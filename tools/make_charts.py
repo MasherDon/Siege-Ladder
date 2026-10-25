@@ -282,7 +282,45 @@ def agent_turns(t):
     return svg(t, h, body, title, desc)
 
 
-CHARTS = {"decode-token": decode_token, "turn-layers": turn_layers, "agent-turns": agent_turns}
+def drives(t):
+    rows = read_csv("drives.csv")
+    configs = list(dict.fromkeys(r["config"] for r in rows))
+    order = list(dict.fromkeys(r["drive"] for r in rows))
+    colour = dict(zip(order, (t["blue"], t["aqua"], t["orange"])))
+    title = "Expert reads from one, two and three NVMe drives"
+    body, y = header(t, title, [
+        "Unbuffered reads of one expert slab (3.4 MB) at a time, 12 / 4 / 4 in flight per drive (diskspd).",
+        "The drives do not slow each other down; prompts read faster with each copy, decode waits for latency instead.",
+    ])
+    body += legend(t, [(colour[d], d) for d in order], y + 12)
+    top = y + 34
+    plot_w = W - LEFT - RIGHT - 60
+    scale = plot_w / 24.0
+    bh, gap_y = 22, 18
+    label = {"F12": "one drive", "F12+E4": "two", "F12+E4+C4": "three"}
+    for i, cfg in enumerate(configs):
+        yy = top + i * (bh + gap_y)
+        body.append(text(LEFT + 70, yy + bh / 2 + 4, label.get(cfg, cfg), 12, t["ink2"], "end"))
+        x = LEFT + 80
+        parts = [r for r in rows if r["config"] == cfg]
+        for k, r in enumerate(parts):
+            w = float(r["gb_s"]) * scale - (GAP if k else 0)
+            x0 = x + (GAP if k else 0)
+            if k == len(parts) - 1:
+                body.append(bar_end_right(x0, yy, w, bh, colour[r["drive"]]))
+            else:
+                body.append(rect(x0, yy, w, bh, colour[r["drive"]]))
+            x += float(r["gb_s"]) * scale
+        total = sum(float(r["gb_s"]) for r in parts)
+        body.append(text(x + 8, yy + bh / 2 + 4, f"{total:.1f} GB/s", 12, t["ink"], "start", 600))
+    h = top + len(configs) * (bh + gap_y) + 20
+    body.append(text(LEFT - 40, h - 10, "data: docs/data/drives.csv", 10.5, t["muted"]))
+    desc = "; ".join(f"{label.get(c, c)}: " + ", ".join(f"{r['drive']} {r['gb_s']} GB/s" for r in rows if r["config"] == c)
+                     for c in configs)
+    return svg(t, h, body, title, desc)
+
+
+CHARTS = {"decode-token": decode_token, "turn-layers": turn_layers, "agent-turns": agent_turns, "drives": drives}
 
 
 def main():

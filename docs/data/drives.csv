@@ -1,0 +1,7 @@
+config,drive,reads_in_flight,gb_s
+F12,Gen5 2 TB (the model),12,13.51
+F12+E4,Gen5 2 TB (the model),12,13.68
+F12+E4,Gen4 1 TB (a copy of the experts),4,5.18
+F12+E4+C4,Gen5 2 TB (the model),12,13.72
+F12+E4+C4,Gen4 1 TB (a copy of the experts),4,5.17
+F12+E4+C4,system NVMe (x2 link),4,3.44

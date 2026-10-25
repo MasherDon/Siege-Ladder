@@ -46,8 +46,9 @@ repositories (see [Reproducing](#reproducing)).
 | decode, short context | 20.3 tok/s (17–20 in real agent turns at 2–27K context) |
 | decode, fast preset | 23–24.7 tok/s (small measured quality cost) |
 | decode at 256K / 512K context | 16–20 tok/s |
-| reading agent turns (0.5–7.5K new tokens into a growing conversation, warm cache) | ~390 tok/s |
-| cold prompt 8.9K / document 256K / document 512K | 672 / 633–652 / 482 tok/s |
+| reading agent turns (0.5–7.5K new tokens into a growing conversation, warm cache) | ~418 tok/s |
+| cold prompt 2.2K / 8.9K | 242 / 729 tok/s |
+| document 256K / 512K (measured before the two latest prefill changes) | 652 / 482 tok/s |
 | 1M context | loads at batch 512; a real 1M document not run yet |
 | quality | 0.09–0.11 nat/token behind the DeepSeek API on its own continuations (3 prompt sets; for scale, Q2 to Q4 is ~0.11); HumanEval 157/164 vs 158 for the API |
 
@@ -75,7 +76,10 @@ better). Reading — the server's own prompt timings.
    - positions the decoder half never reads run through the encoder layers only (exact);
    - DeepSeek's YoCo truncation (DeepInfer's default for V4.1): the decoder half (layers 20–39) computes only the last
      140 prompt positions. We skip its experts for the other rows (attention and dense layers still run on all of
-     them) — +13% on agent turns, +60% on a cold 8.9K prompt, within error on our API sets.
+     them) — +13% on agent turns, +60% on a cold 8.9K prompt, within error on our API sets;
+   - a prompt's Engram rows are faulted in layer by layer under the compute of the layers before them, instead of all
+     before the first kernel (bit-exact; +5.6% on agent turns, +9% / +6% on cold 2.2K / 8.9K prompts), and the pinned
+     host blocks of the compute buffer are kept between prompts (+3.7% on agent turns).
 6. **Sparse attention in decode with a q8 KV cache:** decode stays at 16–20 tok/s from short context to 512K.
 7. **A quant mix from public GGUFs:** prometheusAIR's IQ2_XS gate/up + Q2_K down, ISTA-DASLab's lighter Q5_K dense part
    (3 GB less VRAM, so more expert slots: +8.5% decode, and closer to the API than a plain 2-bit mix).
@@ -105,17 +109,25 @@ Measured with Nsight Systems and the server's timings; the numbers behind each c
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/agent-turns-dark.svg">
-  <img src="docs/img/agent-turns-light.svg" width="760" alt="Reading time of agent turns 2-8 against their new tokens: about 5.3 s plus 1.04 ms per token; 2-3 s of each turn is waiting for expert loads.">
+  <img src="docs/img/agent-turns-light.svg" width="760" alt="Reading time of agent turns 2-8 against their new tokens: about 5 s plus 1 ms per token; 2-3 s of each turn is waiting for expert loads.">
 </picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/drives-dark.svg">
+  <img src="docs/img/drives-light.svg" width="760" alt="Expert reads: the Gen5 drive alone 13.5 GB/s, with a copy on a Gen4 drive 18.9 GB/s, with a third copy on the system drive 22.3 GB/s.">
+</picture>
+
+More: [what each change does and measured](docs/techniques.md), [how we measure](docs/measuring.md), [the
+environment switches](docs/switches.md).
 
 ## Where we're stuck — ideas welcome
 
 1. **Predicting which experts a token needs 1–2 layers ahead.** Perfect staging into VRAM would give 27–29 tok/s; our
    lens reaches 76% precision at ~14% recall (it needs ≥65–70% precision at ≥50% recall to pay off).
 2. **Overlapping compute with expert copies:** copies take ~30 ms per token, compute ~19 ms, and they overlap by 3 ms.
-3. **Short agent turns:** reading a turn costs ~5.3 s plus ~1.04 ms per new token, so even a 500-token turn takes 6 s.
-   Waiting for expert loads is 2–3 s of every turn whatever its size; a 7.5K-token turn also spends 1.3 s reading
-   Engram rows before its first kernel, and every turn ~1 s on GPU memory setup and a 4-token tail call.
+3. **Short agent turns:** reading a turn costs ~5 s plus ~1 ms per new token, so even a 500-token turn takes 5.6 s.
+   Waiting for expert loads is 2–3 s of every turn whatever its size; the server also re-runs the prompt's last 4
+   tokens in a second call (0.34 s), and moving the output head back into VRAM takes 0.26 s.
 4. **1M context:** loads only at batch 512 — the sparse prefill plan wants 11.7–15 GiB at larger batches.
 
 **The bus is the wall.** Copying experts from RAM to the GPU over PCIe 4.0 takes ~30 ms of a ~49 ms token, which caps
@@ -127,8 +139,7 @@ be a starting point.
 
 ## Reproducing
 
-Not turnkey yet: the engine and the weights can be rebuilt from this repository today; the benchmark scripts are
-still being cleaned up for publishing. Built and run on Windows 11 only.
+Not turnkey: a research setup, built and run on Windows 11 only.
 
 **1. The engine** — JigSawPT's llama.cpp fork with our patches on top:
 
@@ -145,7 +156,7 @@ have long names. Build with CUDA 13.0 (13.2 miscompiles `mul_mat_id` for the IQ 
 
 ```sh
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DLLAMA_CURL=OFF
-cmake --build build --target llama-server llama-cli llama-perplexity
+cmake --build build --target llama-server llama-cli llama-perplexity llama-logits
 ```
 
 **2. The weights** — `tools/assemble.py` copies every tensor byte for byte from the public repositories at pinned
@@ -179,16 +190,26 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-engram-00001-of-00011.gguf -ngl 99 -t 
   7% fewer expert bytes, the same dense part).
 - `LLAMA_MOE_STREAM_MIRROR=<folder>` — a copy of the expert parts (5–11) on a second NVMe (up to three folders,
   `;`-separated); each read goes to the drive with fewer reads in flight.
-- The patches read 114 environment switches in all, each documented where it is read (mostly
+- The patches read 116 environment switches in all, each documented where it is read (mostly
   `src/llama-moe-stream.cpp` and `src/models/deepseek4.cpp`); the commit messages say what each change measured.
 
-**4. The benchmark scripts** — TODO.
+**4. The benchmark scripts** — `bench/`, Python 3, no packages; set the paths in `bench/config.json` (see
+`bench/config.py`) and see [docs/measuring.md](docs/measuring.md):
+
+```sh
+python bench/harness.py run mytest --            # the server on a set of prompts: speeds and the fork's counters
+python bench/agent_turns.py turns                # the 8-turn agent session behind "reading agent turns"
+python bench/tf_run.py out/tf mytext.txt --arm base --arm fast PRESET=fast   # teacher-forced decode, A B B A
+python bench/tf_series.py out/tf                 # its summary, corrected for drive stalls
+```
 
 ## Repository layout
 
 | path | what |
 |---|---|
-| `patches/` | 91 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order |
+| `patches/` | 92 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order |
+| `bench/` | the benchmark scripts: server runs, agent turns, long documents, teacher-forced decode, quality against the API, Nsight profiles |
+| `docs/` | [techniques](docs/techniques.md), [measuring](docs/measuring.md), [switches](docs/switches.md) |
 | `docs/img/`, `docs/data/` | the charts (light and dark) and the numbers behind them |
 | `tools/assemble.py`, `template/` | assembles the weights; the GGUF headers and source manifests of the `cd` and `qd` builds |
 | `tools/make_charts.py` | draws the charts from `docs/data/*.csv` (plain SVG, no dependencies) |

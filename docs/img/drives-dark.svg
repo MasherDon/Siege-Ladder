@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 258" width="760" height="258" role="img" aria-labelledby="t d" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<title id="t">Expert reads from one, two and three NVMe drives</title>
+<desc id="d">one drive: Gen5 2 TB (the model) 13.51 GB/s; two: Gen5 2 TB (the model) 13.68 GB/s, Gen4 1 TB (a copy of the experts) 5.18 GB/s; three: Gen5 2 TB (the model) 13.72 GB/s, Gen4 1 TB (a copy of the experts) 5.17 GB/s, system NVMe (x2 link) 3.44 GB/s</desc>
+<rect width="760" height="258" rx="8" fill="#1a1a19"/>
+<text x="24" y="30" font-size="15" fill="#f0efec" text-anchor="start" font-weight="600">Expert reads from one, two and three NVMe drives</text>
+<text x="24" y="50" font-size="12.5" fill="#c3c2b7" text-anchor="start">Unbuffered reads of one expert slab (3.4 MB) at a time, 12 / 4 / 4 in flight per drive (diskspd).</text>
+<text x="24" y="67" font-size="12.5" fill="#c3c2b7" text-anchor="start">The drives do not slow each other down; prompts read faster with each copy, decode waits for latency instead.</text>
+<rect x="24" y="87" width="10" height="10" rx="2" fill="#3987e5"/>
+<text x="39" y="96" font-size="12" fill="#c3c2b7" text-anchor="start">Gen5 2 TB (the model)</text>
+<rect x="199.6" y="87" width="10" height="10" rx="2" fill="#199e70"/>
+<text x="214.6" y="96" font-size="12" fill="#c3c2b7" text-anchor="start">Gen4 1 TB (a copy of the experts)</text>
+<rect x="454.4" y="87" width="10" height="10" rx="2" fill="#d95926"/>
+<text x="469.4" y="96" font-size="12" fill="#c3c2b7" text-anchor="start">system NVMe (x2 link)</text>
+<text x="134" y="133" font-size="12" fill="#c3c2b7" text-anchor="end">one drive</text>
+<path d="M144,118 h338.3 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-338.3 z" fill="#3987e5"/>
+<text x="494.3" y="133" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">13.5 GB/s</text>
+<text x="134" y="173" font-size="12" fill="#c3c2b7" text-anchor="end">two</text>
+<rect x="144" y="158" width="346.6" height="22" fill="#3987e5"/>
+<path d="M492.6,158 h125.2 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-125.2 z" fill="#199e70"/>
+<text x="629.8" y="173" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">18.9 GB/s</text>
+<text x="134" y="213" font-size="12" fill="#c3c2b7" text-anchor="end">three</text>
+<rect x="144" y="198" width="347.6" height="22" fill="#3987e5"/>
+<rect x="493.6" y="198" width="129" height="22" fill="#199e70"/>
+<path d="M624.5,198 h81.1 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-81.1 z" fill="#d95926"/>
+<text x="717.7" y="213" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">22.3 GB/s</text>
+<text x="24" y="248" font-size="10.5" fill="#898781" text-anchor="start">data: docs/data/drives.csv</text>
+</svg>
