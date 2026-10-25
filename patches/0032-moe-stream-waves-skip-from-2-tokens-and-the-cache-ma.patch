@@ -1,7 +1,7 @@
 From e830016ac25d51f4d57111717658bb75cb1b5470 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 07:49:48 +0000
-Subject: [PATCH 32/91] moe-stream : waves skip from 2 tokens and the cache may
+Subject: [PATCH 32/92] moe-stream : waves skip from 2 tokens and the cache may
  have 2*K slots - the MMVQ kernels leave skipped ids out (an id at or past
  INT32_MAX), LLAMA_MOE_STREAM_SKIP_MIN (default 2, 64 = before); the node
  budget plans with skipping below 3*K; the load-time VRAM note uses the probed

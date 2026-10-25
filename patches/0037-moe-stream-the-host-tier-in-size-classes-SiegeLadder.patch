@@ -1,7 +1,7 @@
 From d1bae471f7b068f015c3ef47f9a3aa687214d8c8 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 14:56:54 +0000
-Subject: [PATCH 37/91] moe-stream : the host tier in size classes (SiegeLadder
+Subject: [PATCH 37/92] moe-stream : the host tier in size classes (SiegeLadder
  M3), runahead's pass skips its pairs off the card, the drop rule's inputs in
  one tensor, and the pass's attention by part of the heads (G21, a
  measurement) - M3: a pool per slab length (gate / up 3 041 280 B in 3 051

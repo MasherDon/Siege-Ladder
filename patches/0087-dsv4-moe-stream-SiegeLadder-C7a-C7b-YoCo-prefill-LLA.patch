@@ -1,7 +1,7 @@
 From b9ffcb7a6f67f60ecefd29b289dabc46b4591030 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:51:21 +0000
-Subject: [PATCH 87/91] dsv4 + moe-stream : SiegeLadder C7a + C7b - YoCo
+Subject: [PATCH 87/92] dsv4 + moe-stream : SiegeLadder C7a + C7b - YoCo
  prefill (LLAMA_DSV4_YOCO=K, off by default): the decoder (layers 20-39) of a
  call keeps its last K positions before the first output - a lower bound on
  their raw windows (ring mask, P13 chunk masks, D10 per-query masks; the

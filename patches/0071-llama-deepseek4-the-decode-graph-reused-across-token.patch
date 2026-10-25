@@ -1,7 +1,7 @@
 From 512e30eb330c978b41cefef937128af306447b3e Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 23:28:18 +0000
-Subject: [PATCH 71/91] llama, deepseek4 : the decode graph reused across
+Subject: [PATCH 71/92] llama, deepseek4 : the decode graph reused across
  tokens - Engram's can_reuse / on_reuse, warmup and head_out in allow_reuse, a
  build counter of the expert stream, the raw ring's stream (SiegeLadder G23
  step 1, on by default; LLAMA_GRAPH_REUSE_DISABLE=1 - off)

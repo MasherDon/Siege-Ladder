@@ -1,7 +1,7 @@
 From 26c4289a0505a3734013e44c5258635244abe850 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 20:45:03 +0000
-Subject: [PATCH 52/91] ggml-cuda : the VMM pool's destructor skips the unmap
+Subject: [PATCH 52/92] ggml-cuda : the VMM pool's destructor skips the unmap
  of a trimmed pool - P1's p1_leave trims the pool (ggml_backend_cuda_trim
  unmaps it and leaves the address range reserved with pool_size = 0), and the
  destructor then called cuMemUnmap(pool_addr, 0): an invalid argument, so a

@@ -1,7 +1,7 @@
 From cdb3f3278567e56944736c1c24d0485d7d719c28 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Tue, 20 Oct 2026 18:50:49 +0000
-Subject: [PATCH 75/91] llama, deepseek4, server, logits : V4.1's exact
+Subject: [PATCH 75/92] llama, deepseek4, server, logits : V4.1's exact
  encoder-only prefill, on by default (SiegeLadder P4; LLAMA_DSV4_ENC_ONLY=0 -
  off) and the G4 CPU-lane probe (LLAMA_MOE_STREAM_G4_PROBE, measurement, off)
 

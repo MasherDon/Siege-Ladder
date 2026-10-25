@@ -1,7 +1,7 @@
 From 0e05d7b64565be62767cbad1b40a6f12e7abe4e7 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 02:48:05 +0000
-Subject: [PATCH 15/91] moe-stream : stage the next layer's experts from the
+Subject: [PATCH 15/92] moe-stream : stage the next layer's experts from the
  model's own prediction (A'), opt-in
 
 DeepSeek V4.1: the graph of layer L computes A' for layer L+1 - the hyper-connection streams carried

@@ -1,7 +1,7 @@
 From d1258f8684e9093437bf7a0ba65a9b36fe4a73de Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Tue, 20 Oct 2026 00:56:34 +0000
-Subject: [PATCH 73/91] llama, deepseek4 : Engram's rows gathered by a CPU op
+Subject: [PATCH 73/92] llama, deepseek4 : Engram's rows gathered by a CPU op
  of the graph right before the layer's first reader, not in set_input
  (SiegeLadder G23 step 2, on by default; LLAMA_ENGRAM_LATE=0 - off;
  decode-sized ubatches)

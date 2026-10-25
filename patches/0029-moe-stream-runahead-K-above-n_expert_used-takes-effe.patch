@@ -1,7 +1,7 @@
 From 868c846fd97ec491545ce091e1150ef2d0fe97cc Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 23:19:57 +0000
-Subject: [PATCH 29/91] moe-stream : runahead - K above n_expert_used takes
+Subject: [PATCH 29/92] moe-stream : runahead - K above n_expert_used takes
  effect, runahead staging keeps the oracle's marks, RA_DEBUG modes without a
  prediction stage nothing
 

@@ -1,7 +1,7 @@
 From 1ef5c5cee2eeb389ee5367b885990b1c66ea4b51 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 21:53:11 +0000
-Subject: [PATCH 69/91] deepseek4 : sparse attention in prefill - D11 on
+Subject: [PATCH 69/92] deepseek4 : sparse attention in prefill - D11 on
  P13-style chunks, each query its own FlashAttention stream over its picks and
  window (SiegeLadder D10 step 1, LLAMA_DSV4_SPARSE_PREFILL=1, off by default)
 

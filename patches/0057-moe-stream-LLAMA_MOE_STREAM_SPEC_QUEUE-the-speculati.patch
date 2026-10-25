@@ -1,7 +1,7 @@
 From c900a379f5cc3c6616a633c895859da2101d6640 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 14:20:42 +0000
-Subject: [PATCH 57/91] moe-stream : LLAMA_MOE_STREAM_SPEC_QUEUE - the
+Subject: [PATCH 57/92] moe-stream : LLAMA_MOE_STREAM_SPEC_QUEUE - the
  speculative queue's ceiling in slabs (default 512, as before)
 
 Measurement apparatus for SiegeLadder P14's ceiling: in prefill each layer of an ubatch is one remap call whose

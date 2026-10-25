@@ -1,7 +1,7 @@
 From b36caca4e113580acb3d87661fabf4b09d090ee2 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 16:38:08 +0000
-Subject: [PATCH 40/91] DeepSeek V4 : the attention of a big ubatch by runs of
+Subject: [PATCH 40/92] DeepSeek V4 : the attention of a big ubatch by runs of
  head groups (SiegeLadder P7), off by default - LLAMA_DSV4_ATTN_SPLIT=S (a
  divisor of the 8 output groups) from LLAMA_DSV4_ATTN_SPLIT_MIN tokens (512):
  each run computes its q from its rows of wq_b, attends with its sinks,

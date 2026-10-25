@@ -1,7 +1,7 @@
 From 499607161bf57a36e6b9a7006b1789a8d86ec998 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 19:50:16 +0000
-Subject: [PATCH 26/91] moe-stream : ORACLE_RECALL also drops the missed
+Subject: [PATCH 26/92] moe-stream : ORACLE_RECALL also drops the missed
  experts from the oracle's read-ahead into L2
 
 A predictor that misses an expert of a call misses it on both paths: the same deterministic draw (call, expert) that

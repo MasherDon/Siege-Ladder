@@ -1,7 +1,7 @@
 From d993c151e61a5be1aa85bd0babfe40a11466f58b Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 05:07:58 +0000
-Subject: [PATCH 84/91] ggml-cuda : MMQ for IQ1_M in the Q8_0_16 tile of IQ2_S
+Subject: [PATCH 84/92] ggml-cuda : MMQ for IQ1_M in the Q8_0_16 tile of IQ2_S
  - 8*(grid value + shift) is an int8 in {-9, -7, -1, 1, 7, 9} and d*(2*scale +
  1)/8 the scale of each 16 values, the same numbers as dequantize_row_iq1_m;
  before, prompts with IQ1_M experts went the dequantize + cuBLAS path with a

@@ -1,7 +1,7 @@
 From 70fc66d4cc2abeced10ea48e5e005a10c6db142d Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 16:15:28 +0000
-Subject: [PATCH 58/91] ggml, llama : V4's clamped SwiGLU as one op
+Subject: [PATCH 58/92] ggml, llama : V4's clamped SwiGLU as one op
  (GGML_GLU_OP_SWIGLU_LIM), a prefill wave computes only its own pairs
  (SiegeLadder G8 / P5, on by default)
 

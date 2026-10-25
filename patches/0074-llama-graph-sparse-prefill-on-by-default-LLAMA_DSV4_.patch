@@ -1,7 +1,7 @@
 From 44e0c5d6203a43746949646ab9154a6e1822326b Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Tue, 20 Oct 2026 17:18:13 +0000
-Subject: [PATCH 74/91] llama-graph : sparse prefill on by default -
+Subject: [PATCH 74/92] llama-graph : sparse prefill on by default -
  LLAMA_DSV4_SPARSE_PREFILL unset = on (=0 off), and while it is on
  LLAMA_DSV4_ATTN_QCHUNK unset = 1536 for the ubatches that cannot go sparse
  (SiegeLadder D10 default, user decision 21.10; router-112 within error)

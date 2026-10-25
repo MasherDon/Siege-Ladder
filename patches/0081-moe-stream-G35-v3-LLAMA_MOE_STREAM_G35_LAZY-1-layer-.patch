@@ -1,7 +1,7 @@
 From 4281949f7072976beb046ee99fed4a252071dd56 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 08:04:05 +0000
-Subject: [PATCH 81/91] moe-stream : G35 v3 - LLAMA_MOE_STREAM_G35_LAZY=1:
+Subject: [PATCH 81/92] moe-stream : G35 v3 - LLAMA_MOE_STREAM_G35_LAZY=1:
  layer L's lens is read by layer L + 1's first half (posted a layer before,
  the host never waits for record [1]; v2 still waited ~1.3 ms per token), so
  G35=3 with it reads ahead as early as G35=2 without it. v2 measured: default

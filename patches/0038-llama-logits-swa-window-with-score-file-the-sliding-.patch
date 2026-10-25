@@ -1,7 +1,7 @@
 From a0b230dfe65f948fe0100a038f9107a8bcf5f680 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 15:09:26 +0000
-Subject: [PATCH 38/91] llama-logits : --swa-window - with --score-file, the
+Subject: [PATCH 38/92] llama-logits : --swa-window - with --score-file, the
  sliding-window cache sized to its window as the server keeps it (swa_full
  off; the context default is full-size, and at -c 32768 its 1.25 GiB of raw K
  on V4.1 does not fit next to the experts under "Prefer No Sysmem Fallback").

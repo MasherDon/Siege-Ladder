@@ -1,7 +1,7 @@
 From 9104370e1e80b09ef3549f2d7db51d9ead441a2d Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 09:31:46 +0000
-Subject: [PATCH 47/91] moe-stream : the L2 tier cut to the WDDM shared budget
+Subject: [PATCH 47/92] moe-stream : the L2 tier cut to the WDDM shared budget
  minus a margin before it is laid out (SiegeLadder M9) - pinned memory counts
  against that budget, and the context pins more after the tier (the CUDA_Host
  compute buffers of P1's start-up probe: 476-542 MiB at 64K / 128K; the output

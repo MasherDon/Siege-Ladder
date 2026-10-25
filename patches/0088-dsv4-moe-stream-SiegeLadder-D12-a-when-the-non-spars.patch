@@ -1,7 +1,7 @@
 From 06bbdfed97c4b6657b052c446917a3cba66f1169 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 09:28:46 +0000
-Subject: [PATCH 88/91] dsv4 + moe-stream : SiegeLadder D12 (a) - when the
+Subject: [PATCH 88/92] dsv4 + moe-stream : SiegeLadder D12 (a) - when the
  non-sparse prefill plan does not fit at the full compressed widths (512K+),
  sched_reserve reserves it for the positions where one sequence ever takes it:
  below indexer_top_k * max(ratio) + -ub (3 072 at -ub 2048 on V4.1), the

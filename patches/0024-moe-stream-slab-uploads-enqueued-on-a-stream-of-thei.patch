@@ -1,7 +1,7 @@
 From b51ac3f65ffe3875a97fde4de8e95f53fbb96b9d Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 18:02:23 +0000
-Subject: [PATCH 24/91] moe-stream : slab uploads enqueued on a stream of their
+Subject: [PATCH 24/92] moe-stream : slab uploads enqueued on a stream of their
  own and fenced once per call, instead of a synchronize after every slab
 
 A worker only enqueues its slab (ggml_backend_tensor_set_async on a second CUDA backend instance of the

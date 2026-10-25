@@ -1,7 +1,7 @@
 From 5ed2e533be73c2c5544c7e3b819e35472e527d0a Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 05:10:56 +0000
-Subject: [PATCH 16/91] moe-stream : drop rule for light experts on the drive
+Subject: [PATCH 16/92] moe-stream : drop rule for light experts on the drive
  (lossy, opt-in); a degraded oracle to measure a predictor
 
 Drop rule (LLAMA_MOE_STREAM_DROP_W=theta, off by default; proposed by the SiegeLadder user): a routed

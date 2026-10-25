@@ -1,7 +1,7 @@
 From aae998647fefd430880ef8b9380cb9fa6d9b81cb Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 03:54:06 +0000
-Subject: [PATCH 85/91] moe-stream : G35 v2 on by default -
+Subject: [PATCH 85/92] moe-stream : G35 v2 on by default -
  LLAMA_MOE_STREAM_G35 unset is 2 (the user's decision of 25.10 after
  SiegeLadder runs.md 4.203 / 4.209: within error on the three API anchors, +4%
  decode on the cd build); =0 - off. The exact preset's runahead builds no lens

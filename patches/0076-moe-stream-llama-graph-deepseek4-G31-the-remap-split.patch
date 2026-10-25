@@ -1,7 +1,7 @@
 From e7229d701bf575522493875814cc6c9110a810b6 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 21 Oct 2026 05:15:57 +0000
-Subject: [PATCH 76/91] moe-stream, llama-graph, deepseek4 : G31 - the remap
+Subject: [PATCH 76/92] moe-stream, llama-graph, deepseek4 : G31 - the remap
  split in two without runahead's pass (LLAMA_MOE_STREAM_G31=1; bit for bit,
  runs.md 4.145), G34 keys (LLAMA_MOE_STREAM_SPEC_WORKERS / SPEC_IDLE /
  DROP_SPEC), C14 probe E1 (LLAMA_MOE_STREAM_C14_Q / _N / _SEL / _SKIP / _DROP

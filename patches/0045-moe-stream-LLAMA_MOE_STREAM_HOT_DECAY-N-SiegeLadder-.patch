@@ -1,7 +1,7 @@
 From 1c5220b091c8f8d4638274d0bfa4cdd7d30689d3 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 07:26:27 +0000
-Subject: [PATCH 45/91] moe-stream : LLAMA_MOE_STREAM_HOT_DECAY=N (SiegeLadder
+Subject: [PATCH 45/92] moe-stream : LLAMA_MOE_STREAM_HOT_DECAY=N (SiegeLadder
  G20, halve the route hotness every N tokens instead of 64; 0 = never) and the
  M15 counters (who took each VRAM slot - a decode miss, a runahead / predictor
  stage, a prompt's waves - and how many tokens later a decode call missed an

@@ -1,7 +1,7 @@
 From 6840ea658df3394f2b7e8feecc5c2ee950493f8d Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 16:02:49 +0000
-Subject: [PATCH 10/91] moe-stream : skip the pairs outside a prefill wave by
+Subject: [PATCH 10/92] moe-stream : skip the pairs outside a prefill wave by
  default
 
 LLAMA_MOE_STREAM_WAVE_SKIP was opt-in since 94c17f8: exact, but on 2026-10-12 the drive was the limit of a

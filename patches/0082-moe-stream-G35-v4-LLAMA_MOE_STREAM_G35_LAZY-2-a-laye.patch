@@ -1,7 +1,7 @@
 From 84fa981271d3139e62e455f4332ea026edbd5333 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 09:07:30 +0000
-Subject: [PATCH 82/91] moe-stream : G35 v4 - LLAMA_MOE_STREAM_G35_LAZY=2: a
+Subject: [PATCH 82/92] moe-stream : G35 v4 - LLAMA_MOE_STREAM_G35_LAZY=2: a
  layer's first half takes its own lens if the post is in already, else the
  next layer's first half does (never a wait; v3 =1 always the next layer).
  Server check of v2 / v3 (SiegeLadder twentieth session): answers +3.7% (v2),

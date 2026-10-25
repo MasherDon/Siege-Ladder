@@ -1,7 +1,7 @@
 From edcc01d67762d803df1bdcd4c46e33cc9ef87960 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 22:48:09 +0000
-Subject: [PATCH 55/91] moe-stream : P11 hardened after a review (SiegeLadder
+Subject: [PATCH 55/92] moe-stream : P11 hardened after a review (SiegeLadder
  runs.md 4.90) - (1) a failed pool allocation re-allocates the cache and now
  also resets every layer's slot table (the new memory holds nothing; before,
  the tables still said RESIDENT and the next remap would have computed with

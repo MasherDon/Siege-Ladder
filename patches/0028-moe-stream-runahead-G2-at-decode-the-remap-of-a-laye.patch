@@ -1,7 +1,7 @@
 From a497d4e53160921777408aa6623ba74437822777 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 22:29:59 +0000
-Subject: [PATCH 28/91] moe-stream : runahead (G2) - at decode the remap of a
+Subject: [PATCH 28/92] moe-stream : runahead (G2) - at decode the remap of a
  layer is split in two, and between the halves the next layer's experts are
  predicted from an approximate pass over the resident ones
 

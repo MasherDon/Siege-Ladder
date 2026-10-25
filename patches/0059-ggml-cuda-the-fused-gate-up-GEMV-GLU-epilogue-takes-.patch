@@ -1,7 +1,7 @@
 From fe7e9d698acb636fa5fe54ca1f9211713026e0b3 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 16:51:34 +0000
-Subject: [PATCH 59/91] ggml-cuda : the fused gate/up GEMV + GLU epilogue takes
+Subject: [PATCH 59/92] ggml-cuda : the fused gate/up GEMV + GLU epilogue takes
  GGML_GLU_OP_SWIGLU_LIM (SiegeLadder G8, decode half)
 
 With V4's clamps folded into one GLU op (70fc66d) the pattern MUL_MAT(_ID) gate, MUL_MAT(_ID) up, GLU matches the

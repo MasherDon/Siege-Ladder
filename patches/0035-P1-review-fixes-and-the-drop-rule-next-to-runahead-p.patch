@@ -1,7 +1,7 @@
 From c94003871bac649beea7be3fcc121c4108cec330 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 10:56:31 +0000
-Subject: [PATCH 35/91] P1 review fixes, and the drop rule next to runahead -
+Subject: [PATCH 35/92] P1 review fixes, and the drop rule next to runahead -
  pins: a context that builds graphs on the head itself (MTP of the same model,
  a DFlash / EAGLE3 draft through ctx_other) pins it for its lifetime, P1
  neither releases a pinned head nor runs next to MTP hidden states switched on

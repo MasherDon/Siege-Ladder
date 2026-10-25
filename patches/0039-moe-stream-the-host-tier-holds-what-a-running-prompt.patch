@@ -1,7 +1,7 @@
 From a5fc255e223b01c8ce7ab5dae3ea9db80bad049f Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 16:01:05 +0000
-Subject: [PATCH 39/91] moe-stream : the host tier holds what a running prompt
+Subject: [PATCH 39/92] moe-stream : the host tier holds what a running prompt
  touched (SiegeLadder P9), on by default - a long prompt's ubatches walk
  layers 0..39 again and again and each touches about twice what the tier
  holds, so CLOCK, an LRU on a loop, evicted exactly what the next ubatch

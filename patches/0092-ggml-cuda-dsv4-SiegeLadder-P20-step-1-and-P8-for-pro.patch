@@ -1,0 +1,338 @@
+From 4dfcf40f68e857fffe60143acc734482f63b082e Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:07:52 +0000
+Subject: [PATCH 92/92] ggml-cuda + dsv4 : SiegeLadder P20 step 1 and P8 for
+ prompts - the per-turn costs of an agent's prompt (runs.md 4.231-4.232). (1)
+ The pinned host blocks of 64 MiB and more are kept for reuse
+ (GGML_CUDA_HOST_CACHE=0 - off): the head yield's reserve took the scheduler's
+ 1.66 GiB host compute buffer for -ub 8192 and freed it after every prompt
+ (~0.3 s of cudaMallocHost / cudaFreeHost a turn); its peak was in the WDDM
+ budget already. A request no waiting block fits gives the waiting ones back
+ first - the reserve grows its buffer in two steps (1643.5, then 1659.5 MiB)
+ and keeping the first next to the second ran the card out of memory at load
+ (the pinned budget is shared with the 44 GB host tier, which comes through
+ the same path). Agent turns read +3.7% (A B B A). (2) A prompt's ubatch takes
+ the late Engram path too (on by default, LLAMA_ENGRAM_LATE_PP=0 - off):
+ set_input hashes its rows and a helper thread faults them in layer by layer
+ in the order the graph reads them; each layer's fill op waits for its own
+ layer, so the faults of layer 14 go under layers 0-13 (the rows were read
+ before the first kernel: 1.29 s on a 7.5K turn). Bitwise the same logits at
+ -ub 4096 (bench/engram_pp_check.py); agent turns read +5.6%, cold 2.2K / 8.9K
+ +9.0% / +6.3% (A B B A)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 77 +++++++++++++++++++++++++-
+ src/llama-graph.cpp             | 98 +++++++++++++++++++++++++++++++--
+ src/llama-graph.h               | 23 +++++++-
+ src/models/deepseek4.cpp        |  6 +-
+ 4 files changed, 195 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7a68a78..12e1d2f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1316,8 +1316,51 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
+     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+ }
+ 
++// SiegeLadder P20 (GGML_CUDA_HOST_CACHE=0 - off): big pinned blocks are kept for reuse instead of freed. A prompt's
++// head-yield cycle (llama-context p1_enter / p1_leave) reserves the scheduler's host compute buffer for the large ubatch
++// (1.66 GiB at -ub 8192 on V4.1) and frees it after the prompt - ~0.25 s of cudaMallocHost / cudaFreeHost on every agent
++// turn (SiegeLadder runs.md 4.231). Its peak is in the WDDM budget already (the host tier is sized around it), so keeping
++// it costs no new room. Blocks under 64 MiB are freed as before; at most two blocks wait, and a request takes a cached
++// block only up to twice its size
++struct ggml_cuda_host_block {
++    void * ptr;
++    size_t size;
++};
++static std::mutex                         ggml_cuda_host_cache_mtx;
++static std::vector<ggml_cuda_host_block>  ggml_cuda_host_cache;      // freed big blocks, oldest first
++static std::unordered_map<void *, size_t> ggml_cuda_host_block_size; // every big block from cudaMallocHost: its size
++static const size_t                       GGML_CUDA_HOST_CACHE_MIN = (size_t) 64 << 20;
++
++static bool ggml_cuda_host_cache_on() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_CUDA_HOST_CACHE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    return on;
++}
++
++static void ggml_cuda_host_free(void * ptr) {
++    if (ggml_cuda_host_cache_on()) {
++        std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
++        auto it = ggml_cuda_host_block_size.find(ptr);
++        if (it != ggml_cuda_host_block_size.end()) {
++            GGML_LOG_DEBUG("%s: %.1f MiB of pinned memory kept for reuse, %zu blocks waiting\n", __func__,
++                    it->second / 1024.0 / 1024.0, ggml_cuda_host_cache.size() + 1);
++            ggml_cuda_host_cache.push_back({ptr, it->second});
++            while (ggml_cuda_host_cache.size() > 2) {
++                void * old = ggml_cuda_host_cache.front().ptr;
++                ggml_cuda_host_cache.erase(ggml_cuda_host_cache.begin());
++                ggml_cuda_host_block_size.erase(old);
++                CUDA_CHECK(cudaFreeHost(old));
++            }
++            return;
++        }
++    }
++    CUDA_CHECK(cudaFreeHost(ptr));
++}
++
+ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+-    CUDA_CHECK(cudaFreeHost(buffer->context));
++    ggml_cuda_host_free(buffer->context);
+ }
+ 
+ static void * ggml_cuda_host_malloc(size_t size) {
+@@ -1325,6 +1368,34 @@ static void * ggml_cuda_host_malloc(size_t size) {
+         return nullptr;
+     }
+ 
++    const bool big = ggml_cuda_host_cache_on() && size >= GGML_CUDA_HOST_CACHE_MIN;
++    if (big) {
++        std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
++        size_t best = ggml_cuda_host_cache.size();
++        for (size_t i = 0; i < ggml_cuda_host_cache.size(); i++) {
++            const auto & b = ggml_cuda_host_cache[i];
++            if (b.size >= size && b.size / 2 <= size && (best == ggml_cuda_host_cache.size() || b.size < ggml_cuda_host_cache[best].size)) {
++                best = i;
++            }
++        }
++        if (best < ggml_cuda_host_cache.size()) {
++            void * ptr = ggml_cuda_host_cache[best].ptr;
++            GGML_LOG_DEBUG("%s: %.1f MiB of pinned memory from a waiting block of %.1f MiB\n", __func__,
++                    size / 1024.0 / 1024.0, ggml_cuda_host_cache[best].size / 1024.0 / 1024.0);
++            ggml_cuda_host_cache.erase(ggml_cuda_host_cache.begin() + best);
++            return ptr;
++        }
++        // no waiting block fits: give them all back before a new one, so the cache never raises the pinned peak. The
++        // scheduler's reserve grows its host buffer in two steps (1643.5 MiB, then 1659.5 MiB at -ub 8192): keeping the
++        // first next to the second ran the card out of memory at the head yield's probe at load - the pinned memory of
++        // the WDDM budget is shared with the 44 GB host tier (which comes through here too and is never freed)
++        for (const auto & b : ggml_cuda_host_cache) {
++            ggml_cuda_host_block_size.erase(b.ptr);
++            CUDA_CHECK(cudaFreeHost(b.ptr));
++        }
++        ggml_cuda_host_cache.clear();
++    }
++
+     void * ptr = nullptr;
+     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+     if (err != cudaSuccess) {
+@@ -1334,6 +1405,10 @@ static void * ggml_cuda_host_malloc(size_t size) {
+                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
+         return nullptr;
+     }
++    if (big) {
++        std::lock_guard<std::mutex> lock(ggml_cuda_host_cache_mtx);
++        ggml_cuda_host_block_size[ptr] = size;
++    }
+ 
+     return ptr;
+ }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index a743f8b..e68cdbc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -250,6 +250,10 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     if (late) {
+         // G23 step 2: the history now, the rows in the graph's fill ops - the first of them joins the read-ahead
+         late_ub = nullptr;
++        if (pp_thread.joinable()) {
++            pp_thread.join();
++        }
++        pp_active = false;
+         if (kv.empty() || ubatch == nullptr || ubatch->token == nullptr) {
+             return;
+         }
+@@ -260,6 +264,9 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+             cache->engram_set(ubatch->seq_id[i][0], ubatch->pos[i], token_map[ubatch->token[i]]);
+         }
+         late_ub = ubatch;
++        if (ubatch->n_tokens > 64) {
++            pp_start(*ubatch); // P8 for prompts: a prompt's ubatch is late unless LLAMA_ENGRAM_LATE_PP=0
++        }
+         return;
+     }
+     if (ahead.joinable()) {
+@@ -312,7 +319,78 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
+-void llm_graph_input_engram::fill_layer(uint32_t e, float * dst, const llama_ubatch & ub) {
++void llm_graph_input_engram::pp_start(const llama_ubatch & ub) {
++    auto * cache = mctx->get_kv();
++    GGML_ASSERT(cache != nullptr && cache->engram_enabled());
++
++    llama_engram_tables t;
++    t.token_map   = (const int32_t *) model.engram_token_map->data;
++    t.primes      = (const int64_t *) model.engram_primes->data;
++    t.offsets     = (const int64_t *) model.engram_offsets->data;
++    t.multipliers = (const int64_t *) model.engram_multipliers->data;
++    t.n_layer     = hparams.engram_n_layer;
++    t.n_head      = hparams.engram_n_head;
++    t.max_ngram   = hparams.engram_max_ngram;
++    t.n_hash_cols = hparams.engram_n_hash_cols;
++    t.head_dim    = hparams.engram_head_dim;
++    t.pad_id      = t.token_map[hparams.engram_pad_token];
++
++    // every layer's row addresses, hashed here as fill_layer hashes them; the helper only faults the pages in
++    std::vector<std::vector<void *>> addrs(t.n_layer);
++    std::vector<std::vector<size_t>> sizes(t.n_layer);
++    std::vector<int32_t> hist(t.max_ngram);
++    std::vector<int64_t> rows(t.n_hash_cols);
++    for (uint32_t e = 0; e < t.n_layer; ++e) {
++        const auto & layer = model.layers[hparams.engram_layer_ids[e]];
++        const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
++        const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
++        addrs[e].reserve((size_t) 2*ub.n_tokens*t.n_hash_cols);
++        sizes[e].reserve(addrs[e].capacity());
++        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
++            const llama_seq_id s = ub.seq_id[i][0];
++            const llama_pos    p = ub.pos[i];
++            bool blocked = false;
++            for (uint32_t g = 0; g < t.max_ngram; ++g) {
++                const llama_pos q   = p - (llama_pos) g;
++                const int32_t   cid = q < 0 ? llama_kv_cache_dsv4::ENGRAM_DEAD : cache->engram_get(s, q);
++                blocked = blocked || cid == llama_kv_cache_dsv4::ENGRAM_DEAD
++                                  || cid == llama_kv_cache_dsv4::ENGRAM_NONE;
++                hist[g] = blocked ? t.pad_id : cid;
++            }
++            llama_engram_hash_row(t, e, hist.data(), rows.data());
++            for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
++                addrs[e].push_back((void *) (w  + (size_t) rows[c]*t.head_dim));
++                sizes[e].push_back(t.head_dim);
++                addrs[e].push_back((void *) (sc + (size_t) rows[c]*(t.head_dim/32)));
++                sizes[e].push_back(t.head_dim/32);
++            }
++        }
++    }
++    {
++        std::lock_guard<std::mutex> lk(pp_mtx);
++        pp_done   = 0;
++        pp_active = true;
++    }
++    pp_thread = std::thread([this, addrs = std::move(addrs), sizes = std::move(sizes)]() {
++        for (size_t e = 0; e < addrs.size(); ++e) {
++            llama_moe_stream_nvtx_push("engram_pp");
++            llama_prefetch_ranges(addrs[e].data(), sizes[e].data(), addrs[e].size());
++            llama_moe_stream_nvtx_pop();
++            {
++                std::lock_guard<std::mutex> lk(pp_mtx);
++                pp_done = (uint32_t) e + 1;
++            }
++            pp_cv.notify_all();
++        }
++    });
++}
++
++void llm_graph_input_engram::pp_wait(uint32_t e) {
++    std::unique_lock<std::mutex> lk(pp_mtx);
++    pp_cv.wait(lk, [&] { return pp_done > e; });
++}
++
++void llm_graph_input_engram::fill_layer(uint32_t e, float * dst, const llama_ubatch & ub, bool prefetch) {
+     auto * cache = mctx->get_kv();
+     GGML_ASSERT(cache != nullptr && cache->engram_enabled());
+ 
+@@ -373,9 +451,11 @@ void llm_graph_input_engram::fill_layer(uint32_t e, float * dst, const llama_uba
+         enderecos.push_back((void *) (sc + (size_t) todas[k]*(t.head_dim/32)));
+         tamanhos .push_back(t.head_dim/32);
+     }
+-    llama_moe_stream_nvtx_push("engram_prefetch");
+-    llama_prefetch_ranges(enderecos.data(), tamanhos.data(), enderecos.size());
+-    llama_moe_stream_nvtx_pop();
++    if (prefetch) {
++        llama_moe_stream_nvtx_push("engram_prefetch");
++        llama_prefetch_ranges(enderecos.data(), tamanhos.data(), enderecos.size());
++        llama_moe_stream_nvtx_pop();
++    }
+ 
+     llama_moe_stream_nvtx_push("engram_read");
+     for (uint32_t i = 0; i < n_tokens; ++i) {
+@@ -410,8 +490,16 @@ void llm_graph_input_engram::fill_op(uint32_t e, ggml_tensor * dst) {
+         std::memset(dst->data, 0, ggml_nbytes(dst)); // no set_input for this compute: nothing to read
+         return;
+     }
++    bool faulted = false;
++    if (pp_active) {
++        // P8 for prompts: this layer's pages from the helper; the next layer's may still be on their way
++        llama_moe_stream_nvtx_push("engram_pp_wait");
++        pp_wait(e);
++        llama_moe_stream_nvtx_pop();
++        faulted = true;
++    }
+     const llama_moe_stream_nvtx_range nvtx_fill("engram_fill");
+-    fill_layer(e, (float *) dst->data, *late_ub);
++    fill_layer(e, (float *) dst->data, *late_ub, !faulted);
+ }
+ 
+ ggml_tensor * llm_graph_input_engram::lookup(ggml_context * ctx, uint32_t e) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 13ad615..964e2c8 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -12,6 +12,8 @@
+ #include <functional>
+ #include <map>
+ #include <thread>
++#include <mutex>
++#include <condition_variable>
+ 
+ struct ggml_cgraph;
+ struct ggml_context;
+@@ -740,6 +742,9 @@ public:
+         if (ahead.joinable()) {
+             ahead.join();
+         }
++        if (pp_thread.joinable()) {
++            pp_thread.join();
++        }
+     }
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+@@ -775,10 +780,24 @@ public:
+     std::vector<ggml_tensor *> late_t;  // [engram_n_layer], the fill ops, made at the first reader
+     // the lookup tensor of engram layer e for the graph: kv[e] (a graph input) or, with late, its fill op
+     ggml_tensor * lookup(ggml_context * ctx, uint32_t e);
+-    // the rows of engram layer e for ubatch ub into dst (F32 [n_hash_cols*head_dim, n_tokens])
+-    void fill_layer(uint32_t e, float * dst, const llama_ubatch & ub);
++    // the rows of engram layer e for ubatch ub into dst (F32 [n_hash_cols*head_dim, n_tokens]); prefetch = false when
++    // the pages were faulted in already (pp_start)
++    void fill_layer(uint32_t e, float * dst, const llama_ubatch & ub, bool prefetch = true);
+     void fill_op(uint32_t e, ggml_tensor * dst);
+ 
++    // SiegeLadder P8 for prompts (on by default, LLAMA_ENGRAM_LATE_PP=0 - off): a prompt's ubatch (over 64 tokens) takes the late path as well,
++    // and set_input hands its rows to a helper thread - hashed on the main thread (the history holds the batch by then),
++    // faulted in by the helper layer by layer in the order the graph reads them; each layer's fill op waits for its own
++    // layer only, so the faults of layer 14 go under the compute of layers 0-13. An agent's turn read them all before
++    // its first kernel: 1.29 s on a turn of 7.5K tokens (SiegeLadder runs.md 4.231)
++    std::thread             pp_thread;
++    std::mutex              pp_mtx;
++    std::condition_variable pp_cv;
++    uint32_t                pp_done   = 0;     // engram layers whose rows the helper has faulted in
++    bool                    pp_active = false; // the current compute's rows go through the helper
++    void pp_start(const llama_ubatch & ub);
++    void pp_wait(uint32_t e);
++
+     const llama_hparams & hparams;
+     const llama_model   & model;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index a69c216..4778f9b 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2362,7 +2362,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         // gathered by a CPU op of the graph right before the layer's first reader (llm_graph_input_engram::lookup), not in
+         // set_input - SiegeLadder runs.md 4.128: default mode +2.2%, exact runahead +1.7%, text = trace
+         static const bool engram_late = getenv("LLAMA_ENGRAM_LATE") == nullptr || atoi(getenv("LLAMA_ENGRAM_LATE")) != 0;
+-        inp->late = engram_late && n_tokens <= 64;
++        // SiegeLadder P8 for prompts (on by default since 25.10, LLAMA_ENGRAM_LATE_PP=0 - off; pp_start): a prompt's ubatch
++        // takes the late path too, its rows faulted in by a helper under the compute of the layers before each engram
++        // layer - bitwise the same logits; agent turns read +5.6%, cold 2.2K / 8.9K +9.0% / +6.3% (runs.md 4.232)
++        static const bool engram_late_pp = getenv("LLAMA_ENGRAM_LATE_PP") == nullptr || atoi(getenv("LLAMA_ENGRAM_LATE_PP")) != 0;
++        inp->late = engram_late && (n_tokens <= 64 || engram_late_pp);
+         if (inp->late) {
+             inp->late_ud.resize(hparams.engram_n_layer);
+             inp->late_t.assign(hparams.engram_n_layer, nullptr);

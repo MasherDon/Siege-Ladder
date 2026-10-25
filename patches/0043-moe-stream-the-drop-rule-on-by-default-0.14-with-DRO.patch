@@ -1,7 +1,7 @@
 From d13d8057935245c2d7bfe15a81a756b4fd7315a7 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 21:52:06 +0000
-Subject: [PATCH 43/91] moe-stream : the drop rule on by default (0.14 with
+Subject: [PATCH 43/92] moe-stream : the drop rule on by default (0.14 with
  DROP_ALL), and C13 - a heavy expert only on the drive replaced by the
  best-scoring held one (SiegeLadder, both lossy; C13 off by default)
 

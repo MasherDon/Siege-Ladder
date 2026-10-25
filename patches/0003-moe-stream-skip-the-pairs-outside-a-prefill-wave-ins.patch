@@ -1,7 +1,7 @@
 From 94c17f845ea40d0f22b5c90725354516e8cefb93 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 17:25:04 +0000
-Subject: [PATCH 03/91] moe-stream : skip the pairs outside a prefill wave
+Subject: [PATCH 03/92] moe-stream : skip the pairs outside a prefill wave
  instead of parking them
 
 LLAMA_MOE_STREAM_WAVE_SKIP=1, off by default, CUDA only, ubatches of 64 tokens and up.

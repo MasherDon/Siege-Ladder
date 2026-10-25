@@ -1,7 +1,7 @@
 From d940273c2584668dfdd38109e8eec815d6e6f6b2 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 15:26:39 +0000
-Subject: [PATCH 01/91] tests : V4.1 expert shapes in test-backend-ops
+Subject: [PATCH 01/92] tests : V4.1 expert shapes in test-backend-ops
 
 MUL_MAT_ID cases with the 2-bit V4.1 expert shapes (IQ2_XXS gate/up 5120 -> 2304,
 Q2_K down 2304 -> 5120, 6 of 16 experts, n = 1..512), eval and perf.

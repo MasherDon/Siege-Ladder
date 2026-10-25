@@ -1,7 +1,7 @@
 From da34f4511a108e8c6423a11524327602b282394d Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 20:27:21 +0000
-Subject: [PATCH 27/91] moe-stream : stage dispatcher - a guess's copy waits
+Subject: [PATCH 27/92] moe-stream : stage dispatcher - a guess's copy waits
  until the copy engine has no demand left, at most 2 staged slabs in flight
 
 Every copy goes into one in-order stream, and a staged slab (a guess for a later call: the oracle's VRAM_AHEAD, A''s

@@ -1,7 +1,7 @@
 From 200a207e861075e2af3805e5298af6514d92b124 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 12:58:15 +0000
-Subject: [PATCH 51/91] ggml : the graph's inputs copied with the first split
+Subject: [PATCH 51/92] ggml : the graph's inputs copied with the first split
  of their backend (SiegeLadder G27, GGML_SCHED_HOIST_INPUTS=1, off by
  default), and DeepSeek V4.1's Engram q / k weights on the card - after the
  mailbox's reply the decode graph still had 8 card splits with host inputs:

@@ -1,7 +1,7 @@
 From 7cd0804e70dff104b86ba6cbd62f53fbf67b4166 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 18:25:34 +0000
-Subject: [PATCH 14/91] ggml, moe-stream : later prefill waves write their down
+Subject: [PATCH 14/92] ggml, moe-stream : later prefill waves write their down
  GEMM in place instead of being summed
 
 With the pairs of other waves skipped, every pair belongs to exactly one wave, so the waves fill disjoint

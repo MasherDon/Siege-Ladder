@@ -1,7 +1,7 @@
 From 6c1499c9135ed00fbdc31e76a4c906b09e279d69 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 14:12:54 +0000
-Subject: [PATCH 17/91] moe-stream : routing traces keep dropped experts; drop
+Subject: [PATCH 17/92] moe-stream : routing traces keep dropped experts; drop
  rule modes to measure a runahead predictor
 
 The trace (LLAMA_MOE_STREAM_TRACE) now records what the router chose, the experts the drop rule took

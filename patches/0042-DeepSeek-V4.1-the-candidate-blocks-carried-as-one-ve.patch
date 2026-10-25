@@ -1,7 +1,7 @@
 From 4d7c4f4201875205980ee28b588fd68499640b3b Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 21:33:56 +0000
-Subject: [PATCH 42/91] DeepSeek V4.1 : the candidate blocks carried as one
+Subject: [PATCH 42/92] DeepSeek V4.1 : the candidate blocks carried as one
  verdict per block, built in their source layer (SiegeLadder D3, step L1), on
  by default
 

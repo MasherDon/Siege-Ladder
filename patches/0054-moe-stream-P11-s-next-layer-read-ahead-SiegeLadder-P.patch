@@ -1,7 +1,7 @@
 From 568a978381f39042f5df9467f808f5c238e82852 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 21:48:32 +0000
-Subject: [PATCH 54/91] moe-stream : P11's next layer read ahead (SiegeLadder
+Subject: [PATCH 54/92] moe-stream : P11's next layer read ahead (SiegeLadder
  P12, LLAMA_MOE_STREAM_P11_AHEAD=N, off by default) - in P11's profile at -ub
  6144 the drive stood idle in long gaps (median 188 ms) while the card did
  attention, and the graph waited for loads 16-27% of the window (SiegeLadder

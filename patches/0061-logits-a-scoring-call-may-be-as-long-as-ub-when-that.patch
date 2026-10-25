@@ -1,7 +1,7 @@
 From e4095c04cbe99fa099ddcf5ab6756adca8e60570 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 18:15:47 +0000
-Subject: [PATCH 61/91] logits : a scoring call may be as long as -ub when that
+Subject: [PATCH 61/92] logits : a scoring call may be as long as -ub when that
  is above 2048 (SiegeLadder P13's check runs router-112 at the consultant's
  -ub 6144; the 2048 cap capped the ubatch too)
 

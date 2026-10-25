@@ -1,7 +1,7 @@
 From a1f0d48e692f8c4f67c0357af910b5e7f9b346db Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 17:27:30 +0000
-Subject: [PATCH 11/91] tests : V4.1 expert and dense perf cases at decode,
+Subject: [PATCH 11/92] tests : V4.1 expert and dense perf cases at decode,
  prefill-wave and ubatch sizes
 
 test-backend-ops perf now runs the DeepSeek V4.1-Flash Q2mix expert GEMMs the way the expert stream runs

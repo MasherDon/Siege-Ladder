@@ -1,7 +1,7 @@
 From 33d36242c2b37f9d86060b09151679f249422779 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 21 Oct 2026 16:03:10 +0000
-Subject: [PATCH 78/91] moe-stream : presets
+Subject: [PATCH 78/92] moe-stream : presets
  (LLAMA_MOE_STREAM_PRESET=exact|default|fast - fill unset keys: exact
  DROP_W=0, fast C14=0.2), the adaptive D14 drive switch
  (LLAMA_MOE_STREAM_MIRROR_ADAPT=S, off by default: a primary read of 16 ms or

@@ -1,7 +1,7 @@
 From a7ca25ef783d904436b5031830994270b32531b7 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 07:59:02 +0000
-Subject: [PATCH 33/91] llama-logits : --override-kv KEY=int:N|float:X|bool:B
+Subject: [PATCH 33/92] llama-logits : --override-kv KEY=int:N|float:X|bool:B
  and -ctk / -ctv for the score context - the lossy modes of the ds4
  general-100 sort (K = 5 / 4, quantized KV)
 

@@ -1,7 +1,7 @@
 From 8643bbe1fab1a3d713f22ac8774e0d258c23b1d1 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 21:34:09 +0000
-Subject: [PATCH 68/91] moe-stream : count runahead calls whose every pair was
+Subject: [PATCH 68/92] moe-stream : count runahead calls whose every pair was
  resident at the end of the first half (SiegeLadder G32, a measurement)
 
 In those calls runahead's approximate pass ran the next layer's attention on its real input: the potential of reusing

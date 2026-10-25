@@ -1,7 +1,7 @@
 From 2bd28b6f7d719448b482783ecba3e299183a6cf9 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 24 Oct 2026 04:55:33 +0000
-Subject: [PATCH 83/91] moe-stream : P11 with a different expert type in every
+Subject: [PATCH 83/92] moe-stream : P11 with a different expert type in every
  layer - each weight's pool is sized by its widest layer (one layer holds the
  pool at a time, so a narrower layer's slots take the front of it); the
  equal-types test is gone. For the ISTA-DASLab GSQ-RCO builds of 1017

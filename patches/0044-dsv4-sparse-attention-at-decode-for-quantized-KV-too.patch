@@ -1,7 +1,7 @@
 From df824afc8aefad7268ee97d2862a8d38b335849b Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 07:05:34 +0000
-Subject: [PATCH 44/91] dsv4 : sparse attention at decode for quantized KV too
+Subject: [PATCH 44/92] dsv4 : sparse attention at decode for quantized KV too
  (SiegeLadder D11) - with -ctk q8_0 / q4_0 the decode path fell back to dense
  attention over every compressed position (64K / 128K: 99-105 / 147-152 ms per
  token outside the load wait, SiegeLadder runs.md 4.71); the picked rows now

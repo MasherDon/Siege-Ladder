@@ -1,7 +1,7 @@
 From 7e4067ea6853bdf0df4f689f851361ffd5573303 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 19:32:48 +0000
-Subject: [PATCH 63/91] deepseek4 : D11's sparse decode views the CSA / HCA
+Subject: [PATCH 63/92] deepseek4 : D11's sparse decode views the CSA / HCA
  mask input once per graph and group (SiegeLadder G29, on by default;
  LLAMA_DSV4_SPARSE_MASK_VIEW=0 - a view per layer as before)
 

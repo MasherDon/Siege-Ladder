@@ -1,7 +1,7 @@
 From 8837abf39c7cceb4b80a08fe45b902f978d2d8fb Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 15:02:00 +0000
-Subject: [PATCH 91/91] moe-stream : SiegeLadder - 17 I/O threads by default
+Subject: [PATCH 91/92] moe-stream : SiegeLadder - 17 I/O threads by default
  (was 9): with the E: copy the agent's turns read +2.8% (A B B A on ade77bb:
  turns 2-8 read in 62.4 / 62.8 s at 17 against 63.8 / 64.9 s at 9; wave stalls
  -9%, 6.2 reads in flight against 3.7; answers the same - SiegeLadder runs.md

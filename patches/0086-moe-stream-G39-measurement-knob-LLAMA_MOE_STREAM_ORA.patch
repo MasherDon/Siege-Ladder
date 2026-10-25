@@ -1,7 +1,7 @@
 From e478bbd10566f42ccb2181d23aea3afcc96d70ea Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 04:33:43 +0000
-Subject: [PATCH 86/91] moe-stream : G39 measurement knob
+Subject: [PATCH 86/92] moe-stream : G39 measurement knob
  LLAMA_MOE_STREAM_ORACLE_FALSE=f - the oracle's staging of a call (VRAM_AHEAD)
  also stages f wrong experts (floor(f), plus one with the probability of f's
  fraction, by the ORACLE_RECALL draw) after the call's own, onto q_stage

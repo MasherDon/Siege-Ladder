@@ -1,7 +1,7 @@
 From 649ad3767668974799f115eb5393dd3303809d26 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 11:49:28 +0000
-Subject: [PATCH 48/91] moe-stream : the mailbox's reply (SiegeLadder G22), on
+Subject: [PATCH 48/92] moe-stream : the mailbox's reply (SiegeLadder G22), on
  by default - with the router's mailbox the remap's CPU split had no card
  input, but its answers (the slot ids for the expert GEMMs, the drop rule's or
  runahead's multipliers) still went to the card as inputs of the next card

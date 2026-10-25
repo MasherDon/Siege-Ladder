@@ -1,7 +1,7 @@
 From fd3adec4d12f681144c7351aba1fed12925d5348 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 20:20:12 +0000
-Subject: [PATCH 05/91] ggml-cuda : sort in 16MB chunks, so the V4.1 indexer
+Subject: [PATCH 05/92] ggml-cuda : sort in 16MB chunks, so the V4.1 indexer
  top-k keeps the pool flat
 
 With CUDA 13.0 the bundled CCCL is 3.0, below the 3.2 that enables the cub top-k, so

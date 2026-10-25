@@ -1,7 +1,7 @@
 From 11f5db943ddda3a9b968bdb6d3cb914dafa3ad94 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 06:05:22 +0000
-Subject: [PATCH 30/91] moe-stream : runahead on by default with K = 6 -
+Subject: [PATCH 30/92] moe-stream : runahead on by default with K = 6 -
  lossless (text = trace, KL at the floor); LLAMA_MOE_STREAM_RUNAHEAD=0 turns
  it off, and next to an oracle, A' or the drop rule it stays off unless asked
  for

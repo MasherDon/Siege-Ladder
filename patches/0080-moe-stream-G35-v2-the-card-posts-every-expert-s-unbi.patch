@@ -1,7 +1,7 @@
 From b82dce2a3ae41d32aebb7e0e9c855c10d5df3e53 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 07:19:21 +0000
-Subject: [PATCH 80/91] moe-stream : G35 v2 - the card posts every expert's
+Subject: [PATCH 80/92] moe-stream : G35 v2 - the card posts every expert's
  unbiased and biased scores of the lens ([n_expert, 2]) in record [1] after
  record [0] and the shared expert (computed while the host remaps; no sort on
  the card), the host picks the G35_M best and wakes the I/O pool once a lens

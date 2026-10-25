@@ -1,7 +1,7 @@
 From cbf88ee8f9c992e78e5adf13c18a873ebf296fab Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 21 Oct 2026 10:35:15 +0000
-Subject: [PATCH 77/91] moe-stream, llama-graph : G31 on by default
+Subject: [PATCH 77/92] moe-stream, llama-graph : G31 on by default
  (LLAMA_MOE_STREAM_G31=0 - off; +2.8%, bit for bit - SiegeLadder runs.md
  4.145, 4.151, 4.157), quietly giving way to runahead, C13, the G4 probe and
  VRAM_ONLY=2; C14 works next to G31 (its selection in G31's first half, the

@@ -1,7 +1,7 @@
 From 1ccbf2dab944c13cb9ce0b3e9ef3bd85c56333f9 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 19:52:28 +0000
-Subject: [PATCH 64/91] moe-stream, llama : the exact expert GEMMs reuse
+Subject: [PATCH 64/92] moe-stream, llama : the exact expert GEMMs reuse
  runahead's rows of the pairs resident at the first half (SiegeLadder G30, on
  by default; LLAMA_MOE_STREAM_RA_REUSE=0 - off)
 

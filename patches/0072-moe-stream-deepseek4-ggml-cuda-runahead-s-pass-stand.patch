@@ -1,7 +1,7 @@
 From 5b4fd127ffddb511b10c51ca75f46e37e6b8c995 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 23:57:42 +0000
-Subject: [PATCH 72/91] moe-stream, deepseek4, ggml-cuda : runahead's pass
+Subject: [PATCH 72/92] moe-stream, deepseek4, ggml-cuda : runahead's pass
  stands in for the real attention of layer L+1 when every pair of layer L was
  resident at the first half (SiegeLadder G32, opt-in: LLAMA_MOE_STREAM_G32=1;
  0 - counted only, the default; 2 - copies built, never skipped)

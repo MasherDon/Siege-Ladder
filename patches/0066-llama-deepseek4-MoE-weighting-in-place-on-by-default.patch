@@ -1,7 +1,7 @@
 From 61ef684741907eda986e2981035f96c82d734308 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 20:34:06 +0000
-Subject: [PATCH 66/91] llama, deepseek4 : MoE weighting in place on by
+Subject: [PATCH 66/92] llama, deepseek4 : MoE weighting in place on by
  default; q's rope part back into wq_b's output without a concat, opt-in
  (SiegeLadder P17, step 1)
 

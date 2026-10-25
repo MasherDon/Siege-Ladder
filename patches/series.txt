@@ -1,7 +1,7 @@
 # Siege-Ladder: the patch series over JigSawPT's llama.cpp fork (the DeepSeek-V4.1 port with SSD streaming)
 # upstream  https://github.com/JigSawPT/llama.cpp  branch dsv41-porte
 # base      8ce0968539b1a6795f3413c2783dfa5646b4688a  (2026-09-23)
-# patches   91, oldest first; exported from our branch at 8837abf
+# patches   92, oldest first; exported from our branch at 4dfcf40
 # apply     git checkout 8ce0968539b1a6795f3413c2783dfa5646b4688a && git am path/to/patches/*.patch
 
 0001-tests-V4.1-expert-shapes-in-test-backend-ops.patch
@@ -95,3 +95,4 @@
 0089-moe-stream-SiegeLadder-G40c-G40d-measurement-knobs-G.patch
 0090-dsv4-moe-stream-SiegeLadder-defaults-of-25.10-the-us.patch
 0091-moe-stream-SiegeLadder-17-I-O-threads-by-default-was.patch
+0092-ggml-cuda-dsv4-SiegeLadder-P20-step-1-and-P8-for-pro.patch

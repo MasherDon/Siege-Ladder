@@ -1,7 +1,7 @@
 From 0a1881221b2ce6d3db17c1d92e6d2787941b77ed Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 10:00:06 +0000
-Subject: [PATCH 34/91] llama : P1 head yield, on by default
+Subject: [PATCH 34/92] llama : P1 head yield, on by default
  (LLAMA_HEAD_YIELD=N, default 64, 0 = off) - the output head gets a GPU buffer
  of its own; a decode call of more than N tokens releases it and runs at -ub
  with the head's VRAM in the compute buffers, the graph ends at the normed

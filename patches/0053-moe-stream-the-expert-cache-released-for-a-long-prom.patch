@@ -1,7 +1,7 @@
 From b60246c9cb0ccca3e37c7ebb6611aa99af0ff184 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 21:19:44 +0000
-Subject: [PATCH 53/91] moe-stream : the expert cache released for a long
+Subject: [PATCH 53/92] moe-stream : the expert cache released for a long
  prompt, the waves of all layers from one shared pool (SiegeLadder P11,
  LLAMA_MOE_STREAM_P11=N, off by default) - a long prompt's -ub is held by VRAM
  (the compute buffer grows ~0.68 MiB per token of -ub at 32K), and every

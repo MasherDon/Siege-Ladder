@@ -1,7 +1,7 @@
 From 3af3e5c01bacaa67b4f28402162c195b4e9ec343 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 19:49:45 +0000
-Subject: [PATCH 20/91] dsv4 : sparse attention at decode, opt-in
+Subject: [PATCH 20/92] dsv4 : sparse attention at decode, opt-in
  (LLAMA_DSV4_SPARSE_DECODE=1)
 
 One token in one stream gathers only the indexer's top-k compressed K rows and

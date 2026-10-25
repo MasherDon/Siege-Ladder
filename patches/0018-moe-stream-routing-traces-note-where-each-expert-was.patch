@@ -1,7 +1,7 @@
 From 084c3390c3b11cce775e5b4cdadfe8df6a1df718 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Thu, 15 Oct 2026 15:41:31 +0000
-Subject: [PATCH 18/91] moe-stream : routing traces note where each expert was;
+Subject: [PATCH 18/92] moe-stream : routing traces note where each expert was;
  a runahead measurement that keeps the layer's cache
 
 The trace (LLAMA_MOE_STREAM_TRACE) now writes a fourth field per call: where each routed expert was when

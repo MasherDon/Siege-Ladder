@@ -1,7 +1,7 @@
 From 32cf9d8a894b8d49793db0d93caecceb608ded48 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 06:56:17 +0000
-Subject: [PATCH 31/91] VRAM budget diagnostics (SiegeLadder M9 / M11): the
+Subject: [PATCH 31/92] VRAM budget diagnostics (SiegeLadder M9 / M11): the
  CUDA VMM pool logs every growth with the node that asked; the WDDM budgets of
  the process (DXGI) are printed when the host tier is allocated and when the
  context is built; LLAMA_MOE_STREAM_PROBE_VRAM=1 takes 16 MiB blocks after

@@ -1,7 +1,7 @@
 From 7abf47fff2eb0ca99d92119ca530b8baf6edc4f6 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 14:15:26 +0000
-Subject: [PATCH 56/91] moe-stream : P11 on by default (a pool of 64 slots;
+Subject: [PATCH 56/92] moe-stream : P11 on by default (a pool of 64 slots;
  LLAMA_MOE_STREAM_P11=0 turns it off)
 
 The user's decision after SiegeLadder runs.md 4.85-4.93: the 30K document 187 -> 107 s (+75%), 64K 421 -> 279 s,
