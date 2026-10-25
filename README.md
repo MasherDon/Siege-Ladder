@@ -58,7 +58,7 @@ On this PC with the same file (measured 2026-10-22): the original fork ~10 tok/s
 arms in A B B A order, corrected for random drive stalls. Quality — negative log-likelihood of the DeepSeek API's own
 continuations on three prompt sets (general-100 from antirez's ds4 quality tests, a 112-prompt code and agent set, and
 a Russian set; continuations collected from the API for 1017), shown as the distance to the full model (smaller is
-better). Reading — the server's own prompt timings.
+better). Reading — the server's own prompt timings. Details: [docs/measuring.md](docs/measuring.md).
 
 ## What helped most
 
@@ -82,7 +82,7 @@ better). Reading — the server's own prompt timings.
      host blocks of the compute buffer are kept between prompts (+3.7% on agent turns).
 6. **Sparse attention in decode with a q8 KV cache:** decode stays at 16–20 tok/s from short context to 512K.
 7. **A quant mix from public GGUFs:** prometheusAIR's IQ2_XS gate/up + Q2_K down, ISTA-DASLab's lighter Q5_K dense part
-   (3 GB less VRAM, so more expert slots: +8.5% decode, and closer to the API than a plain 2-bit mix).
+   (3 GB less VRAM, so more expert slots: +8.5% decode, and at least as close to the API as a plain 2-bit mix).
 
 ## What didn't work
 
@@ -130,6 +130,8 @@ environment switches](docs/switches.md).
    tokens in a second call (0.34 s), and moving the output head back into VRAM takes 0.26 s.
 4. **1M context:** loads only at batch 512 — the sparse prefill plan wants 11.7–15 GiB at larger batches.
 
+Ideas, questions and results on other hardware are welcome in the issues.
+
 **The bus is the wall.** Copying experts from RAM to the GPU over PCIe 4.0 takes ~30 ms of a ~49 ms token, which caps
 decode at ~32 tok/s on this box even with perfect overlap.
 
@@ -139,7 +141,13 @@ be a starting point.
 
 ## Reproducing
 
-Not turnkey: a research setup, built and run on Windows 11 only.
+Not turnkey: a research setup, built and run on Windows 11 only. What it needs:
+
+- an NVIDIA GPU with 16 GB (the build line targets Blackwell, `sm_120`; set `CMAKE_CUDA_ARCHITECTURES` for others);
+- 64 GB of RAM (the RAM tier takes 43–46 GiB, pinned);
+- ~375 GB on a fast NVMe (Gen4 or Gen5) for the weights, and ~175 GB on a second drive for the optional copy of the
+  expert parts;
+- Windows 10/11 (parts of the patches deal with WDDM's memory budget), CUDA 13.0, Python 3.10+ for the scripts.
 
 **1. The engine** — JigSawPT's llama.cpp fork with our patches on top:
 
@@ -207,7 +215,7 @@ python bench/tf_series.py out/tf                 # its summary, corrected for dr
 
 | path | what |
 |---|---|
-| `patches/` | 92 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order |
+| `patches/` | 92 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order. The commit messages quote their measurements and cite sections of our own log (`runs.md 4.xx`), which is not published |
 | `bench/` | the benchmark scripts: server runs, agent turns, long documents, teacher-forced decode, quality against the API, Nsight profiles |
 | `docs/` | [techniques](docs/techniques.md), [measuring](docs/measuring.md), [switches](docs/switches.md) |
 | `docs/img/`, `docs/data/` | the charts (light and dark) and the numbers behind them |
@@ -223,6 +231,13 @@ files keeps llama.cpp's license notice, as its license requires. See [NOTICE.md]
 
 ## Built on
 
-JigSawPT (the DeepSeek-V4.1 port of llama.cpp with SSD streaming of experts), llama.cpp / ggml, DeepSeek (the model and
-DeepInfer's YoCo prefill), Strata, Project Maya, antirez's ds4 (DwarfStar), and the prometheusAIR and ISTA-DASLab
-quants of 1017.
+- [JigSawPT's llama.cpp fork](https://github.com/JigSawPT/llama.cpp) (`dsv41-porte`): the DeepSeek-V4.1 port with SSD
+  streaming of experts that the patches build on;
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp);
+- DeepSeek: [the model](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) and
+  [DeepInfer](https://github.com/deepseek-ai/DeepInfer) (the YoCo prefill);
+- [antirez's ds4](https://github.com/antirez/ds4): the quality tests and the scoring method;
+- [Strata](https://github.com/Niko1221/Strata) and [Project Maya](https://github.com/mw00/project-maya): ideas we
+  compared against and borrowed (no code);
+- the quants of 1017 by [prometheusAIR](https://huggingface.co/prometheusAIR/DeepSeek-V4.1-Flash-1017-GGUF) and
+  [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF).

@@ -3,6 +3,8 @@
 # base      8ce0968539b1a6795f3413c2783dfa5646b4688a  (2026-09-23)
 # patches   92, oldest first; exported from our branch at 4dfcf40
 # apply     git checkout 8ce0968539b1a6795f3413c2783dfa5646b4688a && git am path/to/patches/*.patch
+# note      the commit messages quote their measurements and cite sections of our own measurement log
+#           (runs.md 4.xx), which is not published
 
 0001-tests-V4.1-expert-shapes-in-test-backend-ops.patch
 0002-moe-stream-miss-only-shift-of-the-last-ranks-toward-.patch

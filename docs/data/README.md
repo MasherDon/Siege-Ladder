@@ -44,7 +44,8 @@ the same.
 An 8-turn agent session replayed against the server (32K context, batch 8192, 43 GiB RAM tier, 22 expert slots,
 q8_0 KV cache, a copy of the expert files on a second NVMe, the patches' defaults), two runs `a` and `b`. Turn 1
 starts cold; turns 2-8 reuse the cached conversation and read only their new tokens
-(`python bench/agent_turns.py TAG` makes the same session).
+(`python bench/agent_turns.py TAG` makes this session; two of its sentences were reworded for publishing, a few
+tokens' difference).
 
 | column | meaning |
 |---|---|
