@@ -40,7 +40,7 @@ The routed experts (~150 GiB at ~2.4 bits per weight) stream from NVMe; ~23 per 
 holds 43–46 GiB of them. No weights are redistributed here — only a script that assembles the build from the public
 repositories (see [Reproducing](#reproducing)).
 
-## Numbers (today's defaults)
+## Numbers (the defaults of 25 October 2026)
 
 | | |
 |---|---|
