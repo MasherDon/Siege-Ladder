@@ -26,7 +26,7 @@ Long context, up to 1M tokens, at a usable speed on a single consumer PC — not
 
 ## The model build
 
-DeepSeek-V4.1-Flash-1017 does not fit in RAM + VRAM. Our build is ~375 GB:
+DeepSeek-V4.1-Flash-1017 does not fit in RAM + VRAM. Our build is 373 GB:
 
 | part | type | source |
 |---|---|---|
@@ -37,7 +37,7 @@ DeepSeek-V4.1-Flash-1017 does not fit in RAM + VRAM. Our build is ~375 GB:
 
 The routed experts (~150 GiB at ~2.4 bits per weight) stream from NVMe; ~23 per layer sit in VRAM, a pinned RAM tier
 holds 43–46 GiB of them. No weights are redistributed here — only a script that assembles the build from the public
-repositories (TODO: see [Reproducing](#reproducing)).
+repositories (see [Reproducing](#reproducing)).
 
 ## Numbers (today's defaults)
 
@@ -127,8 +127,8 @@ be a starting point.
 
 ## Reproducing
 
-Not turnkey yet: the engine builds from this repository today; the weight assembly script and the benchmark scripts
-are still being cleaned up for publishing. Built and run on Windows 11 only.
+Not turnkey yet: the engine and the weights can be rebuilt from this repository today; the benchmark scripts are
+still being cleaned up for publishing. Built and run on Windows 11 only.
 
 **1. The engine** — JigSawPT's llama.cpp fork with our patches on top:
 
@@ -148,8 +148,19 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_A
 cmake --build build --target llama-server llama-cli llama-perplexity
 ```
 
-**2. The weights** — TODO: the assembly script and the GGUF headers it uses as a template (sources: prometheusAIR's
-and ISTA-DASLab's GGUFs of 1017, DeepSeek's official 1017 release).
+**2. The weights** — `tools/assemble.py` copies every tensor byte for byte from the public repositories at pinned
+revisions (prometheusAIR's and ISTA-DASLab's GGUFs of 1017, DeepSeek's official 1017 release) into the 11 GGUF parts
+of our build, by HTTP range requests, so only the bytes the build uses are downloaded (373 GB, no full source files).
+Python 3 only, resumable; `template/` holds the parts' GGUF headers and a manifest with each tensor's source.
+
+```sh
+python tools/assemble.py D:/models/v41-cd --plan     # what will be fetched and written
+python tools/assemble.py D:/models/v41-cd            # run it; run it again to resume after an interruption
+python tools/assemble.py D:/models/v41-cd --check    # compare both ends of every tensor with its source
+```
+
+`--build qd` assembles the fast preset's lighter build (362 GB) instead. Source files you already have whole can be
+used with `--sources <folder>` (and checked with `--verify-sources`).
 
 **3. Running** — the server line of our agent-turn measurements (up to 32K context; the model is the first of 11 GGUF
 parts):
@@ -179,6 +190,7 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-engram-00001-of-00011.gguf -ngl 99 -t 
 |---|---|
 | `patches/` | 91 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order |
 | `docs/img/`, `docs/data/` | the charts (light and dark) and the numbers behind them |
+| `tools/assemble.py`, `template/` | assembles the weights; the GGUF headers and source manifests of the `cd` and `qd` builds |
 | `tools/make_charts.py` | draws the charts from `docs/data/*.csv` (plain SVG, no dependencies) |
 
 ## License

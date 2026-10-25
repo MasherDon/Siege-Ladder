@@ -1,2 +1,5 @@
 # patches must keep their bytes: no line-ending conversion on Windows checkouts
 *.patch -text
+# GGUF headers and the first part of the weights are binary
+*.gguf binary
+*.header binary

@@ -13,6 +13,8 @@ projects (or from Project Maya) is included.
 
 No model weights are included. The assembly script downloads them from their own repositories, each under its own
 license (see the model cards; all three were MIT on 2026-10-25): DeepSeek's official DeepSeek-V4.1-Flash-1017 release
-(`deepseek-ai/DeepSeek-V4.1-Flash-1017`), prometheusAIR's and ISTA-DASLab's GGUF quants of it. If the GGUF part headers
-of our build are included as the assembly template (metadata and tensor tables only), they are derived from DeepSeek's
-MIT-licensed release and keep its notice.
+(`deepseek-ai/DeepSeek-V4.1-Flash-1017`), prometheusAIR's and ISTA-DASLab's GGUF quants of it.
+
+`template/` holds the GGUF headers of our builds (metadata and tensor tables) and their first part whole (metadata,
+the tokenizer and four small Engram hash tables). They are derived from DeepSeek's MIT-licensed release, whose
+license is kept beside them as [template/LICENSE](template/LICENSE) (MIT, © 2023 DeepSeek).
