@@ -1,0 +1,518 @@
+From 5ed2e533be73c2c5544c7e3b819e35472e527d0a Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 05:10:56 +0000
+Subject: [PATCH 16/91] moe-stream : drop rule for light experts on the drive
+ (lossy, opt-in); a degraded oracle to measure a predictor
+
+Drop rule (LLAMA_MOE_STREAM_DROP_W=theta, off by default; proposed by the SiegeLadder user): a routed
+expert held neither in VRAM nor whole in the host tier, whose share of its token's routing weight is below
+theta in every pair it has, is not waited for. Its pairs get weight 0 for this call - a second custom op
+right after the remap, on the same host split, hands the graph a weight mask - and it is read into the
+host tier for the calls after it. LLAMA_MOE_STREAM_DROP_ALL=1 drops only when that frees the call from
+the drive: a call with one heavy drive miss waits for the drive anyway, and dropping its light ones only
+costs quality. LLAMA_MOE_STREAM_DROP_RENORM=1 scales the kept pairs back to the token's full weight. With
+the rule on, the remap is a ggml_custom_4d op that also takes the routing weights.
+
+Measurement apparatus for 3a: LLAMA_MOE_STREAM_ORACLE_RECALL keeps each expert of the oracle's staging
+with that probability (a deterministic hash of call and expert); LLAMA_MOE_STREAM_PRED_STAGE=1 stages
+only the model prediction's false positives on top of the oracle's staging, =2 computes the prediction
+and stages nothing.
+
+DeepSeek V4.1-Flash Q2mix, 512 tokens, -ub 1, 17 I/O threads, tok/s; KL against exact K=6 on ~3K
+tokens at -ub 1 (SiegeLadder runs.md 4.27): base 9.3-10.0; drop < 0.12 10.8-11.2, KL 0.0137; with
+DROP_ALL 10.6, KL 0.0105; DROP_ALL < 0.14 11.8-12.2, KL 0.0146; DROP_ALL < 0.14 with A' top 3 staged
+12.4-12.5, KL 0.0166 (K=5: 0.0276). Oracle staging one call ahead at recall 1.0 / 0.9 / 0.75 / 0.6:
+14.4 / 13.1 / 11.5 / 10.9; with A''s false positives at 0.6: 9.75, which is A' itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |  21 +++-
+ src/llama-moe-stream.cpp | 261 +++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h   |  40 +++++-
+ 3 files changed, 307 insertions(+), 15 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 656a2a3..5287fa9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2313,10 +2313,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         stream_wave_cap = wb.cap;
+     }
+ 
+-    ggml_tensor * ids_gemm = selected_experts;
++    ggml_tensor * ids_gemm  = selected_experts;
++    ggml_tensor * drop_mask = nullptr;
+     if (msl && n_stream_waves == 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+-        if (pred_next != nullptr) {
++        if (msl->mgr->drop_w > 0.0f && !weight_before_ffn) {
++            // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, off by default): the remap also needs this call's
++            // routing weights to tell the low-weight experts; the prediction, when there is one, rides along.
++            // Its weight multipliers come out of a second op right after it, on the same host split.
++            ggml_tensor * args[3] = { ids_cont, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), nullptr };
++            int n_args = 2;
++            if (pred_next != nullptr) {
++                args[n_args++] = ggml_cont(ctx0, pred_next);
++            }
++            ids_gemm  = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, args, n_args,
++                    llama_moe_stream_remap_v, 1, msl);
++            drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ids_cont->ne[0], ids_cont->ne[1], 1, &ids_gemm, 1,
++                    llama_moe_stream_drop_mask, 1, msl);
++            cb(drop_mask, "ffn_moe_drop_mask", il);
++        } else if (pred_next != nullptr) {
+             // the prediction rides to the host with this layer's ids: same op, same sync
+             ids_gemm = ggml_map_custom2(ctx0, ids_cont, ggml_cont(ctx0, pred_next), llama_moe_stream_remap_pred, 1, msl);
+         } else {
+@@ -2542,7 +2557,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     if (!weight_before_ffn) {
+-        experts = ggml_mul(ctx0, experts, weights);
++        experts = ggml_mul(ctx0, experts, drop_mask != nullptr ? ggml_mul(ctx0, weights, drop_mask) : weights);
+         cb(experts, "ffn_moe_weighted", il);
+     }
+ 
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 63f7246..3e16668 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -503,6 +503,28 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_PRED_RAM")) {
+         pred_ram = (uint32_t) std::max(0, atoi(p));
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_PRED_STAGE")) {
++        pred_stage = std::min(2, std::max(0, atoi(p)));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE_RECALL")) {
++        oracle_recall = std::min(1.0f, std::max(0.0f, (float) std::strtod(p, nullptr)));
++    }
++    // drop rule; see drop_w in the header. Lossy: it changes the output whenever it fires.
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_W")) {
++        drop_w = std::max(0.0f, (float) std::strtod(p, nullptr));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_RENORM")) {
++        drop_renorm = std::strtol(p, nullptr, 10) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ALL")) {
++        drop_all = std::strtol(p, nullptr, 10) != 0;
++    }
++    if (drop_w > 0.0f) {
++        LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy): an expert held in neither VRAM nor the host tier with "
++                       "less than %.3f of the routing weight is not waited for%s%s\n", __func__, drop_w,
++                       drop_all ? ", only when that frees the call from the drive" : "",
++                       drop_renorm ? ", the kept pairs renormalised" : "");
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_VRAM")) {
+         spec_vram = std::strtol(p, nullptr, 10) != 0;
+     }
+@@ -1189,6 +1211,16 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+ // idle until its call: the graph synchronises on every remap, so nothing on the GPU still reads its
+ // slots, and the call itself waits for RESIDENT as for any other load. Without an evictable slot the
+ // expert is left to demand. Math is untouched: this moves when an upload happens, not what is read.
++// Deterministic uniform [0, 1) of a call index and an expert (splitmix64): every run of one
++// ORACLE_RECALL point keeps exactly the same experts.
++static float moe_hash01(uint64_t a, uint64_t b) {
++    uint64_t z = a*0x9E3779B97F4A7C15ull + b + 0x632BE59BD9B4E019ull;
++    z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ull;
++    z = (z ^ (z >> 27))*0x94D049BB133111EBull;
++    z ^= z >> 31;
++    return (float) (z >> 40) / (float) (1ull << 24);
++}
++
+ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+     for (int64_t j0 = idx + 1; j0 <= idx + vram_ahead && j0 < (int64_t) spec_oracle.size(); j0++) {
+         const int32_t il_f = spec_oracle[(size_t) j0].first;
+@@ -1196,12 +1228,25 @@ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+             continue; // never the running layer: its slots are about to be read
+         }
+         const auto & experts = spec_oracle[(size_t) j0].second;
+-        stage_experts_locked(*layers[il_f], experts.data(), experts.size());
++        if (oracle_recall < 1.0f) {
++            // a predictor that misses some of the call's experts: those are neither staged nor protected
++            oracle_kept.clear();
++            for (const int32_t e : experts) {
++                if (moe_hash01((uint64_t) j0, (uint64_t) e) < oracle_recall) {
++                    oracle_kept.push_back(e);
++                }
++            }
++            stage_experts_locked(*layers[il_f], oracle_kept.data(), oracle_kept.size());
++        } else {
++            stage_experts_locked(*layers[il_f], experts.data(), experts.size());
++        }
+     }
+ }
+ 
+-void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n) {
+-    std::fill(sf.keep.begin(), sf.keep.end(), 0);
++void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep) {
++    if (!add_keep) {
++        std::fill(sf.keep.begin(), sf.keep.end(), 0);
++    }
+     for (size_t i = 0; i < n; i++) {
+         const auto it = sf.expert_slot.find(experts[i]);
+         if (it != sf.expert_slot.end()) {
+@@ -1245,6 +1290,9 @@ void llama_moe_stream::predict_locked(const llama_moe_stream_layer & sl_now, con
+         return;
+     }
+     stats.n_pred_calls++;
++    if (pred_stage == 2) {
++        return; // measurement: the graph computes the prediction, nothing acts on it
++    }
+ 
+     pred_seen.assign(sf->n_expert, 0);
+     pred_order.clear();
+@@ -1258,10 +1306,32 @@ void llama_moe_stream::predict_locked(const llama_moe_stream_layer & sl_now, con
+         }
+     }
+ 
+-    const size_t n_vram = std::min(pred_order.size(), (size_t) pred_vram*(size_t) n_tok);
+-    const size_t n_ram  = std::min(pred_order.size(), (size_t) pred_ram *(size_t) n_tok);
++    size_t n_vram = std::min(pred_order.size(), (size_t) pred_vram*(size_t) n_tok);
++    size_t n_ram  = std::min(pred_order.size(), (size_t) pred_ram *(size_t) n_tok);
++    if (pred_stage == 1) {
++        // measurement: only the prediction's false positives among its top pred_vram, staged on top of
++        // the oracle's staging of the same call - which has just run, so its keep marks are added to,
++        // not cleared. The next call is spec_calls: this call's trace_and_speculate_locked counted itself.
++        const int64_t j = spec_calls;
++        if (j >= (int64_t) spec_oracle.size() || spec_oracle[(size_t) j].first != sf->il) {
++            return; // nothing known about the next call, so nothing is known to be false
++        }
++        for (const int32_t e : spec_oracle[(size_t) j].second) {
++            if (e >= 0 && (uint32_t) e < sf->n_expert) {
++                pred_seen[e] = 2;
++            }
++        }
++        size_t w = 0;
++        for (size_t i = 0; i < n_vram; i++) {
++            if (pred_seen[pred_order[i]] != 2) {
++                pred_order[w++] = pred_order[i];
++            }
++        }
++        n_vram = w;
++        n_ram  = 0;
++    }
+     if (n_vram > 0) {
+-        stage_experts_locked(*sf, pred_order.data(), n_vram);
++        stage_experts_locked(*sf, pred_order.data(), n_vram, /*add_keep =*/ pred_stage == 1);
+     }
+     // after staging: speculate_locked skips what now has a VRAM slot, so only the wider ranks are read ahead
+     for (size_t i = 0; i < n_ram; i++) {
+@@ -1406,6 +1476,17 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_pred_calls, pred_vram, pred_ram, stats.n_stage, stats.n_stage_ready,
+                 stats.n_stage_late, stats.n_stage_waste, stats.n_stage_skip, stats.n_pred_spec);
+     }
++    if (oracle_recall < 1.0f || pred_stage != 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: measurement: the oracle's staging keeps %.2f of each call's experts; "
++                "the prediction stages %s\n", __func__, pfx, oracle_recall,
++                pred_stage == 0 ? "all it predicts" : pred_stage == 1 ? "only its false positives" : "nothing");
++    }
++    if (drop_w > 0.0f) {
++        LLAMA_LOG_WARN("%s: %smoe stream: drop rule (lossy; held in neither tier, share < %.3f%s): %" PRId64 " pairs of %"
++                PRId64 " experts dropped, in %" PRId64 " of %" PRId64 " calls\n", __func__, pfx, drop_w,
++                drop_renorm ? ", kept pairs renormalised" : "", stats.n_drop_pairs, stats.n_drop_exp,
++                stats.n_drop_calls, stats.n_calls);
++    }
+     if (n_shift > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: miss-only shift swapped %" PRId64 " experts (%" PRId64 " from the host tier)\n",
+                 __func__, pfx, n_shift, n_shift_l2);
+@@ -1705,14 +1786,15 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+     }
+ }
+ 
+-static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred, void * userdata);
++static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
++        const ggml_tensor * wts, void * userdata);
+ 
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith != 0) {
+         return;
+     }
+-    moe_stream_remap_impl(dst, a, nullptr, userdata);
++    moe_stream_remap_impl(dst, a, nullptr, nullptr, userdata);
+ }
+ 
+ void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
+@@ -1720,10 +1802,45 @@ void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const
+     if (ith != 0) {
+         return;
+     }
+-    moe_stream_remap_impl(dst, a, b, userdata);
++    moe_stream_remap_impl(dst, a, b, nullptr, userdata);
++}
++
++void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    const ggml_tensor * pred = nullptr;
++    const ggml_tensor * wts  = nullptr;
++    for (int i = 1; i < GGML_MAX_SRC && dst->src[i] != nullptr; i++) {
++        if (dst->src[i]->type == GGML_TYPE_F32) {
++            wts = dst->src[i];
++        } else {
++            pred = dst->src[i];
++        }
++    }
++    moe_stream_remap_impl(dst, dst->src[0], pred, wts, userdata);
++}
++
++void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
++    float * out = (float *) dst->data;
++    const int64_t n = ggml_nelements(dst);
++    std::lock_guard<std::mutex> lk(sl->mgr->mtx);
++    if ((int64_t) sl->drop_mask.size() == n) {
++        std::memcpy(out, sl->drop_mask.data(), (size_t) n*sizeof(float));
++    } else {
++        std::fill(out, out + n, 1.0f);
++    }
+ }
+ 
+-static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred, void * userdata) {
++static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
++        const ggml_tensor * wts, void * userdata) {
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
+@@ -1733,6 +1850,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     GGML_ASSERT(ggml_is_contiguous(a));
+     GGML_ASSERT(ggml_are_same_shape(a, dst));
+     GGML_ASSERT(pred == nullptr || (pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred) && pred->ne[1] == a->ne[1]));
++    GGML_ASSERT(wts == nullptr || (wts->type == GGML_TYPE_F32 && ggml_is_contiguous(wts) && ggml_nelements(wts) == ggml_nelements(a)));
+ 
+     const int64_t n = ggml_nelements(a);
+ 
+@@ -1781,6 +1899,102 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         }
+     }
+ 
++    // Drop rule (LLAMA_MOE_STREAM_DROP_W; lossy, off by default; see drop_w in the header). An expert held
++    // neither in VRAM nor in the host tier, whose share of its token's routing weight is below the threshold
++    // in every pair it has, is taken out of this call: none of its pairs waits for the drive - they are
++    // mapped onto a kept slot of the same token and multiplied by 0 (llama_moe_stream_drop_mask) - and it is
++    // read into the host tier below, for the calls after this one. Its hotness was counted above: it was
++    // routed. A token's top pair has at least 1/k of its weight, so with the threshold capped under that,
++    // every token keeps at least one pair.
++    sl->dropped.clear();
++    if (wts != nullptr) {
++        const int64_t k     = a->ne[0];
++        const int64_t n_tok = a->ne[1];
++        const float   thr   = std::min(mgr->drop_w, 0.99f/(float) k);
++        const float * w     = (const float *) wts->data;
++        if (thr > 0.0f) {
++            sl->drop_share.assign(sl->n_expert, 0.0f);
++            for (int64_t t = 0; t < n_tok; t++) {
++                float s = 0.0f;
++                for (int64_t j = 0; j < k; j++) {
++                    s += w[t*k + j];
++                }
++                for (int64_t j = 0; j < k; j++) {
++                    const int32_t e = ids[t*k + j];
++                    sl->drop_share[e] = std::max(sl->drop_share[e], s > 0.0f ? w[t*k + j]/s : 1.0f);
++                }
++            }
++            // only on the drive: held neither in VRAM (resident or loading) nor whole in the host tier. The
++            // host tier's lock nests inside mgr->mtx here; the workers never hold mgr->mtx while they are in
++            // the host tier, so the order cannot invert.
++            auto on_drive = [&](int32_t e) {
++                if (sl->expert_slot.find(e) != sl->expert_slot.end()) {
++                    return false;
++                }
++                if (!mgr->l2) {
++                    return true;
++                }
++                for (const auto & wt : sl->weights) {
++                    if (!mgr->l2->has(wt.file_idx, wt.offs + (size_t) e*wt.nb_expert, wt.nb_expert)) {
++                        return true;
++                    }
++                }
++                return false;
++            };
++            bool heavy_on_drive = false;
++            for (const int32_t e : sl->uniq) {
++                const bool light = sl->drop_share[e] < thr;
++                if ((light || mgr->drop_all) && on_drive(e)) {
++                    if (light) {
++                        sl->dropped.push_back(e);
++                    } else {
++                        heavy_on_drive = true;
++                    }
++                }
++            }
++            if (mgr->drop_all && heavy_on_drive) {
++                sl->dropped.clear(); // the call waits for the drive anyway: dropping would only cost quality
++            }
++            if (!sl->dropped.empty()) {
++                for (const int32_t e : sl->dropped) {
++                    sl->touched[e] = 2;
++                }
++                size_t n_keep = 0;
++                for (size_t i = 0; i < sl->uniq.size(); i++) {
++                    if (sl->touched[sl->uniq[i]] != 2) {
++                        sl->uniq[n_keep++] = sl->uniq[i];
++                    }
++                }
++                sl->uniq.resize(n_keep);
++            }
++        }
++        sl->drop_mask.assign((size_t) n, 1.0f);
++        for (int64_t t = 0; t < n_tok && !sl->dropped.empty(); t++) {
++            float s = 0.0f;
++            float s_drop = 0.0f;
++            for (int64_t j = 0; j < k; j++) {
++                s += w[t*k + j];
++                if (sl->touched[ids[t*k + j]] == 2) {
++                    s_drop += w[t*k + j];
++                    sl->drop_mask[t*k + j] = 0.0f;
++                    mgr->stats.n_drop_pairs++;
++                }
++            }
++            if (mgr->drop_renorm && s_drop > 0.0f && s > s_drop) {
++                const float f = s/(s - s_drop);
++                for (int64_t j = 0; j < k; j++) {
++                    if (sl->drop_mask[t*k + j] != 0.0f) {
++                        sl->drop_mask[t*k + j] = f;
++                    }
++                }
++            }
++        }
++        if (!sl->dropped.empty()) {
++            mgr->stats.n_drop_exp += (int64_t) sl->dropped.size();
++            mgr->stats.n_drop_calls++;
++        }
++    }
++
+     // classify the touched experts; reserve and enqueue demand loads in deterministic order
+     std::fill(sl->keep.begin(), sl->keep.end(), 0);
+     sl->demand_slots.clear();
+@@ -1867,6 +2081,11 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // the demand is enqueued delays the very loads the graph is about to wait on.
+     moe_nvtx_push("speculate", sl->il);
+     mgr->trace_and_speculate_locked(*sl);
++    // the drop rule's other half: what this call did not wait for is read into the host tier for the
++    // calls after it, behind every demand load, so the next call that wants it copies it from RAM
++    for (const int32_t e : sl->dropped) {
++        mgr->speculate_locked(*sl, e);
++    }
+     moe_nvtx_pop();
+ 
+     // Staging next (A4b): after this call's own demand, so its loads stay first in line, and before the
+@@ -1902,10 +2121,32 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     }
+ 
+     for (int64_t i = 0; i < n; i++) {
++        if (sl->touched[ids[i]] == 2) {
++            out[i] = -1; // dropped: given a kept slot of its token below
++            continue;
++        }
+         const int32_t s = sl->expert_slot.at(ids[i]);
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
++    if (!sl->dropped.empty()) {
++        // a dropped pair still runs through the expert GEMMs, with weight 0: any resident slot of the same
++        // token will do, and there is one - a token's top pair is never dropped
++        const int64_t k = a->ne[0];
++        for (int64_t i = 0; i < n; i++) {
++            if (out[i] >= 0) {
++                continue;
++            }
++            const int64_t t0 = (i/k)*k;
++            for (int64_t j = t0; j < t0 + k; j++) {
++                if (out[j] >= 0) {
++                    out[i] = out[j];
++                    break;
++                }
++            }
++            GGML_ASSERT(out[i] >= 0);
++        }
++    }
+ }
+ 
+ // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index e9caa7e..16c39dc 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -116,6 +116,12 @@ struct llama_moe_stream_layer {
+     // finds it, and by any new reservation of the slot
+     std::vector<uint8_t> slot_staged;
+     std::vector<int32_t> demand_slots; // slots the current call waits on
++    // drop rule (LLAMA_MOE_STREAM_DROP_W): the weight multiplier of each [n_expert_used, n_tokens] pair of
++    // the current call - 0 for a dropped pair, 1 (or the renormalising factor) for the rest - written by
++    // the remap and copied out by llama_moe_stream_drop_mask; the experts dropped; per-expert scratch
++    std::vector<float>   drop_mask;
++    std::vector<int32_t> dropped;
++    std::vector<float>   drop_share; // [n_expert] the largest share of a token's routing weight it has
+ 
+     // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
+     // plan_n_waves passes of at most plan_capacity experts each, run one pass at a time
+@@ -459,6 +465,26 @@ struct llama_moe_stream {
+     uint32_t pred_k() const { return pred_vram > pred_ram ? pred_vram : pred_ram; }
+     std::vector<uint8_t> pred_seen;  // scratch of predict_locked, under mtx
+     std::vector<int32_t> pred_order;
++    // What the prediction stages (LLAMA_MOE_STREAM_PRED_STAGE): 0 all of it; 1 only the experts the oracle
++    // says the next call will NOT use - its false positives, on top of the oracle's own staging; 2 nothing,
++    // the graph still computes it. 1 and 2 are measurement apparatus, like oracle_recall below.
++    int32_t pred_stage = 0;
++    // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
++    // probability, by a deterministic hash of the call and the expert (LLAMA_MOE_STREAM_ORACLE_RECALL, 1 = all)
++    float   oracle_recall = 1.0f;
++    std::vector<int32_t> oracle_kept; // scratch of stage_ahead_locked, under mtx
++    // Drop rule (proposed by the user 2026-10-15; lossy, so opt-in and measured by KL first). A step waits
++    // for its slowest miss, and that is often a low-weight expert on the drive. A routed expert held neither
++    // in VRAM nor in the host tier, whose share of the routing weight is below drop_w in every pair it has,
++    // is not waited for: its pairs get weight 0 in this call, and it is read into the host tier for the
++    // calls after it. LLAMA_MOE_STREAM_DROP_W (0 = off); LLAMA_MOE_STREAM_DROP_RENORM=1 scales the kept
++    // pairs of the token back up to its full routing weight.
++    float   drop_w      = 0.0f;
++    bool    drop_renorm = false;
++    // LLAMA_MOE_STREAM_DROP_ALL=1: drop only when every drive miss of the call is below the threshold. A call
++    // with one heavy drive miss waits for the drive anyway, and its light ones load in parallel at no extra
++    // time, so dropping them there costs quality and buys nothing.
++    bool    drop_all    = false;
+     // speculate experts that are in the VRAM cache too (LLAMA_MOE_STREAM_SPEC_VRAM=1); see speculate_locked
+     bool    spec_vram      = false;
+     // the remap protects every slot its call reads before picking a victim (LLAMA_MOE_STREAM_KEEP_FIRST=0: off)
+@@ -540,6 +566,9 @@ struct llama_moe_stream {
+         int64_t n_stage_waste = 0; // staged for a call that did not ask for the expert after all
+         int64_t n_pred_calls  = 0; // remap calls that acted on a prediction of the next layer (3a)
+         int64_t n_pred_spec   = 0; // predicted experts queued to read ahead into the host tier
++        int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
++        int64_t n_drop_exp    = 0; // experts not loaded for their call because of it
++        int64_t n_drop_calls  = 0; // remap calls that dropped at least one expert
+         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
+ 
+         // wait for a free slot, which t_stall_us cannot see: it starts only once all demand loads
+@@ -571,8 +600,9 @@ struct llama_moe_stream {
+ 
+     // A4b: reserve slots and queue loads for the experts of calls idx+1..idx+vram_ahead
+     void stage_ahead_locked(int64_t idx, int32_t il_now);
+-    // reserve slots of layer sf and queue staged loads for these experts (the body of both staging paths)
+-    void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n);
++    // reserve slots of layer sf and queue staged loads for these experts (the body of both staging paths);
++    // add_keep: protect them on top of the experts a previous staging of the same call protected
++    void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep = false);
+     // 3a: act on the prediction of the next streamed layer after sl_now; pred is [k, n_tok] I32
+     void predict_locked(const llama_moe_stream_layer & sl_now, const int32_t * pred, int64_t k, int64_t n_tok);
+ 
+@@ -618,6 +648,12 @@ static inline bool llama_moe_stream_wave_skip(const llama_moe_stream_layer & sl,
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+ // the same, with b = the model's prediction of the next layer's experts ([k, n_tokens] I32; 3a)
+ void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
++// the same as a ggml_custom_4d op: src[0] the ids, then by type the routing weights (F32 [1, k, n_tokens],
++// for the drop rule) and the prediction (I32 [k', n_tokens], 3a), each optional
++void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userdata);
++// the drop rule's weight multipliers for the call its src[0] (the remap's output) has just handled,
++// F32 [1, k, n_tokens]
++void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
+ 
+ // Adds mgr->route_bias to the selection logits of every expert this layer currently holds
+ // (resident or loading), leaving masked-out entries at -inf untouched. Runs before top-k, so it

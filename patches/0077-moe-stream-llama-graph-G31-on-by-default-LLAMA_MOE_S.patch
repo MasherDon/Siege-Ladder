@@ -1,0 +1,162 @@
+From cbf88ee8f9c992e78e5adf13c18a873ebf296fab Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 10:35:15 +0000
+Subject: [PATCH 77/91] moe-stream, llama-graph : G31 on by default
+ (LLAMA_MOE_STREAM_G31=0 - off; +2.8%, bit for bit - SiegeLadder runs.md
+ 4.145, 4.151, 4.157), quietly giving way to runahead, C13, the G4 probe and
+ VRAM_ONLY=2; C14 works next to G31 (its selection in G31's first half, the
+ second half neither waits for the deferred experts nor gives their pairs
+ their slots - the same numbers as without G31)
+
+---
+ src/llama-graph.cpp      |  5 ++--
+ src/llama-moe-stream.cpp | 59 ++++++++++++++++++++++++++++------------
+ src/llama-moe-stream.h   |  8 +++---
+ 3 files changed, 48 insertions(+), 24 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c4142f3..1318ddf 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3693,8 +3693,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // SiegeLadder C14 (c14_q in llama_moe_stream): the model graph marked this layer c14_ok; a graph that cannot serve
+         // the pairs the remap would defer takes the mark back, and the remap (which reads it) defers none
+         if (msl != nullptr && msl->c14_ok) {
+-            const bool c14_here = n_tokens == 1 && drop_mask != nullptr && !weight_before_ffn && ra_ids == nullptr &&
+-                    !g31_split && (!msl->mgr->c14_real || (msl->rp_on && msl->mgr->skip_capable));
++            // (next to G31's split - ra_ids is its first half then - but not runahead's)
++            const bool c14_here = n_tokens == 1 && drop_mask != nullptr && !weight_before_ffn &&
++                    (ra_ids == nullptr || g31_split) && (!msl->mgr->c14_real || (msl->rp_on && msl->mgr->skip_capable));
+             msl->c14_ok = c14_here;
+         }
+         if (msl != nullptr && msl->c14_ok && msl->mgr->c14_real) {
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 3eb6f90..e351fab 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -974,20 +974,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                 drop_all ? "; DROP_ALL: a call in which a heavy expert still waits for the drive gives its drops and "
+                            "substitutions back" : "");
+     }
+-    // SiegeLadder G31; see g31 in the header. Lossless: the same rows, multipliers and sum as the single remap
++    // SiegeLadder G31; see g31 in the header. Lossless: the same rows, multipliers and sum as the single remap. On by
++    // default since runs.md 4.151 (+2.8%; bit for bit, 4.145); LLAMA_MOE_STREAM_G31=0 - off. It gives way, after the C14
++    // keys below, to what splits or reshapes the call otherwise - quietly unless it was asked for
++    bool g31_asked = false;
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G31")) {
+-        g31 = atoi(p) != 0 ? 1 : 0;
+-    }
+-    if (g31 > 0 && (runahead_k > 0 || subst > 0 || g4_probe > 0 || drop_vram_only == 2)) {
+-        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G31 is ignored next to %s\n", __func__,
+-                runahead_k > 0 ? "runahead (its remap is split already)" : subst > 0 ? "C13 (LLAMA_MOE_STREAM_SUBST)" :
+-                g4_probe > 0 ? "the G4 probe" : "the drop rule's VRAM_ONLY=2");
+-        g31 = 0;
+-    }
+-    if (g31 > 0) {
+-        LLAMA_LOG_WARN("%s: moe stream: G31 on: at decode each streamed layer's remap is split in two without runahead's "
+-                "pass - the expert GEMMs of the pairs resident at the first half run while the call's other copies fly, "
+-                "the second half's GEMMs write the other rows into the same output\n", __func__);
++        g31       = atoi(p) != 0 ? 1 : 0;
++        g31_asked = g31 > 0;
+     }
+     // SiegeLadder C14, probe E1; see c14_q in the header. C14 proper (c14_real) takes the same keys but C14 for C14_Q
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_Q")) {
+@@ -1021,15 +1014,32 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_DEPTH")) {
+         c14_depth = atoi(p) >= 2 ? 2 : 1;
+     }
+-    if (c14_q > 0.0f && (drop_w <= 0.0f || runahead_k > 0 || subst > 0 || g4_probe > 0 || g31 > 0 ||
++    if (c14_q > 0.0f && (drop_w <= 0.0f || runahead_k > 0 || subst > 0 || g4_probe > 0 ||
+                 (c14_real && (!mailbox || c14_drop)))) {
+         LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_%s is ignored %s\n", __func__, c14_real ? "C14" : "C14_Q",
+                 drop_w <= 0.0f ? "without the drop rule's path (DROP_W > 0; 1e-6 for the exact one)" :
+                 runahead_k > 0 ? "next to runahead" : subst > 0 ? "next to C13" : g4_probe > 0 ? "next to the G4 probe" :
+-                g31 > 0 ? "next to G31" : !mailbox ? "without the mailbox (G16)" : "with C14_DROP (that is the probe's)");
++                !mailbox ? "without the mailbox (G16)" : "with C14_DROP (that is the probe's)");
+         c14_q    = 0.0f;
+         c14_real = false;
+     }
++    // G31 gives way to runahead (its remap is split already), C13, the G4 probe and VRAM_ONLY=2 (a token may lose every
++    // pair there, and the single remap's fallback slot of the layer has no second half). With C14 it works: C14 decides in
++    // the first half, the second half neither waits for the deferred experts nor gives their pairs their slots
++    if (g31 > 0 && (runahead_k > 0 || subst > 0 || g4_probe > 0 || drop_vram_only == 2)) {
++        if (g31_asked) {
++            LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G31 is ignored next to %s\n", __func__,
++                    runahead_k > 0 ? "runahead (its remap is split already)" : subst > 0 ? "C13 (LLAMA_MOE_STREAM_SUBST)" :
++                    g4_probe > 0 ? "the G4 probe" : "the drop rule's VRAM_ONLY=2");
++        }
++        g31 = 0;
++    }
++    if (g31 > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: G31 on (the default; LLAMA_MOE_STREAM_G31=0 - off): at decode each streamed layer's "
++                "remap is split in two without runahead's pass - the expert GEMMs of the pairs resident at the first half "
++                "run while the call's other copies fly, the second half's GEMMs write the other rows into the same output\n",
++                __func__);
++    }
+     if (c14_real && c14_depth != 1) {
+         LLAMA_LOG_WARN("%s: moe stream: C14 proper defers to the next layer's attention only (DEPTH 1)\n", __func__);
+         c14_depth = 1;
+@@ -4736,8 +4746,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         if (!sl->subst.empty()) {
+             moe_c13_weights_locked(*mgr, *sl, ids, w, c13_probs, k, n_tok); // C13's multipliers on top of the drop rule's
+         }
+-        // SiegeLadder C14 (probe E1, or proper): the deferred pairs, on top of the drop rule's multipliers
+-        if (mgr->c14_q > 0.0f && sl->c14_ok && issue_only == 0 && n_tok == 1) {
++        // SiegeLadder C14 (probe E1, or proper): the deferred pairs, on top of the drop rule's multipliers - in the single
++        // remap or G31's first half (its multipliers move to exact_mask with the drop rule's; not runahead's)
++        if (mgr->c14_q > 0.0f && sl->c14_ok && (issue_only == 0 || issue_only == 2) && n_tok == 1) {
+             moe_c14_select_locked(*mgr, *sl, ids, w, k);
+         }
+         if (!sl->c14_def.empty()) {
+@@ -5057,6 +5068,11 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+     sl->demand_slots.clear();
+     bool waited = false;
+     for (const int32_t e : sl->uniq) {
++        // SiegeLadder C14 proper next to G31: a deferred expert is waited for by c14_wait after the next layer's attention,
++        // not here (only G31's second half meets one: C14 does not run next to runahead)
++        if (g31 && !sl->c14_def.empty() && std::find(sl->c14_def.begin(), sl->c14_def.end(), e) != sl->c14_def.end()) {
++            continue;
++        }
+         const auto it = sl->expert_slot.find(e);
+         int32_t s = -1;
+         if (it != sl->expert_slot.end()) {
+@@ -5183,7 +5199,14 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
+-    if (!sl->dropped.empty()) {
++    // SiegeLadder C14 proper next to G31: a deferred pair reads a kept slot of its token at weight 0 (its exact_mask, as in
++    // the single remap); its own slot goes to its GEMMs through c14_wait
++    if (g31) {
++        for (const auto & p : sl->c14_pairs) {
++            out[p.i] = -1;
++        }
++    }
++    if (!sl->dropped.empty() || (g31 && !sl->c14_pairs.empty())) {
+         // as in the remap: a dropped pair still runs through the expert GEMMs at weight 0 (exact_mask), on any kept
+         // slot of its token - a token's top pair is never dropped outside the VRAM_ONLY measurements, which runahead
+         // does not run with
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index bac915f..f414553 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -809,15 +809,15 @@ struct llama_moe_stream {
+     // llama_context::process_ubatch, around each compute: the graph's blocks bound to their layers, then unbound
+     void g32_bind_layer(int32_t il, const std::vector<ggml_tensor *> * nodes);
+     void g32_unbind();
+-    // SiegeLadder G31 (LLAMA_MOE_STREAM_G31=1; 0 - off, the default): at decode, without runahead, a streamed layer's remap
++    // SiegeLadder G31 (on by default since runs.md 4.151, +2.8%; LLAMA_MOE_STREAM_G31=0 - off): at decode, without runahead, a streamed layer's remap
+     // in two halves as runahead's but with no approximate pass. The first queues the call's loads and decides the drop
+     // rule as the remap does, and gives the expert GEMMs the slots of the pairs resident at its end (the others the skip
+     // id); the card runs those GEMMs in a split of their own while the other copies fly. The second waits for the loads
+     // and gives the slots of the other pairs, whose GEMMs write their rows into the first ones' output (G30's mechanism);
+     // the multipliers and the weighted sum are the single remap's - the output is the same bit for bit. Not next to
+-    // runahead (its remap is split already), C13, the G4 probe or the drop rule's VRAM_ONLY=2; needs the mailbox and its
+-    // reply (G16 / G22), and the expert pipeline ending in the down GEMM (build_moe_ffn)
+-    int32_t  g31             = 0;
++    // runahead (its remap is split already), C13, the G4 probe, the drop rule's VRAM_ONLY=2 or C14 (it gives way to all of
++    // them); needs the mailbox and its reply (G16 / G22), and the expert pipeline ending in the down GEMM (build_moe_ffn)
++    int32_t  g31             = 1;
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
+     bool     skip_capable    = true;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this

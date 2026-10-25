@@ -1,0 +1,74 @@
+From aae998647fefd430880ef8b9380cb9fa6d9b81cb Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:54:06 +0000
+Subject: [PATCH 85/91] moe-stream : G35 v2 on by default -
+ LLAMA_MOE_STREAM_G35 unset is 2 (the user's decision of 25.10 after
+ SiegeLadder runs.md 4.203 / 4.209: within error on the three API anchors, +4%
+ decode on the cd build); =0 - off. The exact preset's runahead builds no lens
+ - the log now says G35 gives way to it (SiegeLadder twenty-fifth session)
+
+---
+ src/llama-moe-stream.cpp | 11 +++++++----
+ src/llama-moe-stream.h   |  8 +++++---
+ 2 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index c6b742a..39f7028 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -747,7 +747,8 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
+ 
+ // SiegeLadder presets (LLAMA_MOE_STREAM_PRESET=exact|default|fast): one key for the decode modes of runs.md 4.157-4.161.
+ // A preset only fills keys that are not set, so an explicit key still wins. exact - no drops (runahead K = 6 then takes
+-// over by itself, lossless); default - the fork's own defaults (drop 0.14 with DROP_ALL, G31); fast - the default plus
++// over by itself, lossless; G35 gives way to it); default - the fork's own defaults (drop 0.14 with DROP_ALL, G31, G35 v2
++// since 25.10); fast - the default plus
+ // C14 0.2 (late, N 1: +4.8...+5.2% over the default, general-100 dNLL about +0.005 more, 4.152 / 4.157). Runs before
+ // any key is read, at the start of the ctor; the keys are set in the process environment, so children see them too.
+ static void moe_stream_apply_preset() {
+@@ -1034,7 +1035,7 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         g31       = atoi(p) != 0 ? 1 : 0;
+         g31_asked = g31 > 0;
+     }
+-    // SiegeLadder G35, heavy-ahead; see g35_depth in the header (off by default, a measurement)
++    // SiegeLadder G35, heavy-ahead; see g35_depth in the header (on by default: v2, d = 2; =0 - off)
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35")) {
+         g35_depth = std::max(0, atoi(p));
+     }
+@@ -1047,8 +1048,10 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
+         g35_lazy = std::max(0, std::min(2, atoi(p)));
+     }
+-    if (g35_depth > 0) {
+-        LLAMA_LOG_WARN("%s: moe stream: G35 (heavy-ahead, a measurement): the router lens %d calls ahead, its %d best, "
++    if (g35_depth > 0 && runahead_k > 0) {
++        LLAMA_LOG_INFO("%s: moe stream: G35 gives way to runahead (the graph builds no lens next to it)\n", __func__);
++    } else if (g35_depth > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: G35 (heavy-ahead): the router lens %d calls ahead, its %d best, "
+                 "read ahead into the host tier from a share of %.3f (on G31's split at decode)%s\n", __func__, g35_depth,
+                 g35_m, g35_h, g35_lazy == 1 ? "; lazy: each lens read by the next layer" :
+                 g35_lazy == 2 ? "; lazy 2: by its own layer if in, else by the next" : "");
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index afe2dd5..1bb9c4d 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -827,14 +827,16 @@ struct llama_moe_stream {
+     // runahead (its remap is split already), C13, the G4 probe, the drop rule's VRAM_ONLY=2 or C14 (it gives way to all of
+     // them); needs the mailbox and its reply (G16 / G22), and the expert pipeline ending in the down GEMM (build_moe_ffn)
+     int32_t  g31             = 1;
+-    // SiegeLadder G35, heavy-ahead (theories G35, runs.md 4.165 / 4.170; LLAMA_MOE_STREAM_G35=d, off by default): at decode,
++    // SiegeLadder G35, heavy-ahead (theories G35, runs.md 4.165 / 4.170; LLAMA_MOE_STREAM_G35=d): at decode,
+     // on G31's split, each layer L computes on the card the router lens of layer L + d - the router of L + d on L's router
+     // input - and posts every expert's scores in mailbox record [1] after record [0] and the shared expert (the card
+     // computes it while the host remaps); the first half picks the lens's G35_M best and reads ahead into the host tier
+     // (speculate_locked, one pool wake-up a lens) those whose share of the lens's top n_used is at least G35_H - the
+     // heavy drive misses the default would wait for, d calls before their call. The math is untouched (it changes when a
+-    // slab is read); with the drop rule fewer heavy experts are on the drive, so fewer calls wait
+-    int32_t  g35_depth       = 0;
++    // slab is read); with the drop rule fewer heavy experts are on the drive, so fewer calls wait. On by default (v2,
++    // d = 2) since the user's decision of 25.10 (runs.md 4.203 / 4.209: on the anchors within error, +4% decode);
++    // LLAMA_MOE_STREAM_G35=0 - off. Never next to runahead (the exact preset) - the graph builds no lens there
++    int32_t  g35_depth       = 2;
+     int32_t  g35_m           = 8;
+     float    g35_h           = 0.14f;
+     // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer

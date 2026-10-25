@@ -1,0 +1,509 @@
+From c94003871bac649beea7be3fcc121c4108cec330 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 10:56:31 +0000
+Subject: [PATCH 35/91] P1 review fixes, and the drop rule next to runahead -
+ pins: a context that builds graphs on the head itself (MTP of the same model,
+ a DFlash / EAGLE3 draft through ctx_other) pins it for its lifetime, P1
+ neither releases a pinned head nor runs next to MTP hidden states switched on
+ at run time; every context starts with the head on the card, and one freed in
+ the middle of a prompt gives it back; a failed read keeps a (head-less)
+ scheduler instead of none, and the destructor tolerates none; a start-up
+ probe reserves the -ub buffers with the head out, so a -ub too large even
+ then fails at load (P1 off) instead of in the middle of a request; reserve
+ failures in the P1 transitions fail the call, not the process; a call that
+ failed in its ubatch loop no longer leaves its output groups behind; P1 is
+ off for contexts with several sequences (--parallel), where a prompt chunk
+ next to another sequence's token would move the head on every call;
+ ggml_backend_cuda_trim synchronizes every device before trimming its pools.
+ Drop rule + runahead (LLAMA_MOE_STREAM_DROP_W with an explicit
+ LLAMA_MOE_STREAM_RUNAHEAD): the first half takes the routing weights and
+ applies the rule, the exact path's multipliers live in exact_mask
+ (llama_moe_stream_exact_mask), the second half maps dropped pairs onto a kept
+ slot of their token; the first half no longer looks up the slot of a dropped
+ expert (std::out_of_range in a worker, a silent crash). SiegeLadder runs.md
+ 4.51: P1 bitwise again (129 of 129 rows); drop 0.14 + runahead KL 0.0097 vs
+ 0.0150 alone, but no faster than runahead (runahead gives the experts slots,
+ so the rule fires 7x less)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  16 +++--
+ src/llama-context.cpp           | 113 +++++++++++++++++++++++++++++---
+ src/llama-context.h             |   4 ++
+ src/llama-graph.cpp             |  17 ++++-
+ src/llama-model.cpp             |  24 ++++++-
+ src/llama-model.h               |   7 +-
+ src/llama-moe-stream.cpp        |  68 ++++++++++++++++---
+ src/llama-moe-stream.h          |  14 ++--
+ 8 files changed, 232 insertions(+), 31 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 93bb6f4..ce7ebcd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4612,17 +4612,23 @@ size_t ggml_backend_cuda_trim(ggml_backend_t backend) {
+         return 0;
+     }
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+-    ggml_cuda_set_device(cuda_ctx->device);
+-    // every queued kernel that took pool memory has to be done with it before the memory is unmapped
+-    CUDA_CHECK(cudaDeviceSynchronize());
+     size_t freed = 0;
+     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
++        bool synced = false;
+         for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+-            if (cuda_ctx->pools[d][s] != nullptr) {
+-                freed += cuda_ctx->pools[d][s]->trim();
++            if (cuda_ctx->pools[d][s] == nullptr) {
++                continue;
+             }
++            if (!synced) {
++                // every queued kernel that took this device's pool memory has to be done with it before it is unmapped
++                ggml_cuda_set_device(d);
++                CUDA_CHECK(cudaDeviceSynchronize());
++                synced = true;
++            }
++            freed += cuda_ctx->pools[d][s]->trim();
+         }
+     }
++    ggml_cuda_set_device(cuda_ctx->device);
+ #ifdef USE_CUDA_GRAPH
+     // a captured graph replays the pool addresses it was captured with, and they are unmapped now
+     cuda_ctx->cuda_graphs.clear();
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index eeba635..7aa5e71 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -481,6 +481,28 @@ llama_context::llama_context(
+         // it was, and says so only when N was asked for
+         const char * hy   = std::getenv("LLAMA_HEAD_YIELD");
+         const int    hy_n = hy != nullptr ? atoi(hy) : 64;
++        // the head belongs to the model: whatever this context does, it starts with the head on the card (a context
++        // freed in the middle of a prompt gives it back, but a failed read may not have), and a context that builds
++        // graphs on the head itself - MTP of the same model, a DFlash / EAGLE3 draft borrowing the target's through
++        // ctx_other - pins it, so that no P1 context releases it under them (review of fork 0a18812)
++        if (model.head_is_released() && !model.head_restore()) {
++            throw std::runtime_error("the output head was left released and cannot be read back from its file");
++        }
++        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT && model.head_yield_ready()) {
++            if (!model.head_pin()) {
++                throw std::runtime_error("the output head cannot be pinned for this context");
++            }
++            p1_pin_self = &model;
++        }
++        if (cparams.ctx_other != nullptr) {
++            const llama_model & om = cparams.ctx_other->get_model();
++            if (om.head_yield_ready()) {
++                if (!om.head_pin()) {
++                    throw std::runtime_error("the target's output head cannot be pinned for this context");
++                }
++                p1_pin_other = &om;
++            }
++        }
+         if (hy_n > 0) {
+             const uint32_t n = (uint32_t) hy_n;
+             const char * why = nullptr;
+@@ -491,12 +513,13 @@ llama_context::llama_context(
+             } else if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.ctx_other != nullptr ||
+                     cparams.embeddings || cparams.embeddings_nextn) {
+                 why = "MTP, paired and embedding contexts use the head (or the hidden state) on their own";
++            } else if (cparams.n_seq_max > 1) {
++                // a batch of one sequence's prompt next to another's generated token would send the head away and
++                // back on every call
++                why = "the context serves several sequences (--parallel)";
+             } else if (n >= cparams.n_ubatch) {
+                 why = "-ub is not above N, so no batch would release the head";
+             }
+-            if (why == nullptr && model.head_is_released() && !model.head_restore()) {
+-                why = "a context before this one left the head released, and it cannot be read back";
+-            }
+             if (why != nullptr) {
+                 if (hy != nullptr) {
+                     LLAMA_LOG_WARN("%s: LLAMA_HEAD_YIELD=%u is off: %s\n", __func__, n, why);
+@@ -513,6 +536,29 @@ llama_context::llama_context(
+ 
+         sched_reserve();
+ 
++        // P1: the -ub buffers are reserved only when the first long prompt comes. Probe them now, with the head
++        // out, so that a -ub too large even then fails here at load and not in the middle of a request: P1 goes
++        // off, and the full reserve with the head in place throws as it did before P1 (review of fork 0a18812)
++        if (p1_ub_small > 0 && !model.hparams.no_alloc) {
++            p1_enter();
++            bool fits = true;
++            try {
++                sched_reserve();
++            } catch (const std::exception & e) {
++                fits = false;
++                LLAMA_LOG_WARN("%s: head yield: -ub %u does not fit even with the head out (%s) - off\n", __func__,
++                        cparams.n_ubatch, e.what());
++            }
++            if (!p1_leave()) {
++                throw std::runtime_error("head yield: the output head could not be read back after the start-up probe");
++            }
++            if (!fits) {
++                p1_ub_small = 0;
++                sched_need_reserve = true;
++                sched_reserve();
++            }
++        }
++
+         if (!cparams.flash_attn) {
+             if (ggml_is_quantized(params.type_v)) {
+                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+@@ -552,7 +598,24 @@ llama_context::~llama_context() {
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
+-    if (!model.hparams.no_alloc) {
++    // SiegeLadder P1: the head goes back to the card for whoever uses the model next - after this context's compute
++    // buffers, so that the two never stand side by side - and the pins come off (review of fork 0a18812)
++    if (cparams.head_out) {
++        gf_res_prev.reset();
++        gf_res_reserve.reset();
++        sched.reset();
++        if (!model.head_restore()) {
++            LLAMA_LOG_WARN("%s: head yield: the output head could not be read back; the next context will try\n", __func__);
++        }
++    }
++    if (p1_pin_self != nullptr) {
++        p1_pin_self->head_unpin();
++    }
++    if (p1_pin_other != nullptr) {
++        p1_pin_other->head_unpin();
++    }
++
++    if (!model.hparams.no_alloc && sched) {
+         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+             ggml_backend_t             backend = backend_ptrs[i];
+             ggml_backend_buffer_type_t buft    = backend_buft[i];
+@@ -850,8 +913,15 @@ bool llama_context::p1_leave() {
+     }
+     double t_read_ms = 0.0;
+     if (!model.head_restore(&t_read_ms)) {
+-        // no head, no logits: the context cannot go on
++        // no head, no logits for this call. The context keeps a scheduler - the head-less one, head_out stays set
++        // - so that a later call can try the read again, and freeing the context does not trip on a missing one
+         p1_groups.clear();
++        sched_need_reserve = true;
++        try {
++            sched_reserve();
++        } catch (const std::exception & e) {
++            LLAMA_LOG_ERROR("%s: head yield: %s\n", __func__, e.what());
++        }
+         return false;
+     }
+     cparams.head_out = false;
+@@ -864,7 +934,12 @@ bool llama_context::p1_leave() {
+     }
+     p1_groups.clear();
+     sched_need_reserve = true;
+-    sched_reserve();
++    try {
++        sched_reserve();
++    } catch (const std::exception & e) {
++        LLAMA_LOG_ERROR("%s: head yield: the compute buffers for %u tokens: %s\n", __func__, p1_ub_small, e.what());
++        return false;
++    }
+     LLAMA_LOG_INFO("%s: head yield: head back in %.1f ms (read %.1f ms), logits of %lld rows, the CUDA pool gave back "
+             "%.1f MiB\n", __func__, (ggml_time_us() - t0)/1000.0, t_read_ms, (long long) n_rows, trimmed/1048576.0);
+     return ok;
+@@ -1997,8 +2072,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     // SiegeLadder P1: which side of a long prompt this call is on (see p1_ub_small)
+     if (p1_ub_small > 0) {
+-        // a call P1 can finish: logits only, a few rows, no backend sampling (its tensors hang off the logits)
+-        const bool p1_ok = !output_all && !has_samplers && n_outputs_all <= 64;
++        // a call that failed in its ubatch loop left its groups behind: its copies are waited for and it is forgotten
++        if (!p1_groups.empty()) {
++            if (sched) {
++                ggml_backend_sched_synchronize(sched.get());
++            }
++            p1_groups.clear();
++        }
++        // a call P1 can finish: logits only, a few rows, no backend sampling (its tensors hang off the logits), no
++        // MTP hidden states (switched on at run time by the speculative code), and no other context on the head
++        const bool p1_ok = !output_all && !has_samplers && n_outputs_all <= 64 && !cparams.embeddings_nextn &&
++                !model.head_pinned();
+         if (cparams.head_out && !p1_ok) {
+             // the head-less graph cannot serve this batch: the head comes back first
+             if (!p1_leave()) {
+@@ -2022,8 +2106,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             p1_groups.clear();
+         }
+         // a phase change re-reserves here, before this call's tokens are queued: sched_reserve synchronizes, and
+-        // the perf counters would book them as done at once
+-        sched_reserve();
++        // the perf counters would book them as done at once. A reserve that fails here fails the call, not the process
++        try {
++            sched_reserve();
++        } catch (const std::exception & e) {
++            LLAMA_LOG_ERROR("%s: head yield: the compute buffers for this batch: %s\n", __func__, e.what());
++            sched_need_reserve = true; // the failed reserve cleared it: the next call tries again
++            if (cparams.head_out) {
++                p1_leave();
++            }
++            return -2;
++        }
+     }
+ 
+     if (t_compute_start_us == 0) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index da627c8..08f722a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -352,6 +352,10 @@ private:
+     // same rows as the full graph would have run
+     uint32_t p1_ub_small = 0;      // N; 0 = off
+     bool     p1_full     = false;  // a batch P1 cannot take runs at n_ubatch with the head in place
++    // the heads this context pins for its lifetime (llama_model::head_pin): its own model's when it builds graphs on
++    // the head itself (MTP), the target's when it borrows it through ctx_other (DFlash / EAGLE3 drafts)
++    const llama_model * p1_pin_self  = nullptr;
++    const llama_model * p1_pin_other = nullptr;
+     int64_t  p1_n_embd   = 0;      // row size of the kept hidden states
+     std::vector<float> p1_hidden;  // [n_outputs_all][p1_n_embd] while the head is out
+     std::vector<std::pair<int64_t, int64_t>> p1_groups; // (first output row, rows) per ubatch, in order
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 21e66ba..659f585 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2323,11 +2323,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (msl && n_stream_waves == 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+         if (moe_runahead && msl->mgr->runahead_k > 0 && n_tokens == 1 && !weight_before_ffn && pred_next == nullptr &&
+-                msl->mgr->drop_w <= 0.0f && n_expert_used == (int64_t) hparams.n_expert_used) {
++                n_expert_used == (int64_t) hparams.n_expert_used) {
+             // the remap in two halves: the first queues the call's loads and returns at once with the slots of its
+             // resident experts; their weight multipliers come out of a second op expanded right after it, so both
+             // stay on one host split. The approximate pass and the second half follow the expert GEMMs' definition.
+-            ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, &ids_cont, 1,
++            // With the drop rule the first half also takes the routing weights and decides what is dropped
++            // (SiegeLadder 17.10: the fast preset's drop + runahead)
++            ggml_tensor * iargs[2] = { ids_cont, nullptr };
++            int n_iargs = 1;
++            if (msl->mgr->drop_w > 0.0f) {
++                iargs[n_iargs++] = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
++            }
++            ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, iargs, n_iargs,
+                     llama_moe_stream_remap_issue, 1, msl);
+             cb(ra_ids, "ffn_moe_topk_issue", il);
+             ggml_build_forward_expand(gf, ra_ids);
+@@ -2612,6 +2619,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, wargs, 2,
+                     llama_moe_stream_remap_wait, 1, msl);
+             cb(ids_gemm, "ffn_moe_topk_stream", il);
++            if (msl->mgr->drop_w > 0.0f) {
++                // the drop rule's multipliers for the exact path, decided by the first half
++                drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ra_ids->ne[0], ra_ids->ne[1], 1, &ids_gemm, 1,
++                        llama_moe_stream_exact_mask, 1, msl);
++                cb(drop_mask, "ffn_moe_drop_mask", il);
++            }
+         }
+         experts = build_expert_gemms(cur, ids_gemm, nullptr);
+     }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0d47c7a..8eda33d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1049,6 +1049,7 @@ struct llama_model::impl {
+     int32_t                    head_file_idx  = -1;
+     size_t                     head_file_offs = 0;
+     bool                       head_released  = false;
++    int32_t                    head_pins      = 0; // contexts that use the head on their own (head_pin)
+ 
+     std::vector<float> tensor_split_owned;
+ };
+@@ -2374,8 +2375,29 @@ ggml_backend_buffer_type_t llama_model::head_buft() const {
+     return pimpl->head_buft;
+ }
+ 
++bool llama_model::head_pin() const {
++    if (!head_yield_ready()) {
++        return true;
++    }
++    if (pimpl->head_released && !head_restore()) {
++        return false;
++    }
++    pimpl->head_pins++;
++    return true;
++}
++
++void llama_model::head_unpin() const {
++    if (pimpl->head_pins > 0) {
++        pimpl->head_pins--;
++    }
++}
++
++bool llama_model::head_pinned() const {
++    return pimpl->head_pins > 0;
++}
++
+ void llama_model::head_release() const {
+-    if (!head_yield_ready() || pimpl->head_released) {
++    if (!head_yield_ready() || pimpl->head_released || pimpl->head_pins > 0) {
+         return;
+     }
+     // ggml_backend_tensor_alloc wants both null again, and a graph that still referenced the head would now fail
+diff --git a/src/llama-model.h b/src/llama-model.h
+index f6261e0..50a658c 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -701,8 +701,13 @@ struct llama_model {
+     bool head_yield_ready() const;
+     bool head_is_released() const;
+     ggml_backend_buffer_type_t head_buft() const;
+-    void head_release() const;
++    void head_release() const;                              // a no-op while the head is pinned
+     bool head_restore(double * t_read_ms = nullptr) const; // allocates the buffer again and reads the bytes back
++    // a context that builds its own graphs on the head (MTP, the DFlash / EAGLE3 drafts through ctx_other) pins it
++    // for its lifetime, so no P1 context releases it under them; pinning reads a released head back first
++    bool head_pin() const;
++    void head_unpin() const;
++    bool head_pinned() const;
+ 
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 38d876f..3d98a94 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -565,8 +565,11 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_DEBUG")) {
+         ra_debug = atoi(p);
+     }
+-    if (runahead_k > 0 && drop_w > 0.0f) {
+-        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_RUNAHEAD is ignored while the drop rule is on\n", __func__);
++    // the drop rule runs inside runahead's first half when both are asked for (SiegeLadder 17.10, the fast preset);
++    // its VRAM_ONLY / ONLY_LAYER measurement modes stay without runahead: VRAM_ONLY=2 may leave a token no kept pair
++    if (runahead_k > 0 && drop_w > 0.0f && (drop_vram_only != 0 || drop_only_layer >= 0)) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_RUNAHEAD is ignored next to the drop rule's VRAM_ONLY / "
++                "ONLY_LAYER measurements\n", __func__);
+         runahead_k = 0;
+     }
+     if (runahead_k > 0) {
+@@ -2475,7 +2478,25 @@ void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * us
+     if (ith != 0) {
+         return;
+     }
+-    moe_stream_remap_impl(dst, dst->src[0], nullptr, nullptr, userdata, /*issue_only =*/ true);
++    // src[1]: the routing weights, when the drop rule runs next to runahead
++    moe_stream_remap_impl(dst, dst->src[0], nullptr, dst->src[1], userdata, /*issue_only =*/ true);
++}
++
++void llama_moe_stream_exact_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
++    float * out = (float *) dst->data;
++    const int64_t n = ggml_nelements(dst);
++    std::lock_guard<std::mutex> lk(sl->mgr->mtx);
++    if ((int64_t) sl->exact_mask.size() == n) {
++        std::memcpy(out, sl->exact_mask.data(), (size_t) n*sizeof(float));
++    } else {
++        std::fill(out, out + n, 1.0f);
++    }
+ }
+ 
+ // G2 runahead, the end of the first half: the slots the approximate pass may read. A pair whose expert is resident
+@@ -2493,9 +2514,10 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+ 
+     int64_t n_kept = 0;
+     for (int64_t i = 0; i < n; i++) {
+-        const int32_t s = sl.expert_slot.at(ids[i]);
+-        if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+-            out[i] = s;
++        // an expert the drop rule took out of the call has no slot at all: it counts as one not resident yet
++        const auto it = sl.expert_slot.find(ids[i]);
++        if (it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++            out[i] = it->second;
+             n_kept++;
+         } else {
+             out[i] = -1;
+@@ -2861,8 +2883,15 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+ 
+     if (issue_only) {
+         // G2 runahead: counted, classified, its loads queued; llama_moe_stream_remap_wait waits for them once the
+-        // graph has computed the approximate pass on what is resident
+-        GGML_ASSERT(sl->dropped.empty());
++        // graph has computed the approximate pass on what is resident. With the drop rule (wts) the dropped experts
++        // queued no load (touched 2, gone from uniq) and drop_mask holds the exact path's multipliers: they move to
++        // exact_mask, because the first half fills drop_mask with the approximate pass's
++        if (wts != nullptr) {
++            sl->exact_mask.swap(sl->drop_mask);
++        } else {
++            GGML_ASSERT(sl->dropped.empty());
++            sl->exact_mask.clear();
++        }
+         moe_stream_runahead_issue_locked(*mgr, *sl, ids, n, a->ne[0], out);
+         return;
+     }
+@@ -3019,10 +3048,33 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+ 
+     const int32_t * ids = sl->ra_ids.data();
+     for (int64_t i = 0; i < n; i++) {
++        if (sl->touched[ids[i]] == 2) {
++            out[i] = -1; // dropped by the first half (the drop rule): given a kept slot of its token below
++            continue;
++        }
+         const int32_t s = sl->expert_slot.at(ids[i]);
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
++    if (!sl->dropped.empty()) {
++        // as in the remap: a dropped pair still runs through the expert GEMMs at weight 0 (exact_mask), on any kept
++        // slot of its token - a token's top pair is never dropped outside the VRAM_ONLY measurements, which runahead
++        // does not run with
++        const int64_t k = dst->ne[0]; // [n_expert_used, n_tokens]
++        for (int64_t i = 0; i < n; i++) {
++            if (out[i] >= 0) {
++                continue;
++            }
++            const int64_t t0 = (i/k)*k;
++            for (int64_t j = t0; j < t0 + k; j++) {
++                if (out[j] >= 0) {
++                    out[i] = out[j];
++                    break;
++                }
++            }
++            GGML_ASSERT(out[i] >= 0);
++        }
++    }
+     mgr->fence_slots_locked(*sl, out, (size_t) n);
+ }
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index ccdb221..6c390cd 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -133,6 +133,9 @@ struct llama_moe_stream_layer {
+     // the current call - 0 for a dropped pair, 1 (or the renormalising factor) for the rest - written by
+     // the remap and copied out by llama_moe_stream_drop_mask; the experts dropped; per-expert scratch
+     std::vector<float>   drop_mask;
++    // the drop rule next to G2 runahead (SiegeLadder 17.10): the exact path's multipliers, kept apart from drop_mask,
++    // which the first half then fills for the approximate pass; copied out by llama_moe_stream_exact_mask
++    std::vector<float>   exact_mask;
+     // G2 runahead (guarded by mgr->mtx): the routed ids of the call between the two halves of its remap, whether
+     // the first half ran, and whether the approximate pass had a resident slot to read (if not, nothing is staged).
+     // The approximate pass takes its weight multipliers from drop_mask above.
+@@ -830,12 +833,15 @@ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userda
+ // F32 [1, k, n_tokens]
+ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
+ // G2 runahead (decode; see runahead_k): the remap in two halves, both ggml_custom_4d ops. _issue: src[0] = the ids
+-// [k, n_tokens]; it does everything the remap does up to its wait and returns the slots the approximate pass may
+-// read (a pair whose expert is not resident gets a resident slot, and weight 0 from llama_moe_stream_drop_mask on
+-// its output). _wait: src[0] = the issue's output (it orders the two), src[1] = the predicted experts of the next
+-// layer [k', n_tokens]; it stages those, waits for the call's loads and returns its slots, as the remap does.
++// [k, n_tokens], src[1] = the routing weights (F32 [1, k, n_tokens]) when the drop rule is on; it does everything the
++// remap does up to its wait and returns the slots the approximate pass may read (a pair whose expert is not resident
++// gets a resident slot, and weight 0 from llama_moe_stream_drop_mask on its output). _wait: src[0] = the issue's
++// output (it orders the two), src[1] = the predicted experts of the next layer [k', n_tokens]; it stages those, waits
++// for the call's loads and returns its slots, as the remap does - a pair the drop rule took out gets a kept slot of
++// its token, and weight 0 from llama_moe_stream_exact_mask on the wait's output.
+ void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_exact_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
+ 
+ // Adds mgr->route_bias to the selection logits of every expert this layer currently holds
+ // (resident or loading), leaving masked-out entries at -inf untouched. Runs before top-k, so it

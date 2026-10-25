@@ -1,0 +1,106 @@
+From 200a207e861075e2af3805e5298af6514d92b124 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 12:58:15 +0000
+Subject: [PATCH 51/91] ggml : the graph's inputs copied with the first split
+ of their backend (SiegeLadder G27, GGML_SCHED_HOIST_INPUTS=1, off by
+ default), and DeepSeek V4.1's Engram q / k weights on the card - after the
+ mailbox's reply the decode graph still had 8 card splits with host inputs:
+ each graph input (the embedding, positions, masks, the Engram rows, the
+ compressors' indices) went with the first split that used it (layers 0-2, 14,
+ 20), and each such split synchronized the backend before its copy; two more
+ split copied Engram's q / k weights of layers 1 and 14, cast to F32 on the
+ CPU, because the loader placed them on the host - tested with GGML_OP_MUL, a
+ bf16 operand the card cannot multiply. The scheduler can now put a FLAG_INPUT
+ tensor a later split needs into the inputs of that backend's first split
+ (n_copies == 1 only), and the q / k weights are placed by a GGML_OP_MUL_MAT
+ test (GGML_OP_NONE means unused to the loader), so their casts run on the
+ card. Decode graph: splits with host inputs 8 -> 1, splits 86 -> 82.
+ SiegeLadder runs.md 4.80: text = trace and the deterministic counters equal
+ on the exact path; o27 ABBA at the drop default: hoisting gives nothing
+ measurable (15.13 vs 15.03 tok/s, outside the wait 40.96 vs 40.92 ms) - the
+ layers it frees wait for their copy events instead (~30 us per layer, the
+ copy -> kernel latency itself under WDDM: bench/cuda_stream_gap.cu measures
+ 31 us on the same stream and 32 us across streams) - so hoisting stays off, a
+ hoisted copy living from the first split on could raise a big ubatch's buffer
+ peak. The q / k placement stays (exact, two splits fewer)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 29 +++++++++++++++++++++++++----
+ src/llama-arch.cpp        |  8 ++++++--
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f6fb917..1a91566 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -822,6 +822,11 @@ struct ggml_backend_sched {
+ 
+     int debug;
+ 
++    // SiegeLadder G27 [GGML_SCHED_HOIST_INPUTS=1, off by default]: a graph input (GGML_TENSOR_FLAG_INPUT) that a later split of
++    // a backend needs is copied with the first split of that backend - with one copy per graph input (n_copies == 1),
++    // every split with an input of its own synchronized the backend before its copy
++    bool hoist_inputs;
++
+     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
+     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
+     int debug_realloc;
+@@ -1410,11 +1415,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
+                             SET_CAUSE(tensor_copy, "4.cpy");
+                         }
+-                        int n_inputs = split->n_inputs++;
+-                        if (n_inputs >= split->inputs_capacity) {
+-                            ggml_backend_sched_split_inputs_grow(split);
++                        // G27: a graph input goes with the first split of this backend - its data is set before the
++                        // graph runs, and a later split with an input of its own waited for the backend to drain
++                        struct ggml_backend_sched_split * dst_split = split;
++                        if (sched->hoist_inputs && sched->n_copies == 1 && (src->flags & GGML_TENSOR_FLAG_INPUT)) {
++                            for (int k = 0; k < i_split; k++) {
++                                if (sched->splits[k].backend_id == cur_backend_id) {
++                                    dst_split = &sched->splits[k];
++                                    break;
++                                }
++                            }
++                        }
++                        int n_inputs = dst_split->n_inputs++;
++                        if (n_inputs >= dst_split->inputs_capacity) {
++                            ggml_backend_sched_split_inputs_grow(dst_split);
+                         }
+-                        split->inputs[n_inputs] = src;
++                        dst_split->inputs[n_inputs] = src;
+                     }
+                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                 }
+@@ -1793,6 +1809,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
+     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
+     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
+ 
++    // off by default: no gain measured (SiegeLadder runs.md 4.80 - the layers it freed wait for their copy events
++    // instead), and a hoisted copy lives from the first split on, which at a big ubatch could raise the buffer's peak
++    const char * GGML_SCHED_HOIST_INPUTS = getenv("GGML_SCHED_HOIST_INPUTS");
++    sched->hoist_inputs = GGML_SCHED_HOIST_INPUTS ? atoi(GGML_SCHED_HOIST_INPUTS) != 0 : false;
++
+     sched->debug_realloc = 0;
+ #ifdef GGML_SCHED_NO_REALLOC
+     sched->debug_realloc = 1;
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 2cd2fa9..bc0e6af 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -880,8 +880,12 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_ENGRAM_EMBED,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
+     {LLM_TENSOR_ENGRAM_EMBED_SCALE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
+     {LLM_TENSOR_ENGRAM_WKV,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+-    {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+-    {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    // SiegeLadder (runs.md 4.80): the graph casts them to F32 before its multiply (dsv4_engram), and the cast runs on the
++    // card; tested with GGML_OP_MUL, a bf16 operand the card cannot multiply kept them on the host, so every token the
++    // casts ran on the CPU and their outputs crossed to the card with a synchronize of their own (two splits). The
++    // placement test only has to say the card takes a bf16 weight (GGML_OP_NONE would mean "unused" to the loader)
++    {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_ENGRAM_TOKEN_MAP,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+     {LLM_TENSOR_ENGRAM_PRIMES,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+     {LLM_TENSOR_ENGRAM_OFFSETS,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},

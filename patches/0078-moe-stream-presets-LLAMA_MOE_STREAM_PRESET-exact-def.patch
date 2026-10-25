@@ -1,0 +1,312 @@
+From 33d36242c2b37f9d86060b09151679f249422779 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 16:03:10 +0000
+Subject: [PATCH 78/91] moe-stream : presets
+ (LLAMA_MOE_STREAM_PRESET=exact|default|fast - fill unset keys: exact
+ DROP_W=0, fast C14=0.2), the adaptive D14 drive switch
+ (LLAMA_MOE_STREAM_MIRROR_ADAPT=S, off by default: a primary read of 16 ms or
+ more sends reads to the copy from 2 in flight for S s), the oracle's
+ ORACLE_ONLY filter by trace mark and the trace mark x for dropped experts
+ (SiegeLadder eighteenth session)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 178 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 170 insertions(+), 8 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index e351fab..a230058 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -745,6 +745,56 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
+     return n > 0 && n == weights.size();
+ }
+ 
++// SiegeLadder presets (LLAMA_MOE_STREAM_PRESET=exact|default|fast): one key for the decode modes of runs.md 4.157-4.161.
++// A preset only fills keys that are not set, so an explicit key still wins. exact - no drops (runahead K = 6 then takes
++// over by itself, lossless); default - the fork's own defaults (drop 0.14 with DROP_ALL, G31); fast - the default plus
++// C14 0.2 (late, N 1: +4.8...+5.2% over the default, general-100 dNLL about +0.005 more, 4.152 / 4.157). Runs before
++// any key is read, at the start of the ctor; the keys are set in the process environment, so children see them too.
++static void moe_stream_apply_preset() {
++    const char * name = std::getenv("LLAMA_MOE_STREAM_PRESET");
++    if (name == nullptr || *name == '\0') {
++        return;
++    }
++    // the ctor runs more than once per process (the loader's memory-fit dry run builds one with the log silenced): the
++    // first call sets the keys, the later ones repeat its line instead of calling the preset's own keys explicit
++    static std::string applied;
++    if (!applied.empty()) {
++        LLAMA_LOG_WARN("%s: moe stream: %s\n", __func__, applied.c_str());
++        return;
++    }
++    struct preset_key { const char * key; const char * value; };
++    static const preset_key k_exact[] = { { "LLAMA_MOE_STREAM_DROP_W", "0"   } };
++    static const preset_key k_fast[]  = { { "LLAMA_MOE_STREAM_C14",    "0.2" } };
++    const preset_key * keys = nullptr;
++    size_t             n    = 0;
++    if (std::strcmp(name, "exact") == 0) {
++        keys = k_exact;
++        n    = sizeof(k_exact)/sizeof(k_exact[0]);
++    } else if (std::strcmp(name, "fast") == 0) {
++        keys = k_fast;
++        n    = sizeof(k_fast)/sizeof(k_fast[0]);
++    } else if (std::strcmp(name, "default") != 0) {
++        LLAMA_LOG_WARN("%s: moe stream: unknown LLAMA_MOE_STREAM_PRESET=%s (exact, default, fast) - ignored\n", __func__, name);
++        return;
++    }
++    std::string set, kept;
++    for (size_t i = 0; i < n; i++) {
++        if (const char * v = std::getenv(keys[i].key)) {
++            kept += format("%s%s=%s", kept.empty() ? "" : ", ", keys[i].key, v);
++            continue;
++        }
++#ifdef _WIN32
++        _putenv_s(keys[i].key, keys[i].value);
++#else
++        setenv(keys[i].key, keys[i].value, 0);
++#endif
++        set += format("%s%s=%s", set.empty() ? "" : ", ", keys[i].key, keys[i].value);
++    }
++    applied = format("preset %s%s%s%s%s", name, set.empty() ? "" : " - sets ", set.c_str(),
++            kept.empty() ? "" : "; set explicitly, kept: ", kept.c_str());
++    LLAMA_LOG_WARN("%s: moe stream: %s\n", __func__, applied.c_str());
++}
++
+ // sizes the per-layer table and clamps the I/O thread count; workers are spawned lazily on first use
+ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct) : n_slots(n_slots) {
+     layers.resize(n_layer);
+@@ -752,6 +802,8 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
+     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
+ 
++    moe_stream_apply_preset();
++
+     // A4, prefetch oracle. Opt-in through the environment because it is a measurement
+     // apparatus, not a feature: LLAMA_MOE_STREAM_TRACE records the call sequence of a run,
+     // LLAMA_MOE_STREAM_ORACLE replays it as anticipation, and AHEAD says how many calls ahead.
+@@ -1832,6 +1884,20 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+     n_streamed_layers  = std::max<int64_t>(1, n_streamed);
+ }
+ 
++// SiegeLadder D14, adaptive (LLAMA_MOE_STREAM_MIRROR_ADAPT=S seconds; off by default): the primary drive stalls ~40 ms
++// about once a second in episodes under sustained load (runs.md 4.149, 4.153), while a permanent shift of reads to the copy
++// costs ~0.7 ms per token outside them (4.160). So a primary read of MIRROR_ADAPT_MS (16) ms or more opens an episode: until
++// S seconds after the latest such read the copies take reads from MIRROR_ADAPT_AT (2) primary reads in flight instead of
++// MIRROR_AT. The drives are the process's, so is this state (file-static: no header change).
++static int32_t              d14_adapt_s   = 0;
++static int64_t              d14_adapt_thr = 16000; // us
++static int32_t              d14_adapt_at  = 2;
++static std::atomic<int64_t> d14_until_us{0};
++static std::atomic<int64_t> d14_start_us{0};
++static std::atomic<bool>    d14_on{false};
++static std::atomic<int64_t> d14_episodes{0};
++static std::atomic<int64_t> d14_total_us{0};
++
+ void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, const char * dir) {
+     mirrors.clear();
+     mirrors.resize(files.size());
+@@ -1841,6 +1907,15 @@ void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, cons
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_MAX")) {
+         mirror_max = std::max(1, atoi(p));
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_ADAPT")) {
++        d14_adapt_s = std::max(0, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_ADAPT_MS")) {
++        d14_adapt_thr = (int64_t) (std::max(1.0, std::strtod(p, nullptr))*1000.0);
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_ADAPT_AT")) {
++        d14_adapt_at = std::max(0, atoi(p));
++    }
+     // A copy is used only with the part's size and the same bytes in 17 sampled 64 KiB blocks (the start, 15 spread
+     // through the file, the tail): a stale copy of another build must not feed the cache without a word
+     const size_t blk = 64u << 10;
+@@ -1896,23 +1971,54 @@ void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, cons
+     moe_aligned_free(buf_b);
+     LLAMA_LOG_INFO("%s: P16: copies of %d of %zu parts in %s (%.1f GB); a slab goes to a copy while the primary has >= %d "
+             "reads in flight and the copies < %d\n", __func__, n_open, files.size(), dir, gb, mirror_at, mirror_max);
++    if (d14_adapt_s > 0 && n_open > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: D14 switch on standby - a primary read of %.0f ms or more sends reads to the copies "
++                "from %d in flight for %d s after it (LLAMA_MOE_STREAM_MIRROR_ADAPT)\n", __func__, d14_adapt_thr/1000.0,
++                d14_adapt_at, d14_adapt_s);
++    }
+ }
+ 
+ const uint8_t * llama_moe_stream::pread_slab(uint32_t file_idx, uint8_t * staging, size_t len, size_t offs, int worker_id) {
+-    llama_file * f   = files[file_idx].get();
+-    bool         mir = false;
++    llama_file * f     = files[file_idx].get();
++    bool         mir   = false;
++    int32_t      at    = mirror_at;
++    const bool   adapt = d14_adapt_s > 0 && file_idx < mirrors.size() && mirrors[file_idx] != nullptr;
++    if (adapt) {
++        // SiegeLadder D14, adaptive: inside an episode the copies take reads earlier; the first read after it closes it
++        if (ggml_time_us() < d14_until_us.load(std::memory_order_relaxed)) {
++            at = std::min(at, d14_adapt_at);
++        } else if (d14_on.load(std::memory_order_relaxed) && d14_on.exchange(false)) {
++            const int64_t span = std::max<int64_t>(0, d14_until_us.load() - d14_start_us.load());
++            d14_total_us.fetch_add(span);
++            LLAMA_LOG_WARN("%s: moe stream: D14 switch off after %.1f s - the copies take reads from %d in flight again\n",
++                    __func__, span/1e6, mirror_at);
++        }
++    }
+     if (file_idx < mirrors.size() && mirrors[file_idx] != nullptr &&
+-            io_inflight_pri.load(std::memory_order_relaxed) >= mirror_at &&
++            io_inflight_pri.load(std::memory_order_relaxed) >= at &&
+             io_inflight_mir.load(std::memory_order_relaxed) < mirror_max) {
+         f   = mirrors[file_idx].get();
+         mir = true;
+     }
+     std::atomic<int32_t> & n = mir ? io_inflight_mir : io_inflight_pri;
+     const int32_t in_flight = n.fetch_add(1, std::memory_order_relaxed) + 1;
+-    const int64_t t0 = mir || slow_read_us > 0 ? ggml_time_us() : 0;
++    const bool    timed     = mir || slow_read_us > 0 || adapt;
++    const int64_t t0 = timed ? ggml_time_us() : 0;
+     const uint8_t * data = llama_moe_stream_pread(*f, staging, len, offs, use_direct_io, worker_id);
+     n.fetch_sub(1, std::memory_order_relaxed);
+-    const int64_t d = mir || slow_read_us > 0 ? ggml_time_us() - t0 : 0;
++    const int64_t d = timed ? ggml_time_us() - t0 : 0;
++    if (adapt && !mir && d >= d14_adapt_thr) {
++        const int64_t now   = ggml_time_us();
++        const int64_t until = now + (int64_t) d14_adapt_s*1000000;
++        for (int64_t u = d14_until_us.load(); until > u && !d14_until_us.compare_exchange_weak(u, until);) {}
++        if (!d14_on.exchange(true)) {
++            d14_start_us.store(now);
++            d14_episodes.fetch_add(1);
++            LLAMA_LOG_WARN("%s: moe stream: D14 switch on - a primary read took %.1f ms; until %d s after the latest such read "
++                    "the copies take reads from %d in flight (not %d)\n", __func__, d/1000.0, d14_adapt_s, d14_adapt_at,
++                    mirror_at);
++        }
++    }
+     if (mir) {
+         io_mirror_n.fetch_add(1, std::memory_order_relaxed);
+         io_mirror_bytes.fetch_add((int64_t) len, std::memory_order_relaxed);
+@@ -2736,12 +2842,24 @@ void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t
+ // "<call> <layer> <e1,e2,...>" per line, in call order. Plain text on purpose: this file is
+ // read by hand as often as by code, and a run that produced a different call count has to be
+ // visible at a glance rather than decoded.
++// SiegeLadder "heavy ahead" ceiling (LLAMA_MOE_STREAM_ORACLE_ONLY=chars, a measurement): the trace's 4th field says where
++// each expert of a call was in the recorded run (v a VRAM slot, l a VRAM slot still loading, r whole in the host tier, d on
++// the drive, x on the drive and dropped - traces from 21.10 on, ? not noted). With ORACLE_ONLY the oracle's read-ahead
++// (AHEAD) takes only the experts whose mark is among the chars - "d" on a trace of the default mode: the drive misses its
++// calls waited for (the light ones it dropped are x). File-static: one oracle per process (no header change).
++static std::vector<std::string> oracle_where;
++static std::string              oracle_only;
++
+ void llama_moe_stream::load_oracle(const char * path) {
+     std::ifstream f(path);
+     if (!f) {
+         LLAMA_LOG_WARN("%s: moe stream: cannot read oracle %s\n", __func__, path);
+         return;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE_ONLY")) {
++        oracle_only = p;
++    }
++    oracle_where.clear();
+     std::string linha;
+     while (std::getline(f, linha)) {
+         if (linha.empty()) {
+@@ -2754,6 +2872,9 @@ void llama_moe_stream::load_oracle(const char * path) {
+         if (!(is >> call >> il >> lista)) {
+             continue;
+         }
++        std::string where;
++        is >> where; // optional
++        oracle_where.push_back(where);
+         std::vector<int32_t> experts;
+         size_t pos = 0;
+         while (pos < lista.size()) {
+@@ -2771,7 +2892,24 @@ void llama_moe_stream::load_oracle(const char * path) {
+         }
+         spec_oracle.emplace_back(il, std::move(experts));
+     }
++    oracle_where.resize(spec_oracle.size());
+     LLAMA_LOG_INFO("%s: moe stream: oracle loaded, %zu calls\n", __func__, spec_oracle.size());
++    if (!oracle_only.empty()) {
++        int64_t n_all = 0, n_kept = 0, n_marked = 0;
++        for (size_t j = 0; j < spec_oracle.size(); j++) {
++            const auto &        ex = spec_oracle[j].second;
++            const std::string & wh = oracle_where[j];
++            n_all += (int64_t) ex.size();
++            if (wh.size() == ex.size()) {
++                n_marked += (int64_t) ex.size();
++                for (const char c : wh) {
++                    n_kept += oracle_only.find(c) != std::string::npos;
++                }
++            }
++        }
++        LLAMA_LOG_WARN("%s: moe stream: ORACLE_ONLY=%s (measurement) - the read-ahead takes %" PRId64 " of %" PRId64 " traced "
++                "experts (%" PRId64 " carry a mark)\n", __func__, oracle_only.c_str(), n_kept, n_all, n_marked);
++    }
+ }
+ 
+ void llama_moe_stream::save_trace() const {
+@@ -2818,14 +2956,19 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+                 return std::find(sl.subst_added.begin(), sl.subst_added.end(), e) != sl.subst_added.end();
+             }), tr.end());
+         }
++        const size_t n_kept = tr.size();
+         tr.insert(tr.end(), sl.dropped.begin(), sl.dropped.end());
+         tr.insert(tr.end(), sl.subst_gone.begin(), sl.subst_gone.end());
+-        // and where each of them was when the call came ('?' where the remap did not note it, e.g. waves)
++        // and where each of them was when the call came ('?' where the remap did not note it, e.g. waves): v - a VRAM slot,
++        // l - a VRAM slot still loading, r - whole in the host tier (RAM), d - on the drive; since 21.10 (eighteenth
++        // session) x - on the drive and dropped by the drop rule (was d), so a default-mode trace tells the drive misses its
++        // calls waited for (d) from the light ones they did not (x)
+         spec_trace_where.resize((size_t) idx + 1);
+         std::string & wh = spec_trace_where[(size_t) idx];
+         wh.clear();
+         if (!sl.trace_where.empty()) {
+-            for (const int32_t e : tr) {
++            for (size_t k = 0; k < tr.size(); k++) {
++                const int32_t e = tr[k];
+                 char c = '?';
+                 for (const auto & ew : sl.trace_where) {
+                     if (ew.first == e) {
+@@ -2833,6 +2976,9 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+                         break;
+                     }
+                 }
++                if (k >= n_kept && k < n_kept + sl.dropped.size()) {
++                    c = 'x';
++                }
+                 wh.push_back(c);
+             }
+         }
+@@ -2853,12 +2999,20 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+         if (il_futuro < 0 || (size_t) il_futuro >= layers.size() || !layers[il_futuro]) {
+             continue;
+         }
+-        for (const int32_t e : spec_oracle[j].second) {
++        static const std::string no_marks;
++        const auto &        ex = spec_oracle[j].second;
++        const std::string & wh = j < oracle_where.size() ? oracle_where[j] : no_marks;
++        for (size_t k = 0; k < ex.size(); k++) {
++            const int32_t e = ex[k];
+             // ORACLE_RECALL: a predictor that misses an expert of a call misses it on the drive too - the same
+             // deterministic draw as the staging, so a missed expert is neither read ahead nor staged
+             if (oracle_recall < 1.0f && moe_hash01((uint64_t) j0, (uint64_t) e) >= oracle_recall) {
+                 continue;
+             }
++            // ORACLE_ONLY: only the experts the recorded run found where the chars say (e.g. r - read from the drive)
++            if (!oracle_only.empty() && (wh.size() != ex.size() || oracle_only.find(wh[k]) == std::string::npos)) {
++                continue;
++            }
+             speculate_locked(*layers[il_futuro], e);
+         }
+         spec_frontier = j0;
+@@ -3396,6 +3550,14 @@ void llama_moe_stream::print_stats(const char * role) const {
+                             q.hist[3].load(), q.hist[4].load(), q.hist[5].load());
+                 }
+             }
++            if (d14_adapt_s > 0) {
++                int64_t tot = d14_total_us.load();
++                if (d14_on.load()) {
++                    tot += std::max<int64_t>(0, std::min(ggml_time_us(), d14_until_us.load()) - d14_start_us.load());
++                }
++                LLAMA_LOG_WARN("%s: %smoe stream: D14 switch: %" PRId64 " episodes, %.1f s with the copies taking reads from "
++                        "%d in flight\n", __func__, pfx, d14_episodes.load(), tot/1e6, d14_adapt_at);
++            }
+         }
+     }
+     LLAMA_LOG_INFO("%s: %smoe stream: slot wait = %.2f ms total over %" PRId64 " waits (%.1f%% of the two stalls)\n",

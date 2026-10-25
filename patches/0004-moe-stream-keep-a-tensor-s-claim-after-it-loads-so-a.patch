@@ -1,0 +1,47 @@
+From 5a6d49c4ffa76756463b8d3411647387050ef418 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 19:47:43 +0000
+Subject: [PATCH 04/91] moe-stream : keep a tensor's claim after it loads, so a
+ promoted slot is not published early
+
+A prefill wave that finds its slot still LOADING from the previous wave's preload queues
+every tensor of that slot again. The worker cleared a tensor's claim bit as soon as the
+tensor landed, so the copy of a tensor that had already arrived passed the check, was
+uploaded again and decremented slot_parts_left a second time: the slot turned RESIDENT
+while another of its tensors was still being read, and the wave multiplied stale weights.
+One I/O worker never hits it (the copies always come after the originals), and decode does
+not take this path. The claim now stays set until reserve_slot_locked clears it on the next
+reservation; only a failed read gives it back.
+
+Measured with llama-perplexity, 3,072 tokens in 512-token batches (64 waves per layer)
+against the 1-worker logits: with 9 workers KL 0.00042 / 0.00027 over two runs, same top
+token 99.61 / 99.67%, and the two runs differed from each other; with the fix both sit at
+the noise floor of the base file (max 0.000058, same top token 100%). Speed unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 2630c1e..a62090a 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -819,8 +819,16 @@ void llama_moe_stream::worker_loop(int worker_id) {
+             continue;
+         }
+ 
+-        sl.slot_claimed[w.slot] &= (uint8_t) ~bit;
++        // The claim stays set after a successful read: the tensor is owned for the rest of
++        // this reservation, and reserve_slot_locked is what clears it. A prefill wave that
++        // finds its slot still LOADING from the previous wave's preload queues every tensor
++        // of that slot again; with the claim cleared here, the copy of a tensor that had
++        // already landed passed the check above, decremented slot_parts_left a second time
++        // and published the slot while another of its tensors was still being read - the
++        // wave then multiplied stale weights. Measured 2026-10-12: with 9 workers a 512-token
++        // batch drifted from the 1-worker logits (KL 3-4e-4, top-1 99.6%) and from itself.
+         if (!ok) {
++            sl.slot_claimed[w.slot] &= (uint8_t) ~bit;
+             load_failed = true;
+         } else if (sl.slot_parts_left[w.slot] > 0 && --sl.slot_parts_left[w.slot] == 0) {
+             // RESIDENT only when the LAST tensor of this slot has landed. Publishing

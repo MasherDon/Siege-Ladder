@@ -1,0 +1,162 @@
+From 1ccbf2dab944c13cb9ce0b3e9ef3bd85c56333f9 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:52:28 +0000
+Subject: [PATCH 64/91] moe-stream, llama : the exact expert GEMMs reuse
+ runahead's rows of the pairs resident at the first half (SiegeLadder G30, on
+ by default; LLAMA_MOE_STREAM_RA_REUSE=0 - off)
+
+Runahead's approximate pass computes the expert GEMMs of the pairs whose expert is resident (or fenced) when the first
+half of the remap ends - 87.3% of the pairs at decode - and the exact MoE recomputed all six. The pass's down output
+now stays alive: the second half gives the pairs the pass computed from their own expert the skip id (after the slots'
+use counters, so the cache sees the same call), and the exact down GEMM writes only the other pairs' rows into that
+output (ggml_mul_mat_id_into; gate / up skip them too). Same expert, same input, same kernel for every row, the weights
+and the sum as before: bitwise. Calls with C13 substitutes keep the exact path as it was; needs RA_SKIP. print_stats
+counts the reused pairs. SiegeLadder runs.md 4.111 (oracle/o38, exact runahead, ABBA x2): kl_run k5 PPL x1.0000, KLD 0
+vs the 17.10 base; text = trace in all 8 runs; 14.06 -> 14.24 tok/s (+1.3%, every pair faster): 1.3 ms of card time
+per token less outside the waits, partly eaten by later staged copies (on time 40 -> 36%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      | 13 ++++++++++++-
+ src/llama-moe-stream.cpp | 27 +++++++++++++++++++++++++++
+ src/llama-moe-stream.h   | 11 +++++++++++
+ 3 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index a06b2cc..3120f4b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3218,11 +3218,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             ggml_build_forward_expand(gf, experts);
+         }
+     } else {
++        ggml_tensor * e_rows = nullptr; // G30: the approximate pass's down output, which the exact GEMMs complete
+         if (ra_ids != nullptr) {
+             // G2 runahead: the approximate routed output - the experts resident when the call came, the others at
+             // weight 0 - summed like the exact one below; the model graph turns it into a prediction of the next
+             // layer's experts, and the second half stages that, waits for this call's loads and gives the exact
+             // GEMMs their slots
++            msl->ra_reuse_ok = false;
+             ggml_tensor * pred = nullptr;
+             if (msl->mgr->ra_debug & 4) {
+                 pred = ggml_cont(ctx0, selected_experts); // measurement: the split remap alone, no approximate pass
+@@ -3240,6 +3242,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     if (msl->ra_skip_ok) {
+                         e_a->op_params[2] = 1;
+                     }
++                    // SiegeLadder G30: the rows of the resident pairs are what the exact GEMMs would compute (same
++                    // expert, same input, same kernel): those pairs get the skip id from the second half, and the exact
++                    // down GEMM writes only the others into this output (ggml_mul_mat_id_into)
++                    msl->ra_reuse_ok = msl->ra_skip_ok && msl->mgr->ra_reuse;
++                    if (msl->ra_reuse_ok) {
++                        e_rows = e_a;
++                    }
+                     e_a = ggml_mul(ctx0, e_a, ggml_mul(ctx0, weights, ra_mask_dev));
+                     cb(e_a, "ffn_moe_weighted_approx", il);
+                     moe_a = ggml_view_2d(ctx0, e_a, n_embd, n_tokens, e_a->nb[2], 0);
+@@ -3297,7 +3306,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 cb(ids_gemm, "ffn_moe_topk_stream_reply", il);
+             }
+         }
+-        experts = build_expert_gemms(cur, ids_gemm, nullptr);
++        // G30: with the pass's rows reused, the exact GEMMs run the other pairs only (the reused ones carry the skip id;
++        // gate / up leave their rows unwritten, the down GEMM in place into e_rows leaves the pass's)
++        experts = build_expert_gemms(cur, ids_gemm, e_rows);
+     }
+ 
+     if (!weight_before_ffn) {
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index dfbd704..e545def 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -855,6 +855,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_SKIP")) {
+         ra_skip = atoi(p) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_REUSE")) {
++        ra_reuse = atoi(p) != 0;
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_L2_SCAN_MIN")) {
+         scan_min_tokens = std::max<int64_t>(2, atoll(p));
+     }
+@@ -3074,6 +3077,11 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_ra_calls, stats.n_ra_pairs > 0 ? 100.0*stats.n_ra_kept/stats.n_ra_pairs : 0.0,
+                 stats.n_ra_invalid, skipped ? "skipped its GEMMs" : "ran on a borrowed slot at weight 0",
+                 1e-3*stats.t_ra_gap_us/stats.n_ra_calls, stats.n_ra_redo);
++        if (stats.n_ra_reused > 0) {
++            LLAMA_LOG_WARN("%s: %smoe stream: runahead: G30 - %" PRId64 " pairs (%.1f%%) took their exact row from the "
++                    "approximate pass, the exact GEMMs computed the others\n", __func__, pfx, stats.n_ra_reused,
++                    stats.n_ra_pairs > 0 ? 100.0*stats.n_ra_reused/stats.n_ra_pairs : 0.0);
++        }
+     }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+@@ -3690,6 +3698,15 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+             }
+         }
+     }
++    // G30: the pairs whose row the pass computes from their own expert (resident, or fenced, now); the second half gives
++    // them the skip id and the exact GEMMs leave their rows as the pass wrote them. A call with substitutes (C13) keeps
++    // the exact path as it was
++    sl.ra_row_ok.assign((size_t) n, 0);
++    if (sl.ra_reuse_ok && sl.ra_skip_ok && sub == nullptr) {
++        for (int64_t i = 0; i < n; i++) {
++            sl.ra_row_ok[i] = sl.drop_mask[i] != 0.0f ? 1 : 0;
++        }
++    }
+     mgr.stats.n_ra_calls++;
+     mgr.stats.n_ra_pairs += n;
+     mgr.stats.n_ra_kept  += n_kept;
+@@ -4682,6 +4699,16 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+             GGML_ASSERT(out[i] >= 0);
+         }
+     }
++    // G30: the pairs whose row the approximate pass computed from their own expert skip the exact GEMMs - their rows stay
++    // as the pass wrote them. After the use counters above, so the cache sees the same call as before
++    if (sl->ra_reuse_ok && (int64_t) sl->ra_row_ok.size() == n) {
++        for (int64_t i = 0; i < n; i++) {
++            if (sl->ra_row_ok[i]) {
++                out[i] = LLAMA_MOE_STREAM_SKIP_ID;
++                mgr->stats.n_ra_reused++;
++            }
++        }
++    }
+     mgr->fence_slots_locked(*sl, out, (size_t) n);
+ }
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 1b6cf51..d5b6a28 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -233,6 +233,13 @@ struct llama_moe_stream_layer {
+     // leave pairs out, so the first half gives the pairs off the card the skip id instead of a resident slot to borrow
+     bool ra_skip_ok = false;
+ 
++    // SiegeLadder G30 (set at graph build next to ra_skip_ok): the exact expert GEMMs write into the approximate pass's own
++    // down output and leave the rows the pass computed from the pair's own expert - same expert, same input, same kernel -
++    // so the second half gives those pairs the skip id. ra_row_ok (guarded by mgr->mtx): per pair of the current call,
++    // whether the pass's row is that pair's (its expert was resident, or fenced, when the first half ended)
++    bool                 ra_reuse_ok = false;
++    std::vector<uint8_t> ra_row_ok;
++
+     // stable userdata for wave w (grows lazily); called at graph build time only
+     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
+ 
+@@ -735,6 +742,9 @@ struct llama_moe_stream {
+     // borrowed resident slot at weight 0, as before). The rows they leave come out zero, as weight 0 made them: the
+     // same guess, without the GEMVs (~40% of the pass's expert pairs at decode)
+     bool     ra_skip         = true;
++    // G30: the exact GEMMs reuse the pass's rows of the pairs resident at the first half (LLAMA_MOE_STREAM_RA_REUSE,
++    // default on; 0 = the exact path recomputes all of them, as before). Needs ra_skip
++    bool     ra_reuse        = true;
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
+     bool     skip_capable    = true;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+@@ -1027,6 +1037,7 @@ struct llama_moe_stream {
+         int64_t n_ra_kept     = 0; // of those, resident when the first half ended (weight kept in the approximate pass)
+         int64_t n_ra_invalid  = 0; // calls with no resident slot in the layer: approximate pass not trusted, nothing staged
+         int64_t n_ra_redo     = 0; // experts the second half found evicted and loaded again (expected 0)
++        int64_t n_ra_reused   = 0; // G30: pairs whose exact row was the approximate pass's (skipped by the exact GEMMs)
+         int64_t t_ra_gap_us   = 0; // time from the end of the first half to the start of the second (the approximate pass)
+         int64_t t_ra_lock_us  = 0; // of that, waiting for mgr->mtx at the start of the second half (G21)
+         int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)

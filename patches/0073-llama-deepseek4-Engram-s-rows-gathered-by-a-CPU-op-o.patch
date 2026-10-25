@@ -1,0 +1,341 @@
+From d1258f8684e9093437bf7a0ba65a9b36fe4a73de Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:56:34 +0000
+Subject: [PATCH 73/91] llama, deepseek4 : Engram's rows gathered by a CPU op
+ of the graph right before the layer's first reader, not in set_input
+ (SiegeLadder G23 step 2, on by default; LLAMA_ENGRAM_LATE=0 - off;
+ decode-sized ubatches)
+
+With the decode graph reused (G23 step 1) nothing stood between Engram's read-ahead (G26, page faults on a 189 GiB
+mapping) and set_input any more - its wait was back on the card's path. Now set_input only writes the history and keeps
+the ubatch; a ggml_custom_4d op per engram layer (made at the first reader: runahead's pass of the layer before, or the
+layer itself) joins the read-ahead and gathers the rows, so the layers before the engram layer give the faults their
+time back. The gather itself moved into fill_layer, which the classic path (prompt ubatches) calls as before.
+Checks (SiegeLadder oracle o45): exact runahead and exact without runahead - text = trace (6 of 6 exact runs);
+ABBA: the default mode 15.08 -> 15.42 tok/s (+2.2%), exact runahead 14.45 -> 14.69 (+1.7%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      | 196 +++++++++++++++++++++++++--------------
+ src/llama-graph.h        |  19 ++++
+ src/models/deepseek4.cpp |  18 +++-
+ 3 files changed, 163 insertions(+), 70 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index a77ffdc..8aee0f5 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -247,6 +247,21 @@ void llm_graph_input_engram::read_ahead(const llama_ubatch & ubatch) {
+ }
+ 
+ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
++    if (late) {
++        // G23 step 2: the history now, the rows in the graph's fill ops - the first of them joins the read-ahead
++        late_ub = nullptr;
++        if (kv.empty() || ubatch == nullptr || ubatch->token == nullptr) {
++            return;
++        }
++        auto * cache = mctx->get_kv();
++        GGML_ASSERT(cache != nullptr && cache->engram_enabled());
++        const int32_t * token_map = (const int32_t *) model.engram_token_map->data;
++        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++            cache->engram_set(ubatch->seq_id[i][0], ubatch->pos[i], token_map[ubatch->token[i]]);
++        }
++        late_ub = ubatch;
++        return;
++    }
+     if (ahead.joinable()) {
+         // G26: the rows faulted in ahead (read_ahead); what is left of that wait is on the graph's path
+         llama_moe_stream_nvtx_push("engram_wait");
+@@ -260,6 +275,47 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     auto * cache = mctx->get_kv();
+     GGML_ASSERT(cache != nullptr && cache->engram_enabled());
+ 
++    const int32_t * token_map = (const int32_t *) model.engram_token_map->data;
++    const uint32_t  n_tokens  = ubatch->n_tokens;
++    const size_t    row       = (size_t) hparams.engram_n_hash_cols*hparams.engram_head_dim;
++
++    // the whole batch goes into the history first: an n-gram inside the batch looks back at
++    // tokens of this same batch
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        cache->engram_set(ubatch->seq_id[i][0], ubatch->pos[i], token_map[ubatch->token[i]]);
++    }
++
++    std::vector<float> buf(row*n_tokens);
++
++    // H4. These rows are random reads over a 189 GiB mapping, issued one at a time on the
++    // thread the graph is waiting on. The addresses come from the token ids alone, so nothing
++    // about them has to wait for anything -- which is the whole reason this is worth timing.
++    static int64_t t_engram_us  = 0;
++    static int64_t n_engram_row = 0;
++    static int64_t n_engram_set = 0;
++    const int64_t t0_engram = ggml_time_us();
++    const llama_moe_stream_nvtx_range nvtx_engram("engram"); // SiegeLadder G26: its share of set_inputs under Nsight
++
++    for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++        fill_layer(e, buf.data(), *ubatch);
++        ggml_backend_tensor_set(kv[e], buf.data(), 0, row*n_tokens*sizeof(float));
++    }
++
++    t_engram_us  += ggml_time_us() - t0_engram;
++    n_engram_row += (int64_t) hparams.engram_n_layer * n_tokens * hparams.engram_n_hash_cols;
++    n_engram_set++;
++    if ((n_engram_set % 64) == 0) {
++        LLAMA_LOG_DEBUG("engram: %" PRId64 " us over %" PRId64 " set_input calls, %" PRId64 " rows "
++                "(%.3f ms per call, %.1f us per row)\n",
++                t_engram_us, n_engram_set, n_engram_row,
++                t_engram_us/1000.0/n_engram_set, (double) t_engram_us/n_engram_row);
++    }
++}
++
++void llm_graph_input_engram::fill_layer(uint32_t e, float * dst, const llama_ubatch & ub) {
++    auto * cache = mctx->get_kv();
++    GGML_ASSERT(cache != nullptr && cache->engram_enabled());
++
+     llama_engram_tables t;
+     t.token_map   = (const int32_t *) model.engram_token_map->data;
+     t.primes      = (const int64_t *) model.engram_primes->data;
+@@ -272,17 +328,10 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     t.head_dim    = hparams.engram_head_dim;
+     t.pad_id      = t.token_map[hparams.engram_pad_token];
+ 
+-    const uint32_t n_tokens = ubatch->n_tokens;
++    const uint32_t n_tokens = ub.n_tokens;
+     const size_t   row      = (size_t) t.n_hash_cols*t.head_dim;
+ 
+-    // the whole batch goes into the history first: an n-gram inside the batch looks back at
+-    // tokens of this same batch
+-    for (uint32_t i = 0; i < n_tokens; ++i) {
+-        cache->engram_set(ubatch->seq_id[i][0], ubatch->pos[i], t.token_map[ubatch->token[i]]);
+-    }
+-
+     std::vector<int32_t> hist(t.max_ngram);
+-    std::vector<float>   buf(row*n_tokens);
+     // every row this layer will read, hashed before anything is read
+     std::vector<int64_t> todas((size_t) n_tokens * t.n_hash_cols);
+     std::vector<void *>  enderecos;
+@@ -290,80 +339,91 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     enderecos.reserve(todas.size()*2);
+     tamanhos .reserve(todas.size()*2);
+ 
+-    // H4. These rows are random reads over a 189 GiB mapping, issued one at a time on the
+-    // thread the graph is waiting on. The addresses come from the token ids alone, so nothing
+-    // about them has to wait for anything -- which is the whole reason this is worth timing.
+-    static int64_t t_engram_us  = 0;
+-    static int64_t n_engram_row = 0;
+-    static int64_t n_engram_set = 0;
+-    const int64_t t0_engram = ggml_time_us();
+-    const llama_moe_stream_nvtx_range nvtx_engram("engram"); // SiegeLadder G26: its share of set_inputs under Nsight
++    const auto & layer = model.layers[hparams.engram_layer_ids[e]];
+ 
+-    for (uint32_t e = 0; e < t.n_layer; ++e) {
+-        const auto & layer = model.layers[hparams.engram_layer_ids[e]];
++    GGML_ASSERT(ggml_backend_buffer_is_host(layer.engram_embd->buffer));
+ 
+-        GGML_ASSERT(ggml_backend_buffer_is_host(layer.engram_embd->buffer));
++    const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
++    const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
+ 
+-        const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
+-        const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
++    // H4. Two passes on purpose. The first only hashes -- it touches no table memory, so it
++    // cannot fault -- and by the end of it every address this layer will read is known.
++    // The second reads. Between them, the OS is handed the whole list at once, so the
++    // faults go out together instead of one per row on the thread the graph waits on.
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        const llama_seq_id s = ub.seq_id[i][0];
++        const llama_pos    p = ub.pos[i];
+ 
+-        // H4. Two passes on purpose. The first only hashes -- it touches no table memory, so it
+-        // cannot fault -- and by the end of it every address this layer will read is known.
+-        // The second reads. Between them, the OS is handed the whole list at once, so the
+-        // faults go out together instead of one per row on the thread the graph waits on.
+-        for (uint32_t i = 0; i < n_tokens; ++i) {
+-            const llama_seq_id s = ubatch->seq_id[i][0];
+-            const llama_pos    p = ubatch->pos[i];
++        bool blocked = false;
++        for (uint32_t g = 0; g < t.max_ngram; ++g) {
++            const llama_pos q   = p - (llama_pos) g;
++            const int32_t   cid = q < 0 ? llama_kv_cache_dsv4::ENGRAM_DEAD : cache->engram_get(s, q);
+ 
+-            bool blocked = false;
+-            for (uint32_t g = 0; g < t.max_ngram; ++g) {
+-                const llama_pos q   = p - (llama_pos) g;
+-                const int32_t   cid = q < 0 ? llama_kv_cache_dsv4::ENGRAM_DEAD : cache->engram_get(s, q);
++            blocked = blocked || cid == llama_kv_cache_dsv4::ENGRAM_DEAD
++                              || cid == llama_kv_cache_dsv4::ENGRAM_NONE;
++            hist[g] = blocked ? t.pad_id : cid;
++        }
+ 
+-                blocked = blocked || cid == llama_kv_cache_dsv4::ENGRAM_DEAD
+-                                  || cid == llama_kv_cache_dsv4::ENGRAM_NONE;
+-                hist[g] = blocked ? t.pad_id : cid;
+-            }
++        llama_engram_hash_row(t, e, hist.data(), todas.data() + (size_t) i*t.n_hash_cols);
++    }
+ 
+-            llama_engram_hash_row(t, e, hist.data(), todas.data() + (size_t) i*t.n_hash_cols);
+-        }
++    for (size_t k = 0; k < todas.size(); ++k) {
++        enderecos.push_back((void *) (w  + (size_t) todas[k]*t.head_dim));
++        tamanhos .push_back(t.head_dim);
++        enderecos.push_back((void *) (sc + (size_t) todas[k]*(t.head_dim/32)));
++        tamanhos .push_back(t.head_dim/32);
++    }
++    llama_moe_stream_nvtx_push("engram_prefetch");
++    llama_prefetch_ranges(enderecos.data(), tamanhos.data(), enderecos.size());
++    llama_moe_stream_nvtx_pop();
+ 
+-        enderecos.clear();
+-        tamanhos.clear();
+-        for (size_t k = 0; k < todas.size(); ++k) {
+-            enderecos.push_back((void *) (w  + (size_t) todas[k]*t.head_dim));
+-            tamanhos .push_back(t.head_dim);
+-            enderecos.push_back((void *) (sc + (size_t) todas[k]*(t.head_dim/32)));
+-            tamanhos .push_back(t.head_dim/32);
++    llama_moe_stream_nvtx_push("engram_read");
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        const int64_t * r = todas.data() + (size_t) i*t.n_hash_cols;
++        float * out = dst + (size_t) i*row;
++        for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
++            llama_engram_dequant_row(w  + (size_t) r[c]*t.head_dim,
++                                     sc + (size_t) r[c]*(t.head_dim/32),
++                                     t.head_dim, out + (size_t) c*t.head_dim);
+         }
+-        llama_moe_stream_nvtx_push("engram_prefetch");
+-        llama_prefetch_ranges(enderecos.data(), tamanhos.data(), enderecos.size());
+-        llama_moe_stream_nvtx_pop();
++    }
++    llama_moe_stream_nvtx_pop();
++}
+ 
+-        llama_moe_stream_nvtx_push("engram_read");
+-        for (uint32_t i = 0; i < n_tokens; ++i) {
+-            const int64_t * r = todas.data() + (size_t) i*t.n_hash_cols;
+-            float * dst = buf.data() + (size_t) i*row;
+-            for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
+-                llama_engram_dequant_row(w  + (size_t) r[c]*t.head_dim,
+-                                         sc + (size_t) r[c]*(t.head_dim/32),
+-                                         t.head_dim, dst + (size_t) c*t.head_dim);
+-            }
+-        }
+-        llama_moe_stream_nvtx_pop();
++// SiegeLadder G23 step 2: the CPU op that gathers an engram layer's rows inside the graph (one task)
++static void llm_graph_engram_late_fill(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith == 0) {
++        auto * f = (llm_graph_input_engram::late_fill *) userdata;
++        f->inp->fill_op(f->e, dst);
++    }
++}
+ 
+-        ggml_backend_tensor_set(kv[e], buf.data(), 0, row*n_tokens*sizeof(float));
++void llm_graph_input_engram::fill_op(uint32_t e, ggml_tensor * dst) {
++    if (ahead.joinable()) {
++        // G26: what is left of the read-ahead - here, after the layers before this one
++        llama_moe_stream_nvtx_push("engram_wait");
++        ahead.join();
++        llama_moe_stream_nvtx_pop();
+     }
++    if (late_ub == nullptr || late_ub->token == nullptr) {
++        std::memset(dst->data, 0, ggml_nbytes(dst)); // no set_input for this compute: nothing to read
++        return;
++    }
++    const llama_moe_stream_nvtx_range nvtx_fill("engram_fill");
++    fill_layer(e, (float *) dst->data, *late_ub);
++}
+ 
+-    t_engram_us  += ggml_time_us() - t0_engram;
+-    n_engram_row += (int64_t) t.n_layer * n_tokens * t.n_hash_cols;
+-    n_engram_set++;
+-    if ((n_engram_set % 64) == 0) {
+-        LLAMA_LOG_DEBUG("engram: %" PRId64 " us over %" PRId64 " set_input calls, %" PRId64 " rows "
+-                "(%.3f ms per call, %.1f us per row)\n",
+-                t_engram_us, n_engram_set, n_engram_row,
+-                t_engram_us/1000.0/n_engram_set, (double) t_engram_us/n_engram_row);
++ggml_tensor * llm_graph_input_engram::lookup(ggml_context * ctx, uint32_t e) {
++    if (!late) {
++        return kv[e];
++    }
++    if (late_t[e] == nullptr) {
++        late_t[e] = ggml_custom_4d(ctx, GGML_TYPE_F32, kv[e]->ne[0], kv[e]->ne[1], 1, 1, nullptr, 0,
++                llm_graph_engram_late_fill, 1, &late_ud[e]);
++        ggml_format_name(late_t[e], "engram_fill-%u", e);
+     }
++    return late_t[e];
+ }
+ 
+ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index d4cd463..3caa9f0 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -738,6 +738,25 @@ public:
+ 
+     std::vector<ggml_tensor *> kv; // per engram layer: F32 [n_hash_cols*head_dim, n_tokens]
+ 
++    // SiegeLadder G23 step 2 (on by default, LLAMA_ENGRAM_LATE=0 - off; decode-sized ubatches): an engram layer's rows are gathered by a CPU op
++    // of the graph right before the first reader of that layer (lookup), not in set_input. With the graph reused (G23)
++    // nothing stood between the read-ahead (G26) and set_input any more; now the layers before the engram layer give
++    // the page faults their time back. set_input then only writes the history and keeps the ubatch for the ops; the
++    // first op joins the read-ahead
++    bool late = false;
++    const llama_ubatch * late_ub = nullptr; // the ubatch of the current compute (set_input), null in a reserve
++    struct late_fill {
++        llm_graph_input_engram * inp = nullptr;
++        uint32_t                 e   = 0;
++    };
++    std::vector<late_fill>     late_ud; // [engram_n_layer], the fill ops' userdata (sized once at build: stable)
++    std::vector<ggml_tensor *> late_t;  // [engram_n_layer], the fill ops, made at the first reader
++    // the lookup tensor of engram layer e for the graph: kv[e] (a graph input) or, with late, its fill op
++    ggml_tensor * lookup(ggml_context * ctx, uint32_t e);
++    // the rows of engram layer e for ubatch ub into dst (F32 [n_hash_cols*head_dim, n_tokens])
++    void fill_layer(uint32_t e, float * dst, const llama_ubatch & ub);
++    void fill_op(uint32_t e, ggml_tensor * dst);
++
+     const llama_hparams & hparams;
+     const llama_model   & model;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 4a80b28..9f82dd7 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2319,6 +2319,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             inp->read_ahead(ubatch);
+         }
+ 
++        // SiegeLadder G23 step 2 (on by default; LLAMA_ENGRAM_LATE=0 - off; decode-sized ubatches): an engram layer's rows
++        // gathered by a CPU op of the graph right before the layer's first reader (llm_graph_input_engram::lookup), not in
++        // set_input - SiegeLadder runs.md 4.128: default mode +2.2%, exact runahead +1.7%, text = trace
++        static const bool engram_late = getenv("LLAMA_ENGRAM_LATE") == nullptr || atoi(getenv("LLAMA_ENGRAM_LATE")) != 0;
++        inp->late = engram_late && n_tokens <= 64;
++        if (inp->late) {
++            inp->late_ud.resize(hparams.engram_n_layer);
++            inp->late_t.assign(hparams.engram_n_layer, nullptr);
++            for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++                inp->late_ud[e].inp = inp.get();
++                inp->late_ud[e].e   = e;
++            }
++        }
++
+         inp_engram = inp.get();
+         res->add_input(std::move(inp));
+     }
+@@ -2414,7 +2428,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         if (inp_engram) {
+             for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+                 if ((int) hparams.engram_layer_ids[e] == iln) {
+-                    x = dsv4_engram(ctx0, hparams.f_norm_rms_eps, ln, inp_engram->kv[e], x);
++                    x = dsv4_engram(ctx0, hparams.f_norm_rms_eps, ln, inp_engram->lookup(ctx0, e), x);
+                 }
+             }
+         }
+@@ -2498,7 +2512,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                     continue;
+                 }
+ 
+-                inpL = dsv4_engram(ctx0, hparams.f_norm_rms_eps, model.layers[il], inp_engram->kv[e], inpL);
++                inpL = dsv4_engram(ctx0, hparams.f_norm_rms_eps, model.layers[il], inp_engram->lookup(ctx0, e), inpL);
+                 cb(inpL, "engram_out", il);
+             }
+         }

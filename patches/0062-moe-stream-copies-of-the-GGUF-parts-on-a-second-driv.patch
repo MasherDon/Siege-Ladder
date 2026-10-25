@@ -1,0 +1,189 @@
+From 1a95bf3d423e47d0fac1a4d905b765561b6cddf0 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:59:57 +0000
+Subject: [PATCH 62/91] moe-stream : copies of the GGUF parts on a second drive
+ (SiegeLadder P16, LLAMA_MOE_STREAM_MIRROR=dir, off by default)
+
+A cold prompt of 1K+ tokens touches most of the experts and is bounded by the drive (SiegeLadder runs.md 4.100: a
+2.2K prompt reads 125 GB at 10.7 GB/s). With LLAMA_MOE_STREAM_MIRROR=dir, a part whose file of the same name and size
+is found in dir, with the same bytes in 17 sampled 64 KiB blocks, gets a second llama_file (its own per-worker handle
+pool). A worker reads a slab from the copy only while the primary drive already has LLAMA_MOE_STREAM_MIRROR_AT (8)
+reads in flight and the copies fewer than LLAMA_MOE_STREAM_MIRROR_MAX (4): decode's shallow queue stays on the fast
+drive, a prompt's overflow goes to the second one. Same bytes either way. print_stats reports the reads and bytes taken
+from the copies. SiegeLadder runs.md 4.107: diskspd with the fork's reads, the PV593 (Gen5 x4) at 12 in flight 13.23
+GB/s alone and 13.11 next to a VP4300 behind the chipset at 4 in flight (4.38) - 17.49 GB/s together.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 103 +++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h   |  15 ++++++
+ 2 files changed, 114 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index ce705e3..dfbd704 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1670,6 +1670,11 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+         LLAMA_LOG_INFO("%s: MoE expert streaming uses O_DIRECT (page cache bypassed)\n", __func__);
+     }
+ 
++    // SiegeLadder P16: copies of the parts on a second drive (see mirrors in the header)
++    if (const char * dir = std::getenv("LLAMA_MOE_STREAM_MIRROR"); dir != nullptr && *dir != '\0') {
++        open_mirrors(paths, dir);
++    }
++
+     // one token drives ~one remap per streamed layer, so decaying every 64 tokens is
+     //   64 * n_streamed_layers remap calls (computed once here, off the hot path)
+     int64_t n_streamed = 0;
+@@ -1686,6 +1691,92 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+     n_streamed_layers  = std::max<int64_t>(1, n_streamed);
+ }
+ 
++void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, const char * dir) {
++    mirrors.clear();
++    mirrors.resize(files.size());
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_AT")) {
++        mirror_at = std::max(0, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_MAX")) {
++        mirror_max = std::max(1, atoi(p));
++    }
++    // A copy is used only with the part's size and the same bytes in 17 sampled 64 KiB blocks (the start, 15 spread
++    // through the file, the tail): a stale copy of another build must not feed the cache without a word
++    const size_t blk = 64u << 10;
++    uint8_t * buf_a = (uint8_t *) moe_aligned_alloc(blk + 2*MOE_STREAM_DIRECT_ALIGN);
++    uint8_t * buf_b = (uint8_t *) moe_aligned_alloc(blk + 2*MOE_STREAM_DIRECT_ALIGN);
++    GGML_ASSERT(buf_a != nullptr && buf_b != nullptr);
++    std::string base = dir;
++    if (!base.empty() && base.back() != '/' && base.back() != '\\') {
++        base += '/';
++    }
++    int    n_open = 0;
++    double gb     = 0.0;
++    for (size_t i = 0; i < paths.size() && i < files.size(); i++) {
++        const size_t      cut   = paths[i].find_last_of("/\\");
++        const std::string mpath = base + (cut == std::string::npos ? paths[i] : paths[i].substr(cut + 1));
++        FILE * probe = ggml_fopen(mpath.c_str(), "rb");
++        if (probe == nullptr) {
++            continue; // no copy of this part
++        }
++        fclose(probe);
++        std::unique_ptr<llama_file> m;
++        try {
++            m.reset(new llama_file(mpath.c_str(), "rb", use_direct_io));
++        } catch (const std::exception & e) {
++            LLAMA_LOG_WARN("%s: P16: cannot open the copy '%s': %s\n", __func__, mpath.c_str(), e.what());
++            continue;
++        }
++        const size_t sz = files[i]->size();
++        if (m->size() != sz || m->has_direct_io() != files[i]->has_direct_io()) {
++            LLAMA_LOG_WARN("%s: P16: the copy '%s' is not the part (size %zu vs %zu, direct %d vs %d) - not used\n",
++                    __func__, mpath.c_str(), m->size(), sz, (int) m->has_direct_io(), (int) files[i]->has_direct_io());
++            continue;
++        }
++        const size_t n = std::min(blk, sz);
++        bool same = true;
++        for (int k = 0; k <= 16 && same; k++) {
++            size_t off = k == 16 ? sz - n : (sz - n) / 16 * k;
++            off &= ~(size_t) (MOE_STREAM_DIRECT_ALIGN - 1);
++            const size_t    len = std::min(n, sz - off);
++            const uint8_t * a   = llama_moe_stream_pread(*files[i], buf_a, len, off, use_direct_io, /*worker_id =*/ -1);
++            const uint8_t * b   = llama_moe_stream_pread(*m,        buf_b, len, off, use_direct_io, /*worker_id =*/ -1);
++            same = a != nullptr && b != nullptr && memcmp(a, b, len) == 0;
++        }
++        if (!same) {
++            LLAMA_LOG_WARN("%s: P16: the copy '%s' has other bytes than the part - not used\n", __func__, mpath.c_str());
++            continue;
++        }
++        gb += sz / 1e9;
++        n_open++;
++        mirrors[i] = std::move(m);
++    }
++    moe_aligned_free(buf_a);
++    moe_aligned_free(buf_b);
++    LLAMA_LOG_INFO("%s: P16: copies of %d of %zu parts in %s (%.1f GB); a slab goes to a copy while the primary has >= %d "
++            "reads in flight and the copies < %d\n", __func__, n_open, files.size(), dir, gb, mirror_at, mirror_max);
++}
++
++const uint8_t * llama_moe_stream::pread_slab(uint32_t file_idx, uint8_t * staging, size_t len, size_t offs, int worker_id) {
++    llama_file * f   = files[file_idx].get();
++    bool         mir = false;
++    if (file_idx < mirrors.size() && mirrors[file_idx] != nullptr &&
++            io_inflight_pri.load(std::memory_order_relaxed) >= mirror_at &&
++            io_inflight_mir.load(std::memory_order_relaxed) < mirror_max) {
++        f   = mirrors[file_idx].get();
++        mir = true;
++    }
++    std::atomic<int32_t> & n = mir ? io_inflight_mir : io_inflight_pri;
++    n.fetch_add(1, std::memory_order_relaxed);
++    const uint8_t * data = llama_moe_stream_pread(*f, staging, len, offs, use_direct_io, worker_id);
++    n.fetch_sub(1, std::memory_order_relaxed);
++    if (mir) {
++        io_mirror_n.fetch_add(1, std::memory_order_relaxed);
++        io_mirror_bytes.fetch_add((int64_t) len, std::memory_order_relaxed);
++    }
++    return data;
++}
++
+ void llama_moe_stream::cap_runahead(uint32_t n_expert_used) {
+     if (runahead_default && n_expert_used > 0 && runahead_k > n_expert_used) {
+         runahead_k = n_expert_used;
+@@ -2109,8 +2200,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2, sl.il);
+                 if (dst != nullptr) {
+                     const int64_t t_io = ggml_time_us();
+-                    const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], dst,
+-                            wt.nb_expert, offs, use_direct_io, worker_id);
++                    const uint8_t * data = pread_slab(wt.file_idx, dst, wt.nb_expert, offs, worker_id);
+                     io_record(/*spec =*/ true, t_io, ggml_time_us(), wt.nb_expert);
+                     if (data == nullptr) {
+                         // a failed speculative read is not an error: drop the slot and carry on
+@@ -2178,8 +2268,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+ 
+                 moe_nvtx_push("read", sl.il);
+                 const int64_t t_io = ggml_time_us();
+-                data = llama_moe_stream_pread(*files[wt.file_idx], dst ? dst : staging,
+-                        wt.nb_expert, offs, use_direct_io, worker_id);
++                data = pread_slab(wt.file_idx, dst ? dst : staging, wt.nb_expert, offs, worker_id);
+                 io_record(/*spec =*/ false, t_io, ggml_time_us(), wt.nb_expert);
+                 moe_nvtx_pop();
+ 
+@@ -3057,6 +3146,12 @@ void llama_moe_stream::print_stats(const char * role) const {
+                         p.us_max.load()/1000.0, p.hist[0].load(), p.hist[1].load(), p.hist[2].load(), p.hist[3].load(),
+                         p.hist[4].load(), p.hist[5].load());
+             }
++            if (io_mirror_n.load() > 0) {
++                const int64_t b_all = io[0].bytes.load() + io[1].bytes.load();
++                LLAMA_LOG_WARN("%s: %smoe stream: P16 reads from the copies = %" PRId64 ", %.2f GB (%.1f%% of the bytes)\n",
++                        __func__, pfx, io_mirror_n.load(), io_mirror_bytes.load()/1e9,
++                        b_all > 0 ? 100.0*io_mirror_bytes.load()/b_all : 0.0);
++            }
+         }
+     }
+     LLAMA_LOG_INFO("%s: %smoe stream: slot wait = %.2f ms total over %" PRId64 " waits (%.1f%% of the two stalls)\n",
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 4df3e2f..1b6cf51 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -640,6 +640,21 @@ struct llama_moe_stream {
+ 
+     llama_files files; // privately reopened GGUF files, same indices as the loader's
+ 
++    // SiegeLadder P16 (LLAMA_MOE_STREAM_MIRROR=dir, off by default): byte-identical copies of the GGUF parts on a second
++    // drive, same indices as files (nullptr where a part has no copy). A slab is read from the copy only while the
++    // primary drive already has mirror_at reads in flight and the copy fewer than mirror_max: decode's shallow queue
++    // stays on the fast drive, a prompt's overflow goes to the second one. Same bytes either way - only the drive differs
++    llama_files mirrors;
++    int32_t mirror_at  = 8;  // LLAMA_MOE_STREAM_MIRROR_AT
++    int32_t mirror_max = 4;  // LLAMA_MOE_STREAM_MIRROR_MAX
++    std::atomic<int32_t> io_inflight_pri{0};
++    std::atomic<int32_t> io_inflight_mir{0};
++    std::atomic<int64_t> io_mirror_n{0};
++    std::atomic<int64_t> io_mirror_bytes{0};
++    void open_mirrors(const std::vector<std::string> & paths, const char * dir);
++    // a slab of part file_idx into staging (see llama_moe_stream_pread), from the part or its copy
++    const uint8_t * pread_slab(uint32_t file_idx, uint8_t * staging, size_t len, size_t offs, int worker_id);
++
+     // Host-RAM tier below the VRAM slots. Off unless LLAMA_MOE_STREAM_L2_GIB is set; sized in
+     // whole GiB because the useful range on a consumer box is tens of gigabytes and a finer knob
+     // would suggest a precision the allocation does not have.

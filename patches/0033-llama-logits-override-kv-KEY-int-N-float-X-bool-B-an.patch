@@ -1,0 +1,105 @@
+From a7ca25ef783d904436b5031830994270b32531b7 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 07:59:02 +0000
+Subject: [PATCH 33/91] llama-logits : --override-kv KEY=int:N|float:X|bool:B
+ and -ctk / -ctv for the score context - the lossy modes of the ds4
+ general-100 sort (K = 5 / 4, quantized KV)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/logits/logits.cpp | 54 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 54 insertions(+)
+
+diff --git a/tools/logits/logits.cpp b/tools/logits/logits.cpp
+index 5e20226..9c13d34 100644
+--- a/tools/logits/logits.cpp
++++ b/tools/logits/logits.cpp
+@@ -505,6 +505,45 @@ static void uso(const char * exe) {
+     printf("  --score-file F    teacher-forced log-probabilities of many sequences, one model load\n");
+     printf("  --score-batch     with --score-file: the prompt and the target in one decode call\n");
+     printf("  --top N           with --score-file: the N most likely ids per position (default 64)\n");
++    printf("  --override-kv K=int:N|float:X|bool:true   model metadata override, e.g. deepseek41.expert_used_count=int:5\n");
++    printf("  -ctk T, -ctv T    KV cache types (f16, bf16, q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl)\n");
++}
++
++// SiegeLadder 17.10 (runs.md 4.46): the lossy modes of the ds4 general-100 sort need K = 5 / 4 and quantized KV
++static bool parse_kv_override(const std::string & s, llama_model_kv_override & o) {
++    const size_t eq = s.find('=');
++    const size_t colon = eq == std::string::npos ? std::string::npos : s.find(':', eq);
++    if (eq == std::string::npos || colon == std::string::npos || eq >= sizeof(o.key)) {
++        return false;
++    }
++    o = {};
++    std::memcpy(o.key, s.data(), eq);
++    const std::string type = s.substr(eq + 1, colon - eq - 1);
++    const std::string val  = s.substr(colon + 1);
++    if (type == "int") {
++        o.tag = LLAMA_KV_OVERRIDE_TYPE_INT;   o.val_i64  = std::stoll(val);
++    } else if (type == "float") {
++        o.tag = LLAMA_KV_OVERRIDE_TYPE_FLOAT; o.val_f64  = std::stod(val);
++    } else if (type == "bool") {
++        o.tag = LLAMA_KV_OVERRIDE_TYPE_BOOL;  o.val_bool = val == "true" || val == "1";
++    } else {
++        return false;
++    }
++    return true;
++}
++
++static bool parse_kv_type(const std::string & s, ggml_type & t) {
++    static const std::pair<const char *, ggml_type> names[] = {
++        {"f16", GGML_TYPE_F16}, {"bf16", GGML_TYPE_BF16}, {"q8_0", GGML_TYPE_Q8_0}, {"q4_0", GGML_TYPE_Q4_0},
++        {"q4_1", GGML_TYPE_Q4_1}, {"q5_0", GGML_TYPE_Q5_0}, {"q5_1", GGML_TYPE_Q5_1}, {"iq4_nl", GGML_TYPE_IQ4_NL},
++    };
++    for (const auto & [n, v] : names) {
++        if (s == n) {
++            t = v;
++            return true;
++        }
++    }
++    return false;
+ }
+ 
+ int main(int argc, char ** argv) {
+@@ -512,6 +551,8 @@ int main(int argc, char ** argv) {
+     int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0, moe_io_threads = 0;
+     int   moe_slots = 0, n_threads = 0, n_top = 64;
+     bool  moe_stream = false, add_bos = true, moe_direct = false, score_batch = false;
++    std::vector<llama_model_kv_override> kv_over;
++    ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
+ 
+     for (int i = 1; i < argc; i++) {
+         const std::string a = argv[i];
+@@ -559,6 +600,13 @@ int main(int argc, char ** argv) {
+         }
+         else if (a == "-ub")                   n_ubatch      = atoi(proximo("-ub").c_str());
+         else if (a == "--no-bos")              add_bos       = false;
++        else if (a == "--override-kv") {
++            llama_model_kv_override o;
++            if (!parse_kv_override(proximo("--override-kv"), o)) { uso(argv[0]); return 1; }
++            kv_over.push_back(o);
++        }
++        else if (a == "-ctk") { if (!parse_kv_type(proximo("-ctk"), type_k)) { uso(argv[0]); return 1; } }
++        else if (a == "-ctv") { if (!parse_kv_type(proximo("-ctv"), type_v)) { uso(argv[0]); return 1; } }
+         else { uso(argv[0]); return 1; }
+     }
+ 
+@@ -585,6 +633,10 @@ int main(int argc, char ** argv) {
+     mp.moe_stream_l2_gib = (uint32_t) moe_l2_gib;
+     mp.moe_stream_io_threads = moe_io_threads;
+     mp.moe_stream_direct = moe_direct;
++    if (!kv_over.empty()) {
++        kv_over.push_back({}); // the list ends at an empty key
++        mp.kv_overrides = kv_over.data();
++    }
+     // tokenizing needs no weights
+     mp.vocab_only        = !arq_tokenize.empty();
+ 
+@@ -614,6 +666,8 @@ int main(int argc, char ** argv) {
+         sp.n_batch  = (uint32_t) n_call;
+         sp.n_ubatch = (uint32_t) std::min(n_ubatch > 0 ? n_ubatch : 1, n_call);
+         sp.n_seq_max = 1;
++        sp.type_k    = type_k;
++        sp.type_v    = type_v;
+         if (n_threads > 0) {
+             sp.n_threads       = n_threads;
+             sp.n_threads_batch = n_threads;

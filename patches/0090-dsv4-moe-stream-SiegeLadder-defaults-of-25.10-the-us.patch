@@ -1,0 +1,151 @@
+From ade77bbb9aea2ef8ec561e720d532d824f18cc12 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 14:44:55 +0000
+Subject: [PATCH 90/91] dsv4 + moe-stream : SiegeLadder defaults of 25.10 (the
+ user's decisions, twenty-sixth session) - C7 K 140 on by default:
+ LLAMA_DSV4_YOCO unset = 140, =0 - off, quiet for other models as P4 is
+ (runs.md 4.219-4.220: within error on every API anchor, agent turns read
+ +13%, cold prompts +20...+60%); the exact preset also sets LLAMA_DSV4_YOCO=0
+ (exact stays the full model's math; the preset runs in the stream's ctor
+ while the model loads, before a context reads the key); the fast preset adds
+ G40 k 1 (G35's lens staged into VRAM: +3.2% stall-corrected on qd fast, k 2
+ +2.8% with 14% more stagings - runs.md 4.229); G40 stays off in default until
+ rare experts are predicted. Checked: c7_check A (exact preset) = the old A
+ byte for byte, C (explicit 140) = the old C, D (no keys) = C; general-100 on
+ fast + G40 +0.0011 [-0.0054, +0.0079] against fast without it; a 256K
+ document with C7 at 652 tok/s (632.7 without), answers 17.6 / 19.9 / 16.8
+ tok/s
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    | 22 +++++++++++++++-------
+ src/llama-context.h      |  3 ++-
+ src/llama-moe-stream.cpp | 17 ++++++++++-------
+ src/llama-moe-stream.h   | 11 ++++++-----
+ 4 files changed, 33 insertions(+), 20 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 98106bf..8a15e06 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -577,10 +577,14 @@ llama_context::llama_context(
+             }
+         }
+ 
+-        // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, off by default; see yoco_k in the header): DeepInfer's YoCo truncation of the
+-        // decoder in prefill (their README's V4.1 setting: K = 140), under P4's conditions and K at least the window
+-        if (const char * y = std::getenv("LLAMA_DSV4_YOCO"); y != nullptr && atoi(y) > 0) {
+-            const int32_t k     = atoi(y);
++        // SiegeLadder C7 (LLAMA_DSV4_YOCO=K; on by default with K = 140 since 25.10 - the user's decision after runs.md
++        // 4.219-4.220: within error on every API anchor, agent turns read +13%, cold prompts +20...+60%; =0 - off, and the
++        // exact preset sets 0; see yoco_k in the header): DeepInfer's YoCo truncation of the decoder in prefill (their
++        // README's V4.1 setting: K = 140), under P4's conditions and K at least the window
++        const char * y_env   = std::getenv("LLAMA_DSV4_YOCO");
++        const bool   y_asked = y_env != nullptr && atoi(y_env) > 0;
++        if (y_env == nullptr || y_asked) {
++            const int32_t k     = y_asked ? atoi(y_env) : 140;
+             const int32_t first = model.hparams.dsv4_dec_first();
+             const char *  why   = nullptr;
+             if (model.arch != LLM_ARCH_DEEPSEEK41 || first < 0 || model.hparams.dsv4_dec_reach() <= 0) {
+@@ -592,7 +596,10 @@ llama_context::llama_context(
+             } else if ((uint32_t) k < model.hparams.n_swa) {
+                 why = "K must be at least the decoder's window (n_swa): the state a call leaves is its last n_swa - 1 rows";
+             }
+-            if (why != nullptr) {
++            // on by default: another model needs no word about it
++            if (why != nullptr && !y_asked && model.arch != LLM_ARCH_DEEPSEEK41) {
++                why = nullptr;
++            } else if (why != nullptr) {
+                 LLAMA_LOG_WARN("%s: SiegeLadder C7 (LLAMA_DSV4_YOCO=%d) is off: %s\n", __func__, k, why);
+             } else {
+                 yoco_k = k;
+@@ -603,8 +610,9 @@ llama_context::llama_context(
+                 yoco_nobound = !yoco_mask && nb != nullptr && atoi(nb) != 0;
+                 yoco_rows    = !yoco_mask && (r == nullptr || atoi(r) != 0);
+                 yoco_lo.assign(LLAMA_MAX_SEQ, -1);
+-                LLAMA_LOG_WARN("%s: SiegeLadder C7 (lossy): the decoder (layers %d-%u) of a call keeps its last %d positions - "
+-                        "%s%s%s\n", __func__, first, model.hparams.n_layer() - 1, k,
++                LLAMA_LOG_WARN("%s: SiegeLadder C7 (lossy%s): the decoder (layers %d-%u) of a call keeps its last %d "
++                        "positions - %s%s%s\n", __func__, y_asked ? "" : "; on by default, LLAMA_DSV4_YOCO=0 - off", first,
++                        model.hparams.n_layer() - 1, k,
+                         yoco_mask ? "the bound on their raw windows alone (MODE=mask: no skips, the check's reference)" :
+                         yoco_nobound ? "the skips WITHOUT the bound (NOBOUND: a negative control, not C7)" :
+                         "a lower bound on their raw windows, whole ubatches below it run the encoder only",
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 02d1ae0..b25ac4c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -380,7 +380,8 @@ private:
+     int64_t  p4_n_tokens = 0;              // ... and their tokens
+     bool p4_enc_only(const llama_ubatch & ubatch) const;
+ 
+-    // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, off by default; docs/v41/c7-design.md; DeepInfer's YoCo prefill truncation):
++    // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, on by default with K = 140 since 25.10, =0 - off, the exact preset sets 0;
++    // docs/v41/c7-design.md; DeepInfer's YoCo prefill truncation):
+     // per decode call and sequence, yoco_lo = min(first output + 1, the call's end) - K. When it lies past the sequence's
+     // first position in the call, the decoder (layers 20-39) keeps only the call's last K positions: rows at or past
+     // yoco_lo see the raw window of those layers only from yoco_lo on (a lower bound on their SWA masks, all three
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index d2d655d..be11781 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -747,10 +747,13 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
+ 
+ // SiegeLadder presets (LLAMA_MOE_STREAM_PRESET=exact|default|fast): one key for the decode modes of runs.md 4.157-4.161.
+ // A preset only fills keys that are not set, so an explicit key still wins. exact - no drops (runahead K = 6 then takes
+-// over by itself, lossless; G35 gives way to it); default - the fork's own defaults (drop 0.14 with DROP_ALL, G31, G35 v2
+-// since 25.10); fast - the default plus
+-// C14 0.2 (late, N 1: +4.8...+5.2% over the default, general-100 dNLL about +0.005 more, 4.152 / 4.157). Runs before
+-// any key is read, at the start of the ctor; the keys are set in the process environment, so children see them too.
++// over by itself, lossless; G35 gives way to it) and no C7 (LLAMA_DSV4_YOCO=0: the prefill truncation, on by default
++// since 25.10, is lossy - exact stays the full model's math); default - the fork's own defaults (drop 0.14 with DROP_ALL,
++// G31, G35 v2, C7 K 140 since 25.10); fast - the default plus C14 0.2 (late, N 1: +4.8...+5.2% over the default,
++// general-100 dNLL about +0.005 more, 4.152 / 4.157) and G40 k 1 (G35's lens staged into VRAM: +3% on qd fast, k 2 the
++// same within the spread with 14% more stagings - runs.md 4.224 / 4.229; the user's decision of 25.10: the fast preset
++// only). Runs before any key is read, at the start of the ctor - while the model loads, before a context reads
++// LLAMA_DSV4_YOCO; the keys are set in the process environment, so children see them too.
+ static void moe_stream_apply_preset() {
+     const char * name = std::getenv("LLAMA_MOE_STREAM_PRESET");
+     if (name == nullptr || *name == '\0') {
+@@ -764,8 +767,8 @@ static void moe_stream_apply_preset() {
+         return;
+     }
+     struct preset_key { const char * key; const char * value; };
+-    static const preset_key k_exact[] = { { "LLAMA_MOE_STREAM_DROP_W", "0"   } };
+-    static const preset_key k_fast[]  = { { "LLAMA_MOE_STREAM_C14",    "0.2" } };
++    static const preset_key k_exact[] = { { "LLAMA_MOE_STREAM_DROP_W", "0"   }, { "LLAMA_DSV4_YOCO",      "0" } };
++    static const preset_key k_fast[]  = { { "LLAMA_MOE_STREAM_C14",    "0.2" }, { "LLAMA_MOE_STREAM_G40", "1" } };
+     const preset_key * keys = nullptr;
+     size_t             n    = 0;
+     if (std::strcmp(name, "exact") == 0) {
+@@ -1060,7 +1063,7 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
+         g35_lazy = std::max(0, std::min(2, atoi(p)));
+     }
+-    // SiegeLadder G40; see g40_k in the header (off by default until the user's decision; k 2, h 0.18 measured best)
++    // SiegeLadder G40; see g40_k in the header (off by default; the fast preset sets it - the user's decision of 25.10)
+     bool g40_asked = false;
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40")) {
+         g40_k     = std::max(0, std::min(64, atoi(p)));
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 67e8e9e..27883a4 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -859,11 +859,12 @@ struct llama_moe_stream {
+     // up to k whose share of its top n_used is at least G40_H and that hold no VRAM slot are staged into the target
+     // layer's slots now, d = G35's depth calls before their call (as the oracle's VRAM_AHEAD = d does with a perfect
+     // guess); G40_LOW=1 - onto q_stage_low (the bus's windows: no gain, runs.md 4.221). The math is untouched, but in a
+-    // preset with the drop rule its stagings evict hot residents the rule then drops (runs.md 4.225: +5% drops, general-100
+-    // +0.0048) - G40_TIER=1 (G40c) takes a staging's victim only among slots whose expert the host tier holds whole, so a
+-    // miss on it is a copy from RAM, never dropped. Off by default (k 0) until the user's decision; k 2, h 0.18 measured
+-    // best (SiegeLadder runs.md 4.224: +5.2% cd default, +4.7% qd fast); with G35 off or giving way to runahead (the exact
+-    // preset) there is no lens, and G40 stays off
++    // preset with the drop rule it adds ~5% drops (runs.md 4.225-4.227: general-100 +0.0040 against the default; the extra
++    // drops come from its stagings from the drive - G40d below takes them away, and half the gain with them); G40_TIER=1
++    // (G40c) takes a staging's victim only among slots whose expert the host tier holds whole (changes nothing: the
++    // residents are tier-backed already). Off by default (k 0) - the user's decision of 25.10: on in the fast preset only
++    // (the preset sets LLAMA_MOE_STREAM_G40), the default once rare experts are predicted; h 0.18 measured best; with G35
++    // off or giving way to runahead (the exact preset) there is no lens, and G40 stays off
+     int32_t  g40_k           = 0;
+     float    g40_h           = 0.18f; // < 0: G35_H
+     bool     g40_low         = false;

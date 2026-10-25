@@ -1,0 +1,148 @@
+From 4d7c4f4201875205980ee28b588fd68499640b3b Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 21:33:56 +0000
+Subject: [PATCH 42/91] DeepSeek V4.1 : the candidate blocks carried as one
+ verdict per block, built in their source layer (SiegeLadder D3, step L1), on
+ by default
+
+In graphs of more than one token the candidate chain (build_candidate_mask) cost the prefill compute buffer ~15 bytes per
+query and compressed position live at once: a ggml_cont copy of the already contiguous scores, a -inf template leaf the
+allocator held from the start of the graph, and a per-position f32 mask (REPEAT) carried to the last index source - and
+as its first reader is the next index source four layers on, the graph placed the whole chain there, with the source
+layer's [n_pos, nt] f32 scores alive until then. Now the pool reads the scores themselves, the template is a fill of the
+pooled scores, the result stays one verdict per block [1, n_blocks, nt, ns], build_lid_top_k adds it in place to the
+scores viewed as [block, n_blocks, nt, ns], and build_csa_lid_attention computes it in its own layer. Exact: the same
+blocks are kept and every score gets the same f32 add of 0 or -inf, so top_k sees identical values.
+LLAMA_DSV4_CAND_COMPACT=0 builds the graph of before. Decode, runahead's pass and MTP (one token) are unchanged.
+
+SiegeLadder runs.md 4.66-4.67: router-112's case_111 (23 454-token prompt, -ub 1536, fresh process) gives positions.tsv
+with one md5 for =0, =1 and the probe of 4.61 on d1bae47; the CUDA0 compute buffer at 32K / -ub 1536 1 310 -> 1 043 MiB,
+the 64-token graph 80.3 -> 71.3 MiB (the buffer grew ~0.58 MiB per ubatch token per 32K of context; 2 198 MiB at
+64K / 1536 did not fit).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/deepseek4.cpp | 82 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 31d749f..224d67d 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -55,6 +55,25 @@ static ggml_tensor * dsv4_engram(
+     return ggml_add(ctx0, h, ggml_mul(ctx0, v, gate));
+ }
+ 
++// SiegeLadder theory D3: V4.1's candidate selection (build_candidate_mask) carried as one verdict per block instead of
++// one per position, and computed in its source layer, for graphs of more than one token. Exact, so on by default;
++// LLAMA_DSV4_CAND_COMPACT=0 builds the graph of before, node for node. Read once, logged once (at model load).
++static bool dsv4_cand_compact() {
++    static const bool on = [] {
++        const char * s = std::getenv("LLAMA_DSV4_CAND_COMPACT");
++        const bool v = s == nullptr || atoi(s) != 0;
++        if (v) {
++            LLAMA_LOG_INFO("%s: SiegeLadder D3: candidate blocks carried compact - one verdict per block, built in the "
++                    "source layer (LLAMA_DSV4_CAND_COMPACT=0: the graph of before)\n", __func__);
++        } else {
++            LLAMA_LOG_WARN("%s: SiegeLadder D3 off (LLAMA_DSV4_CAND_COMPACT=0): the candidate mask is carried per "
++                    "position, as before\n", __func__);
++        }
++        return v;
++    }();
++    return on;
++}
++
+ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+     hparams.dsv4_v41 = arch == LLM_ARCH_DEEPSEEK41;
+     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+@@ -168,6 +187,9 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+     }
+     ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv4_candidate_block_size,  false);
+     ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv4_candidate_topk_blocks, false);
++    if (hparams.dsv4_candidate_source_layer >= 0) {
++        dsv4_cand_compact(); // reads LLAMA_DSV4_CAND_COMPACT and logs it, once (SiegeLadder D3)
++    }
+ 
+     ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
+     if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+@@ -865,6 +887,43 @@ ggml_tensor * llama_model_deepseek4::graph::build_candidate_mask(
+     GGML_ASSERT(n_blocks > 0 && n_pos%n_blocks == 0);
+     const int64_t block = n_pos/n_blocks;
+ 
++    // SiegeLadder theory D3 (graphs of more than one token): the chain below costs, per query and compressed position,
++    // a 4-byte copy of the scores (ggml_cont of a tensor that is already contiguous), a template leaf the allocator
++    // holds from the start of the graph, and a 4-byte mask (REPEAT) carried to the last index source - and as nothing in
++    // this layer reads that mask, the whole chain, this layer's [n_pos, nt] f32 scores with it, waited in the graph for
++    // the next index source: ~15 bytes per query and position live at once at the buffer's peak. Here the pool reads the
++    // scores themselves, the -inf template is a fill of the pooled scores (a computed tensor, which the allocator gives
++    // a lifetime and which may take their memory once top_k has read them), and the result stays one verdict per block,
++    // [1, n_blocks, nt, ns]: build_lid_top_k adds it to the scores viewed as [block, n_blocks, nt, ns], and
++    // build_csa_lid_attention computes it in this layer. Exact: the same max over the same values picks the same
++    // blocks, and every score gets the same f32 add of 0 or -inf as from the per-position mask, so top_k sees
++    // identical values.
++    if (dsv4_cand_compact() && n_tokens > 1) {
++        ggml_tensor * bs = ggml_is_contiguous(index_score) ? index_score : ggml_cont(ctx0, index_score);
++        bs = ggml_pool_2d(ctx0, bs, GGML_OP_POOL_MAX, (int) block, 1, (int) block, 1, 0, 0);
++        cb(bs, "cand_block_score", il);
++
++        bs = ggml_add(ctx0, bs, cand_pin);
++
++        const int64_t k = topb < n_blocks ? topb : n_blocks;
++        ggml_tensor * top = ggml_cont(ctx0, ggml_top_k(ctx0, bs, (int) k));
++
++        // -inf everywhere, 0 on the blocks that were kept: [n_blocks, nt, 1, ns] -> [1, n_blocks, nt, ns]
++        ggml_tensor * keep = ggml_fill(ctx0, bs, -INFINITY);
++        keep = ggml_reshape_4d(ctx0, keep, 1, n_blocks, keep->ne[1], keep->ne[3]);
++
++        ggml_tensor * top3 = ggml_view_4d(ctx0, top, top->ne[0], top->ne[1], top->ne[3], 1,
++                top->nb[1], top->nb[2], top->ne[3]*top->nb[3], 0);
++
++        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top3->ne[0], top3->ne[1], top3->ne[2]);
++        zeros = ggml_fill(ctx0, zeros, 0.0f);
++
++        keep = ggml_set_rows(ctx0, keep, zeros, top3);
++        cb(keep, "cand_keep", il);
++
++        return keep;
++    }
++
+     // one score per block: its best position. Unreachable positions arrive at -inf.
+     ggml_tensor * bs = ggml_cont(ctx0, index_score);
+     bs = ggml_pool_2d(ctx0, bs, GGML_OP_POOL_MAX, (int) block, 1, (int) block, 1, 0, 0);
+@@ -1006,6 +1065,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
+     if (cand_carry != nullptr) {
+         if (hparams.dsv4_candidate_source_layer >= 0 && il == hparams.dsv4_candidate_source_layer) {
+             *cand_carry = build_candidate_mask(indexer_score, inp_lid_pin, il);
++        } else if (*cand_carry != nullptr && dsv4_cand_compact() && n_tokens > 1) {
++            // SiegeLadder D3: the carry is one verdict per block, [1, n_blocks, nt, ns]. The positions of a block are
++            // consecutive, so the scores viewed as [block, n_blocks, nt, ns] have them in ne0 and take the verdict by
++            // broadcast, in place: each score gets the same f32 add of 0 or -inf as from the per-position mask.
++            ggml_tensor * keep     = *cand_carry;
++            const int64_t n_pos    = indexer_score->ne[0];
++            const int64_t n_blocks = keep->ne[1];
++            GGML_ASSERT(keep->ne[0] == 1 && n_blocks > 0 && n_pos%n_blocks == 0);
++            GGML_ASSERT(keep->ne[2] == indexer_score->ne[1] && keep->ne[3] == indexer_score->ne[3]);
++
++            ggml_tensor * s = ggml_reshape_4d(ctx0, indexer_score,
++                    n_pos/n_blocks, n_blocks, indexer_score->ne[1], indexer_score->ne[3]);
++            s = ggml_add_inplace(ctx0, s, keep);
++            indexer_score = ggml_reshape_4d(ctx0, s, n_pos, indexer_score->ne[1], 1, indexer_score->ne[3]);
++            cb(indexer_score, "lid_score_candidates", il);
+         } else if (*cand_carry != nullptr) {
+             indexer_score = ggml_add(ctx0, indexer_score, *cand_carry);
+             cb(indexer_score, "lid_score_candidates", il);
+@@ -1095,6 +1169,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+ 
+     ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
+ 
++    // SiegeLadder D3: the candidate source's block verdicts are computed here, in their own layer and after q. Their
++    // first reader is the next index source, four layers on, which would otherwise pull the whole chain - and this
++    // layer's [n_pos, nt] f32 scores with it - into its own place in the graph; now the scores die at this layer's top_k.
++    if (cand_carry != nullptr && *cand_carry != nullptr && il == hparams.dsv4_candidate_source_layer &&
++            dsv4_cand_compact() && n_tokens > 1) {
++        ggml_build_forward_expand(gf, *cand_carry);
++    }
++
+     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
+     cb(raw_k, "csa_raw_k", il);
+ 

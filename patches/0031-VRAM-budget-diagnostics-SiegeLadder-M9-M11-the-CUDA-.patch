@@ -1,0 +1,278 @@
+From 32cf9d8a894b8d49793db0d93caecceb608ded48 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 06:56:17 +0000
+Subject: [PATCH 31/91] VRAM budget diagnostics (SiegeLadder M9 / M11): the
+ CUDA VMM pool logs every growth with the node that asked; the WDDM budgets of
+ the process (DXGI) are printed when the host tier is allocated and when the
+ context is built; LLAMA_MOE_STREAM_PROBE_VRAM=1 takes 16 MiB blocks after
+ load until the driver refuses
+
+Under "Prefer No Sysmem Fallback" the real limit was ~15 665 MiB of DXGI usage in every configuration (the DXGI budget, 15 227, is exceeded freely): -ub 2048 at 12K leaves 16 MiB, so the pool fails on its first growth.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 20 ++++++++-
+ src/CMakeLists.txt              |  1 +
+ src/llama-moe-stream.cpp        | 56 ++++++++++++++++++++++++
+ src/llama-wddm.cpp              | 76 +++++++++++++++++++++++++++++++++
+ src/llama-wddm.h                | 17 ++++++++
+ 5 files changed, 169 insertions(+), 1 deletion(-)
+ create mode 100644 src/llama-wddm.cpp
+ create mode 100644 src/llama-wddm.h
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b91e5e6..06e6fa7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -415,6 +415,11 @@ const ggml_cuda_device_info & ggml_cuda_info() {
+ 
+ // #define DEBUG_CUDA_MALLOC
+ 
++// SiegeLadder (theory M11, runs.md 4.43): the graph node being computed on this thread, so that the VMM pool can say
++// which op made it grow. The pool grows at run time, after the load-time memory estimate, and with the driver's
++// "Prefer No Sysmem Fallback" a growth past free VRAM is a crash in the middle of a prompt.
++static thread_local const ggml_tensor * ggml_cuda_pool_cur_node = nullptr;
++
+ // buffer pool for cuda (legacy)
+ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+     static const int MAX_BUFFERS = 256;
+@@ -538,6 +543,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ 
+     int device;
+     int physical_device;
++    int stream_no = 0;
+     CUdeviceptr pool_addr = 0;
+     size_t pool_used = 0;
+     size_t pool_size = 0;
+@@ -580,6 +586,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+ 
+             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
+ 
++            // M11: every growth, logged before the driver calls, so a failing one is the last line
++            {
++                const ggml_tensor * node = ggml_cuda_pool_cur_node;
++                GGML_LOG_INFO("%s: cuda pool[%d][%d] grows %.1f -> %.1f MiB for a %.2f MiB buffer (%.1f MiB in use) at %s (%s)\n",
++                        __func__, device, stream_no, pool_size/1048576.0, (pool_size + reserve_size)/1048576.0,
++                        size/1048576.0, pool_used/1048576.0, node ? node->name : "-", node ? ggml_op_desc(node) : "-");
++            }
++
+             // allocate more physical memory
+             CUmemAllocationProp prop = {};
+             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+@@ -686,7 +700,9 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
+                                                                                [[maybe_unused]] int stream_no) {
+ #if defined(GGML_USE_VMM)
+     if (ggml_cuda_info().devices[device].vmm) {
+-        return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_vmm(device));
++        auto * pool = new ggml_cuda_pool_vmm(device);
++        pool->stream_no = stream_no;
++        return std::unique_ptr<ggml_cuda_pool>(pool);
+     }
+ #endif // defined(GGML_USE_VMM)
+     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
+@@ -4065,7 +4081,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++                ggml_cuda_pool_cur_node = node;
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
++                ggml_cuda_pool_cur_node = nullptr;
+                 if (!ok) {
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 4f3fb51..04fc13f 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -37,6 +37,7 @@ add_library(llama
+             llama-model.cpp
+             llama-engram.cpp
+             llama-moe-stream.cpp
++            llama-wddm.cpp
+             llama-quant.cpp
+             llama-sampler.cpp
+             llama-vocab.cpp
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 469d0e7..5205996 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-moe-stream.h"
++#include "llama-wddm.h"
+ 
+ #include "llama-impl.h"
+ 
+@@ -410,6 +411,17 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+ 
+     const size_t bytes = n_l2 * stride;
+ 
++    // M9: pinned memory counts against the shared (non-local) WDDM budget; past it the tier is not locked (4.36)
++    {
++        const llama_wddm_budget wb = llama_wddm_query_budget();
++        if (wb.ok) {
++            LLAMA_LOG_INFO("%s: WDDM shared-memory budget %.0f MiB, %.0f in use; the tier asks %.0f MiB%s\n", __func__,
++                    wb.nonlocal_budget/1048576.0, wb.nonlocal_usage/1048576.0, bytes/1048576.0,
++                    host_buft != nullptr && wb.nonlocal_usage + bytes > wb.nonlocal_budget ?
++                        " - more than is left: the part past the budget will not stay locked" : "");
++        }
++    }
++
+     if (host_buft != nullptr) {
+         ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, bytes);
+         if (b != nullptr) {
+@@ -685,6 +697,50 @@ llama_moe_stream::~llama_moe_stream() {
+ }
+ 
+ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
++    // M11: the end of the context's construction - every load-time buffer is in place, and what is left of the
++    // process's VRAM budget is all the CUDA pool can grow into (with "Prefer No Sysmem Fallback" a growth past it
++    // is a crash in the middle of a prompt: -ub 2048 at 12K, runs.md 4.43)
++    {
++        const llama_wddm_budget wb = llama_wddm_query_budget();
++        if (wb.ok) {
++            const double headroom = ((double) wb.local_budget - (double) wb.local_usage)/1048576.0;
++            LLAMA_LOG_INFO("%s: WDDM budget of %s: VRAM %.0f of %.0f MiB in use (dedicated %.0f), %.0f MiB left for "
++                    "the CUDA pool; shared %.0f of %.0f MiB\n", __func__, wb.name, wb.local_usage/1048576.0,
++                    wb.local_budget/1048576.0, wb.dedicated/1048576.0, headroom, wb.nonlocal_usage/1048576.0,
++                    wb.nonlocal_budget/1048576.0);
++            if (headroom < 256.0) {
++                LLAMA_LOG_WARN("%s: only %.0f MiB of the VRAM budget left after load - a prompt batch that grows the "
++                        "CUDA pool past it fails under \"Prefer No Sysmem Fallback\" (a smaller -ub needs less)\n",
++                        __func__, headroom);
++            }
++        }
++        // measurement (LLAMA_MOE_STREAM_PROBE_VRAM=1): the DXGI budget is not the real limit - 4.43 ran 100-400 MiB
++        // past it, and the pool still died 16 MiB above the load at -ub 2048 - so take 16 MiB blocks until the driver
++        // refuses, note how far it went, and give them all back
++        if (std::getenv("LLAMA_MOE_STREAM_PROBE_VRAM") != nullptr && backend != nullptr) {
++            ggml_backend_dev_t pdev = ggml_backend_get_device(backend);
++            ggml_backend_buffer_type_t pbuft = pdev != nullptr ? ggml_backend_dev_buffer_type(pdev) : nullptr;
++            if (pbuft != nullptr) {
++                const size_t step = 16ull << 20;
++                std::vector<ggml_backend_buffer_t> got;
++                while (got.size() < 1024) { // 16 GiB at most
++                    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(pbuft, step);
++                    if (b == nullptr) {
++                        break;
++                    }
++                    got.push_back(b);
++                }
++                const llama_wddm_budget at_peak = llama_wddm_query_budget();
++                for (ggml_backend_buffer_t b : got) {
++                    ggml_backend_buffer_free(b);
++                }
++                LLAMA_LOG_WARN("%s: VRAM probe: %zu MiB more could be allocated after load%s%.0f MiB in use at the "
++                        "peak, budget %.0f, dedicated %.0f)\n", __func__, got.size()*16, at_peak.ok ? " (DXGI: " : " (",
++                        at_peak.ok ? at_peak.local_usage/1048576.0 : 0.0, at_peak.local_budget/1048576.0,
++                        at_peak.dedicated/1048576.0);
++            }
++        }
++    }
+     if (!async_upload || backend == nullptr || bufs.empty()) {
+         return;
+     }
+diff --git a/src/llama-wddm.cpp b/src/llama-wddm.cpp
+new file mode 100644
+index 0000000..dc24ab0
+--- /dev/null
++++ b/src/llama-wddm.cpp
+@@ -0,0 +1,76 @@
++// SiegeLadder (theories M9, M11; runs.md 4.43). Under WDDM a process may hold only its budget of the adapter's
++// dedicated memory - the OS keeps the rest - and with the NVIDIA driver's "Prefer No Sysmem Fallback" an allocation
++// past the budget fails instead of spilling into system memory: the CUDA pool then dies in the middle of a prompt.
++// Pinned host memory counts against the non-local (shared) budget, which caps the host tier (M6).
++#include "llama-wddm.h"
++
++#ifdef _WIN32
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <dxgi1_4.h>
++
++#pragma comment(lib, "dxgi.lib")
++
++llama_wddm_budget llama_wddm_query_budget() {
++    llama_wddm_budget r;
++
++    IDXGIFactory4 * factory = nullptr;
++    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void **) &factory))) {
++        return r;
++    }
++    // the adapter with the most dedicated memory: the discrete card, not an iGPU that drives the monitor
++    IDXGIAdapter1 * best     = nullptr;
++    SIZE_T          best_mem = 0;
++    for (UINT i = 0; ; i++) {
++        IDXGIAdapter1 * a = nullptr;
++        if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) {
++            break;
++        }
++        DXGI_ADAPTER_DESC1 d = {};
++        a->GetDesc1(&d);
++        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.DedicatedVideoMemory > best_mem) {
++            if (best != nullptr) {
++                best->Release();
++            }
++            best     = a;
++            best_mem = d.DedicatedVideoMemory;
++            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, r.name, (int) sizeof(r.name), nullptr, nullptr);
++        } else {
++            a->Release();
++        }
++    }
++    if (best != nullptr) {
++        IDXGIAdapter3 * a3 = nullptr;
++        if (SUCCEEDED(best->QueryInterface(__uuidof(IDXGIAdapter3), (void **) &a3))) {
++            DXGI_QUERY_VIDEO_MEMORY_INFO local    = {};
++            DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal = {};
++            if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
++                SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
++                r.ok              = true;
++                r.dedicated       = best_mem;
++                r.local_budget    = local.Budget;
++                r.local_usage     = local.CurrentUsage;
++                r.nonlocal_budget = nonlocal.Budget;
++                r.nonlocal_usage  = nonlocal.CurrentUsage;
++            }
++            a3->Release();
++        }
++        best->Release();
++    }
++    factory->Release();
++    return r;
++}
++
++#else
++
++llama_wddm_budget llama_wddm_query_budget() {
++    return {};
++}
++
++#endif
+diff --git a/src/llama-wddm.h b/src/llama-wddm.h
+new file mode 100644
+index 0000000..b96e39e
+--- /dev/null
++++ b/src/llama-wddm.h
+@@ -0,0 +1,17 @@
++#pragma once
++
++#include <cstdint>
++
++// SiegeLadder (theories M9, M11; runs.md 4.43): the WDDM video memory budgets of this process for the adapter with
++// the most dedicated memory, read through DXGI. ok is false off Windows or when DXGI cannot tell.
++struct llama_wddm_budget {
++    bool     ok              = false;
++    char     name[128]       = {};
++    uint64_t dedicated       = 0; // DXGI_ADAPTER_DESC1::DedicatedVideoMemory
++    uint64_t local_budget    = 0; // VRAM the OS lets this process hold
++    uint64_t local_usage     = 0; // VRAM this process holds now
++    uint64_t nonlocal_budget = 0; // system memory the GPU may map for this process: pinned host buffers count here
++    uint64_t nonlocal_usage  = 0;
++};
++
++llama_wddm_budget llama_wddm_query_budget();

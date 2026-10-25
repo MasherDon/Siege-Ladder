@@ -1,0 +1,59 @@
+From 6840ea658df3394f2b7e8feecc5c2ee950493f8d Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 16:02:49 +0000
+Subject: [PATCH 10/91] moe-stream : skip the pairs outside a prefill wave by
+ default
+
+LLAMA_MOE_STREAM_WAVE_SKIP was opt-in since 94c17f8: exact, but on 2026-10-12 the drive was the limit of a
+prefill in waves, so the compute it removes hid under the next wave's load. Since the expert files are no
+longer mapped (3aa63fa, 74d0419) the drive delivers and the compute is the limit, and skipping wins at every
+ubatch. DeepSeek V4.1-Flash Q2mix, prompts of 2159 / 8897 tokens, tok/s, skip vs park (SiegeLadder runs.md
+4.23): -ub 2048 116 / 146 vs 57 / 60, -ub 1024 83 / 100 vs 57 / 62, -ub 512 55 / 64 vs 44 / 49.
+KL against the -ub 512 io-1 reference on this build: mean 0, max 5.8e-5, same top-1 100%, PPL x1.000001.
+
+LLAMA_MOE_STREAM_WAVE_SKIP=0 turns it off; any other value keeps it on, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 13 ++++++++++---
+ src/llama-moe-stream.h   |  2 +-
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 5e24409..01511b8 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -506,10 +506,17 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+     use_direct_io = direct;
+ 
+-    // opt-in: exact, but measured 2026-10-12 it does not speed up prompts (the disk is the limit) and at
+-    // -ub 2048 the CUDA VMM pool then fails to grow (cuMemSetAccess: not ready) on an 8.9K prompt.
++    // On by default since 2026-10-14; LLAMA_MOE_STREAM_WAVE_SKIP=0 turns it off. Exact (KL at the noise
++    // floor, SiegeLadder runs.md 4.16). It was opt-in before: on 2026-10-12 the disk was the limit, so the
++    // wave compute it removes hid under the next wave's load, and at -ub 2048 the VMM pool failed to grow
++    // on an 8.9K prompt (fixed in fd3adec). Since the expert files stopped being mapped (3aa63fa, 74d0419)
++    // the compute is the limit: an 8.9K prompt with skipping vs without, measured 2026-10-14 (runs.md
++    // 4.23), -ub 2048 146 vs 60 tok/s, -ub 1024 100 vs 62, -ub 512 64 vs 49.
+     // alloc_bufs() keeps it only when every expert cache lands in a CUDA buffer.
+-    wave_skip = std::getenv("LLAMA_MOE_STREAM_WAVE_SKIP") != nullptr;
++    {
++        const char * s = std::getenv("LLAMA_MOE_STREAM_WAVE_SKIP");
++        wave_skip = s == nullptr || std::atoi(s) != 0;
++    }
+ 
+     // Router bias toward resident experts. Read once here rather than per call so a run cannot
+     // change policy halfway through and leave counters that describe two different experiments.
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index daa3ff0..e96582c 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -398,7 +398,7 @@ struct llama_moe_stream {
+     int64_t n_shift_l2  = 0; // of those, substitutes found in the host tier
+ 
+     // Multi-pass prefill skips the pairs outside the current wave rather than parking them (see
+-    // llama_moe_stream_wave_skip). Opt-in with LLAMA_MOE_STREAM_WAVE_SKIP=1, and only where the
++    // llama_moe_stream_wave_skip). On unless LLAMA_MOE_STREAM_WAVE_SKIP=0, and only where the
+     // expert caches live in a CUDA buffer, the one backend whose mul_mat_id handles skipped ids.
+     // Exact either way - it changes which GEMM rows run, not what the model computes.
+     bool wave_skip = false;

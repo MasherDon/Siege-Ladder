@@ -1,0 +1,79 @@
+From 44e0c5d6203a43746949646ab9154a6e1822326b Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:18:13 +0000
+Subject: [PATCH 74/91] llama-graph : sparse prefill on by default -
+ LLAMA_DSV4_SPARSE_PREFILL unset = on (=0 off), and while it is on
+ LLAMA_DSV4_ATTN_QCHUNK unset = 1536 for the ubatches that cannot go sparse
+ (SiegeLadder D10 default, user decision 21.10; router-112 within error)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp | 16 +++++++++++-----
+ src/llama-graph.h   |  5 +++--
+ 2 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8aee0f5..5a87858 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1331,7 +1331,8 @@ static void dsv4_build_comp_inputs(
+ 
+ // SiegeLadder P13 (models/deepseek4.cpp, build_attention_impl): the attention of a big prefill ubatch in chunks of
+ // queries, each with its own window rows of the ring and its own compressed width.
+-//   LLAMA_DSV4_ATTN_QCHUNK=nq          chunks of at most nq queries, as equal as possible (0 = off, the default)
++//   LLAMA_DSV4_ATTN_QCHUNK=nq          chunks of at most nq queries, as equal as possible (0 = off; unset - 1536 while
++//                                      D10 below is on, its default since 21.10, else off)
+ //   LLAMA_DSV4_ATTN_QCHUNK_MIN=m       only ubatches of at least m tokens (default 2*nq)
+ //   LLAMA_DSV4_ATTN_QCHUNK_IDENTITY=1  the check of the gather and the masks: every ubatch of at least _MIN tokens
+ //                                      (default 2) takes one chunk with all n_kv ring rows in ring order and the full
+@@ -1343,7 +1344,7 @@ static void dsv4_build_comp_inputs(
+ // SiegeLadder D10 step 1 (docs/v41/d10-design.md; models/deepseek4.cpp, build_attention_impl): D11's sparse attention in
+ // prefill, on the chunks above. Every query of a compressed layer attends only over the indexer's picks and its window,
+ // gathered per query, instead of over the window ring and every compressed position with a top-k mask.
+-//   LLAMA_DSV4_SPARSE_PREFILL=1  on (0 = off, the default)
++//   LLAMA_DSV4_SPARSE_PREFILL    on by default since 21.10 (router-112 within error, 4.120); 0 = off
+ //   LLAMA_DSV4_SPARSE_QC=n       queries per chunk (default 512): the gathered K is 768 KiB per query, 384 MiB per chunk
+ //   LLAMA_DSV4_SPARSE_MIN=m      only ubatches of at least m tokens (default 64): decode, MTP and short calls as before
+ // A ubatch attends sparsely when P13's conditions hold, its positions are consecutive, every query sees at least top-k
+@@ -1364,8 +1365,14 @@ static const dsv4_p13_env & dsv4_p13_get_env() {
+     static const dsv4_p13_env env = [] {
+         dsv4_p13_env e;
+ 
++        // SiegeLadder D10 is on by default since 21.10 (router-112 within error, 4.120); its ubatches that cannot go
++        // sparse - the first ~1024 positions of a sequence - take P13's chunks of 1536 unless LLAMA_DSV4_ATTN_QCHUNK says
++        // otherwise (the measured configuration, 4.120-4.129)
++        const char * s_sp = getenv("LLAMA_DSV4_SPARSE_PREFILL");
++        const bool   sp_default_on = s_sp == nullptr || atoi(s_sp) != 0;
++
+         const char * s = getenv("LLAMA_DSV4_ATTN_QCHUNK");
+-        e.nq = s != nullptr ? std::max<int64_t>(0, (int64_t) atoll(s)) : 0;
++        e.nq = s != nullptr ? std::max<int64_t>(0, (int64_t) atoll(s)) : (sp_default_on ? 1536 : 0);
+         if (e.nq > 0 && e.nq < 256) {
+             // every chunk adds ~25 nodes per layer and a FlashAttention call; below 256 queries it only costs
+             LLAMA_LOG_WARN("%s: SiegeLadder P13: LLAMA_DSV4_ATTN_QCHUNK=%lld raised to 256\n", __func__, (long long) e.nq);
+@@ -1393,8 +1400,7 @@ static const dsv4_p13_env & dsv4_p13_get_env() {
+         }
+ 
+         // SiegeLadder D10
+-        s = getenv("LLAMA_DSV4_SPARSE_PREFILL");
+-        e.sparse = s != nullptr && atoi(s) != 0;
++        e.sparse = sp_default_on;
+         if (e.sparse && e.identity) {
+             LLAMA_LOG_WARN("%s: SiegeLadder D10: LLAMA_DSV4_SPARSE_PREFILL is off in P13's identity mode\n", __func__);
+             e.sparse = false;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3caa9f0..6f62d6d 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -697,8 +697,9 @@ public:
+     const llama_kv_cache_dsv4_context * mctx;
+ };
+ 
+-// SiegeLadder D10: LLAMA_DSV4_SPARSE_PREFILL is on. A DSV4 context then reserves its prompt graph twice - with the sparse
+-// plan and with the plan of a ubatch that cannot attend sparsely (llama_context::sched_reserve, cparams.dsv4_reserve_dense)
++// SiegeLadder D10: LLAMA_DSV4_SPARSE_PREFILL is on (the default since 21.10; =0 - off). A DSV4 context then reserves its
++// prompt graph twice - with the sparse plan and with the plan of a ubatch that cannot attend sparsely
++// (llama_context::sched_reserve, cparams.dsv4_reserve_dense)
+ bool llm_graph_dsv4_sparse_prefill();
+ 
+ // DeepSeek-V4.1 conditional memory. The table is ~91 GiB per layer and only n_hash_cols rows

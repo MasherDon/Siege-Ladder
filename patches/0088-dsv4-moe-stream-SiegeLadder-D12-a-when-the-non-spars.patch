@@ -1,0 +1,230 @@
+From 06bbdfed97c4b6657b052c446917a3cba66f1169 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 09:28:46 +0000
+Subject: [PATCH 88/91] dsv4 + moe-stream : SiegeLadder D12 (a) - when the
+ non-sparse prefill plan does not fit at the full compressed widths (512K+),
+ sched_reserve reserves it for the positions where one sequence ever takes it:
+ below indexer_top_k * max(ratio) + -ub (3 072 at -ub 2048 on V4.1), the
+ reserve plans' widths capped by
+ llama_kv_cache_dsv4_context::set_reserve_pos_cap; cparams.dsv4_dense_cap
+ keeps the cap, and a non-sparse ubatch of 64+ tokens past it is reported once
+ at its build. When the full widths fit (256K and below) nothing changes. 512K
+ now loads and runs (SiegeLadder runs.md 4.222: a 451K-token document at 481.9
+ tok/s, answers 16.4-17.9 tok/s at 16 slots); 1M still does not - the sparse
+ plan itself asks 15.2 GiB at -ub 2048. Also the E: copy's threshold
+ LLAMA_MOE_STREAM_MIRROR_AT 8 -> 4 by default (cold prefill +1.1...+3.8%,
+ decode the same - runs.md 4.217, 4.140)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp       | 18 ++++++++++++++++++
+ src/llama-cparams.h         |  2 ++
+ src/llama-graph.cpp         | 33 +++++++++++++++++++++++++++++++++
+ src/llama-graph.h           |  9 +++++++++
+ src/llama-kv-cache-dsv4.cpp | 19 ++++++++++++++++---
+ src/llama-kv-cache-dsv4.h   |  5 +++++
+ src/llama-moe-stream.h      |  2 +-
+ 7 files changed, 84 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 12944b4..98106bf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -988,8 +988,26 @@ void llama_context::sched_reserve() {
+         std::vector<size_t> sizes_dense(backend_ptrs.size(), 0);
+ 
+         cparams.dsv4_reserve_dense = true;
++        cparams.dsv4_dense_cap     = 0;
+         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                 model.hparams.no_alloc, model.hparams.no_alloc ? sizes_dense.data() : nullptr);
++
++        // SiegeLadder D12: at 512K+ that graph at the full compressed widths asks 8-10 GiB (runs.md 4.216), but on one
++        // sequence only its first ubatches - below ~1024 + -ub positions - ever take it: reserve it for them
++        if (!gf && !model.hparams.no_alloc && n_seqs == 1) {
++            const uint32_t n_pos = llm_graph_dsv4_dense_bound(model.hparams, mctx.get(), n_tokens);
++            if (n_pos > 0 && n_pos < cparams.n_ctx) {
++                llm_graph_dsv4_set_dense_cap(mctx.get(), n_pos);
++                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
++                llm_graph_dsv4_set_dense_cap(mctx.get(), 0);
++                if (gf) {
++                    cparams.dsv4_dense_cap = n_pos;
++                    LLAMA_LOG_WARN("%s: SiegeLadder D12: the non-sparse pp graph does not fit at the full compressed "
++                            "widths - reserved for positions below %u, where a sequence's first ubatches take it; a "
++                            "non-sparse ubatch past them would need more\n", __func__, n_pos);
++                }
++            }
++        }
+         cparams.dsv4_reserve_dense = false;
+         if (!gf) {
+             throw std::runtime_error("failed to allocate compute pp buffers (SiegeLadder D10: the non-sparse pp graph)");
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 8959369..6d5770a 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -58,6 +58,8 @@ struct llama_cparams {
+     // SiegeLadder C7 (LLAMA_DSV4_YOCO=K): this ubatch's decoder bound - its rows at or past it see the raw window of
+     // layers 20-39 only from it on (llama_context::yoco_lo); -1 - no bound in this ubatch's graph
+     int32_t dsv4_yoco_lo    = -1;
++    // SiegeLadder D12: the compute buffers hold the non-sparse plan only for positions below this (0 - for all)
++    uint32_t dsv4_dense_cap = 0;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1da3e2a..a743f8b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1434,6 +1434,26 @@ bool llm_graph_dsv4_sparse_prefill() {
+     return dsv4_p13_get_env().sparse;
+ }
+ 
++// SiegeLadder D12 (llama-graph.h): every query of a ubatch from position top_k*ratio - 1 on sees top-k compressed
++// positions in both groups (n_visible = (pos + 1)/ratio, the larger ratio bounds both); a ubatch that starts below it
++// ends before it + n_tokens. mctx must be a DSV4 context (the caller checks the arch)
++uint32_t llm_graph_dsv4_dense_bound(const llama_hparams & hparams, const llama_memory_context_i * mctx, uint32_t n_tokens) {
++    if (mctx == nullptr || hparams.indexer_top_k == 0) {
++        return 0;
++    }
++
++    const auto *   dctx  = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
++    const uint32_t ratio = std::max(dctx->get_csa_ratio(), dctx->get_hca_ratio());
++
++    return ratio > 0 ? hparams.indexer_top_k*ratio + n_tokens : 0;
++}
++
++void llm_graph_dsv4_set_dense_cap(const llama_memory_context_i * mctx, uint32_t n_pos) {
++    if (mctx != nullptr) {
++        static_cast<const llama_kv_cache_dsv4_context *>(mctx)->set_reserve_pos_cap(n_pos);
++    }
++}
++
+ // SiegeLadder D10: the cell of every position p_lo .. p_hi of the sequence in the window ring (cell_of[p - p_lo]); false
+ // when one is missing or held twice - then some query's window would need a mask, and the ubatch does not go sparse
+ static bool dsv4_sparse_window_cells(
+@@ -4974,6 +4994,19 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+     // SiegeLadder P13: the chunk plan of this ubatch and its two inputs (off by default: no tensors, the graph of before)
+     inp->p13       = dsv4_p13_build_plan(cparams, hparams, mctx_cur, ubatch);
+     inp->p13_n_swa = hparams.n_swa;
++
++    // SiegeLadder D12: the buffers hold the non-sparse plan only below cparams.dsv4_dense_cap (sched_reserve); a ubatch
++    // past it that does not attend sparsely (gaps, a window not in the ring, several sequences) needs more of them
++    if (cparams.dsv4_dense_cap > 0 && !mctx_cur->is_reserve() && !inp->p13.sparse && ubatch.n_tokens >= 64 &&
++            ubatch.pos != nullptr && ubatch.pos[ubatch.n_tokens - 1] >= (llama_pos) cparams.dsv4_dense_cap) {
++        static bool warned = false;
++        if (!warned) {
++            warned = true;
++            LLAMA_LOG_WARN("%s: SiegeLadder D12: a %u-token ubatch at positions up to %d does not attend sparsely - the "
++                    "compute buffers hold such a plan only below position %u; growing them may fail\n", __func__,
++                    ubatch.n_tokens, ubatch.pos[ubatch.n_tokens - 1], cparams.dsv4_dense_cap);
++        }
++    }
+     if (inp->p13.n_chunk > 0) {
+         inp->p13_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->p13.raw_len*inp->p13.n_chunk);
+         ggml_set_input(inp->p13_rows);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3ccfb40..13ad615 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -714,6 +714,15 @@ public:
+ // (llama_context::sched_reserve, cparams.dsv4_reserve_dense)
+ bool llm_graph_dsv4_sparse_prefill();
+ 
++// SiegeLadder D12: when the non-sparse plan does not fit at the full compressed widths (512K+ contexts), sched_reserve
++// reserves it for the ubatches that need it on one sequence - those with a position below the first one from which every
++// query sees top-k compressed positions in both groups, so all their positions are below that + -ub. The first returns
++// that bound for n_tokens (0 when mctx is no DSV4 context); the second sets it as the cap of mctx's reserve plans (0 -
++// the full widths, as before). The cap the buffers got stays in cparams.dsv4_dense_cap: a non-sparse ubatch past it,
++// which they do not cover, is reported once at its build
++uint32_t llm_graph_dsv4_dense_bound(const llama_hparams & hparams, const llama_memory_context_i * mctx, uint32_t n_tokens);
++void     llm_graph_dsv4_set_dense_cap(const llama_memory_context_i * mctx, uint32_t n_pos);
++
+ // DeepSeek-V4.1 conditional memory. The table is ~91 GiB per layer and only n_hash_cols rows
+ // are read per token, so the gather and the FP8 dequantization run on the host and the graph
+ // gets one plain F32 tensor per engram layer.
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index b2cb549..c604d2b 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -2336,6 +2336,16 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+     return plans_lid[i_next];
+ }
+ 
++// SiegeLadder D12: a reserve plan's compressed width under the cap (set_reserve_pos_cap) - what a plan of positions
++// below n_pos gets, (pos + 1)/ratio padded to 256 as dsv4_build_comp_plan pads it - and never more than the cache
++static uint32_t dsv4_reserve_width(uint32_t kv_size, uint32_t ratio, uint32_t n_pos) {
++    if (n_pos == 0 || ratio == 0) {
++        return kv_size;
++    }
++
++    return std::min<uint32_t>(kv_size, GGML_PAD(std::max<uint32_t>(1, n_pos/ratio), 256u));
++}
++
+ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_csa_plan(const llama_ubatch & ubatch) const {
+     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+ 
+@@ -2345,7 +2355,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+ 
+     reserve_plan_csa = dsv4_build_reserve_comp_plan(
+             ubatch, csa_ratio, kv->get_comp_overlap(),
+-            csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(), csa_state->get_n_rs_seq());
++            csa_state->get_state_size(), dsv4_reserve_width(get_csa()->get_n_kv(), csa_ratio, reserve_pos_cap),
++            csa_state->get_n_stream(), csa_state->get_n_rs_seq());
+ 
+     return reserve_plan_csa;
+ }
+@@ -2359,7 +2370,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+ 
+     reserve_plan_hca = dsv4_build_reserve_comp_plan(
+             ubatch, hca_ratio, false,
+-            hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream(), hca_state->get_n_rs_seq());
++            hca_state->get_state_size(), dsv4_reserve_width(get_hca()->get_n_kv(), hca_ratio, reserve_pos_cap),
++            hca_state->get_n_stream(), hca_state->get_n_rs_seq());
+ 
+     return reserve_plan_hca;
+ }
+@@ -2373,7 +2385,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+ 
+     reserve_plan_lid = dsv4_build_reserve_comp_plan(
+             ubatch, csa_ratio, kv->get_comp_overlap(),
+-            lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
++            lid_state->get_state_size(), dsv4_reserve_width(get_lid()->get_n_kv(), csa_ratio, reserve_pos_cap),
++            lid_state->get_n_stream(), lid_state->get_n_rs_seq());
+ 
+     return reserve_plan_lid;
+ }
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index 2a5448c..696d5e8 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -432,6 +432,10 @@ public:
+     // the context of the graph reserve (init_full): its plans are worst-case shapes with no positions behind them
+     bool is_reserve() const { return reserve_plans; }
+ 
++    // SiegeLadder D12: the reserve plans take the compressed widths of a ubatch whose positions are all below n_pos
++    // ((pos + 1)/ratio, padded as the plans pad it) instead of the full caches; 0 - the full caches, as before
++    void set_reserve_pos_cap(uint32_t n_pos) const { reserve_pos_cap = n_pos; }
++
+ private:
+ 
+     std::vector<comp_plan> plans_csa;
+@@ -456,6 +460,7 @@ private:
+     stream_copy_info sc_info_lid;
+ 
+     bool reserve_plans = false;
++    mutable uint32_t  reserve_pos_cap = 0; // SiegeLadder D12
+     mutable comp_plan reserve_plan_csa;
+     mutable comp_plan reserve_plan_hca;
+     mutable comp_plan reserve_plan_lid;
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index b9a9ab6..91f534f 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -720,7 +720,7 @@ struct llama_moe_stream {
+     llama_files mirrors[MOE_STREAM_MIRRORS];
+     std::string mirror_dir[MOE_STREAM_MIRRORS];
+     int32_t     n_mirrors  = 0;
+-    int32_t mirror_at  = 8;  // LLAMA_MOE_STREAM_MIRROR_AT
++    int32_t mirror_at  = 4;  // LLAMA_MOE_STREAM_MIRROR_AT; 8 before 25.10 (4: cold prefill +1.1...+3.8%, decode the same - runs.md 4.217)
+     int32_t mirror_max = 4;  // LLAMA_MOE_STREAM_MIRROR_MAX, per copy
+     std::atomic<int32_t> io_inflight_pri{0};
+     std::atomic<int32_t> io_inflight_mir[MOE_STREAM_MIRRORS] = {};

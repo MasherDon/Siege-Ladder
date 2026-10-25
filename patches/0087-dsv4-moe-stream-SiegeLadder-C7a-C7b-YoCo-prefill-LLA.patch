@@ -1,0 +1,1116 @@
+From b9ffcb7a6f67f60ecefd29b289dabc46b4591030 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 06:51:21 +0000
+Subject: [PATCH 87/91] dsv4 + moe-stream : SiegeLadder C7a + C7b - YoCo
+ prefill (LLAMA_DSV4_YOCO=K, off by default): the decoder (layers 20-39) of a
+ call keeps its last K positions before the first output - a lower bound on
+ their raw windows (ring mask, P13 chunk masks, D10 per-query masks; the
+ decoder layers read their own copy), whole ubatches below it run P4's encoder
+ graph, and in a ubatch across it the rows below take SKIP_ID in the wave plan
+ (C7b: no routed experts loaded or computed). MODE=mask - the bound alone (the
+ check's reference), NOBOUND=1 - the skips alone (negative control), ROWS=0 -
+ no C7b. Bitwise at -ub 1 against the mask reference (SiegeLadder
+ bench/c7_check.py). Also: P16 takes up to three copy folders
+ (LLAMA_MOE_STREAM_MIRROR=dir;dir;dir, the overflow to the copy with the
+ fewest reads in flight); G39 draws exactly f wrong experts a call at any
+ depth; G39b (ORACLE_FALSE_LOW=1: wrong stagings on q_stage_low, served one at
+ a time only with no demand or right staging queued); G40
+ (LLAMA_MOE_STREAM_G40=k, _H, _LOW: G35's lens stages its best into VRAM;
+ measurement, off). SiegeLadder twenty-fifth session, the build of 13:5x
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    | 156 ++++++++++++++++++++++
+ src/llama-context.h      |  15 +++
+ src/llama-cparams.h      |   3 +
+ src/llama-graph.cpp      | 120 +++++++++++++++++
+ src/llama-graph.h        |  14 ++
+ src/llama-moe-stream.cpp | 274 +++++++++++++++++++++++++++++----------
+ src/llama-moe-stream.h   |  57 ++++++--
+ src/models/deepseek4.cpp |  17 ++-
+ 8 files changed, 578 insertions(+), 78 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8e95079..12944b4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -577,6 +577,42 @@ llama_context::llama_context(
+             }
+         }
+ 
++        // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, off by default; see yoco_k in the header): DeepInfer's YoCo truncation of the
++        // decoder in prefill (their README's V4.1 setting: K = 140), under P4's conditions and K at least the window
++        if (const char * y = std::getenv("LLAMA_DSV4_YOCO"); y != nullptr && atoi(y) > 0) {
++            const int32_t k     = atoi(y);
++            const int32_t first = model.hparams.dsv4_dec_first();
++            const char *  why   = nullptr;
++            if (model.arch != LLM_ARCH_DEEPSEEK41 || first < 0 || model.hparams.dsv4_dec_reach() <= 0) {
++                why = "the model is not V4.1's causal encoder-decoder";
++            } else if (cparams.embeddings || cparams.embeddings_nextn || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
++                why = "embedding and MTP contexts read the last layer's state of every position";
++            } else if (std::getenv("LLAMA_DSV41_NO_HC_THREAD") != nullptr) {
++                why = "LLAMA_DSV41_NO_HC_THREAD (a measurement) collapses each sublayer with its own mix";
++            } else if ((uint32_t) k < model.hparams.n_swa) {
++                why = "K must be at least the decoder's window (n_swa): the state a call leaves is its last n_swa - 1 rows";
++            }
++            if (why != nullptr) {
++                LLAMA_LOG_WARN("%s: SiegeLadder C7 (LLAMA_DSV4_YOCO=%d) is off: %s\n", __func__, k, why);
++            } else {
++                yoco_k = k;
++                const char * m  = std::getenv("LLAMA_DSV4_YOCO_MODE");
++                const char * nb = std::getenv("LLAMA_DSV4_YOCO_NOBOUND");
++                const char * r  = std::getenv("LLAMA_DSV4_YOCO_ROWS");
++                yoco_mask    = m != nullptr && std::strcmp(m, "mask") == 0;
++                yoco_nobound = !yoco_mask && nb != nullptr && atoi(nb) != 0;
++                yoco_rows    = !yoco_mask && (r == nullptr || atoi(r) != 0);
++                yoco_lo.assign(LLAMA_MAX_SEQ, -1);
++                LLAMA_LOG_WARN("%s: SiegeLadder C7 (lossy): the decoder (layers %d-%u) of a call keeps its last %d positions - "
++                        "%s%s%s\n", __func__, first, model.hparams.n_layer() - 1, k,
++                        yoco_mask ? "the bound on their raw windows alone (MODE=mask: no skips, the check's reference)" :
++                        yoco_nobound ? "the skips WITHOUT the bound (NOBOUND: a negative control, not C7)" :
++                        "a lower bound on their raw windows, whole ubatches below it run the encoder only",
++                        yoco_rows ? "; the decoder rows below it load and compute no routed experts (C7b)" : "",
++                        !yoco_mask && p4_reach <= 0 ? " (P4 is off: no ubatch skips the decoder)" : "");
++            }
++        }
++
+         sched_reserve();
+ 
+         // P1: the -ub buffers are reserved only when the first long prompt comes. Probe them now, with the head
+@@ -1049,6 +1085,42 @@ bool llama_context::p4_enc_only(const llama_ubatch & ubatch) const {
+     return true;
+ }
+ 
++// SiegeLadder C7: the bound of this ubatch's graph - its sequence's yoco_lo when some row at or past it lies inside its
++// first window (the only rows the bound changes), else -1 - and row0, C7b's first row at or past the bound when the
++// positions rise (the decoder rows before it are without consequence: no output, and the rows past the bound do not see
++// them). One sequence only: the masks are those of one stream, C7b's wave plan is the ubatch's
++int32_t llama_context::yoco_ubatch_lo(const llama_ubatch & ubatch, int64_t & row0) const {
++    row0 = 0;
++    if (yoco_k <= 0 || ubatch.n_tokens == 0 || ubatch.n_seqs_unq != 1 || ubatch.n_seq_id[0] != 1) {
++        return -1;
++    }
++    const llama_seq_id seq = ubatch.seq_id[0][0];
++    if (seq < 0 || seq >= (llama_seq_id) yoco_lo.size() || yoco_lo[seq] < 0) {
++        return -1;
++    }
++    const llama_pos lo     = yoco_lo[seq];
++    const llama_pos n_swa  = (llama_pos) model.hparams.n_swa;
++    bool            bound  = false;
++    bool            rising = true;
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq) {
++            return -1;
++        }
++        const llama_pos p = ubatch.pos[i];
++        bound  = bound || (p >= lo && p < lo + n_swa - 1);
++        rising = rising && (i == 0 || p > ubatch.pos[i - 1]);
++    }
++    if (rising) {
++        while (row0 < (int64_t) ubatch.n_tokens && ubatch.pos[row0] < lo) {
++            row0++;
++        }
++        if (row0 == (int64_t) ubatch.n_tokens) {
++            row0 = 0; // every row below the bound: a ubatch P4 did not take (P4 off) - C7b leaves it alone
++        }
++    }
++    return bound ? lo : -1;
++}
++
+ void llama_context::p1_enter() {
+     if (sched) {
+         ggml_backend_sched_synchronize(sched.get());
+@@ -2296,6 +2368,50 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         }
+     }
+ 
++    // SiegeLadder C7: per sequence the decoder bound of this call (see yoco_k in the header) - the last K positions up to
++    // and with its first output, or its last K positions when it has none (the state it leaves). Active only past the
++    // sequence's first position in the call: shorter calls, decode and the question after a document run as P4 decides
++    if (yoco_k > 0) {
++        std::fill(yoco_lo.begin(), yoco_lo.end(), -1);
++        bool yoco_call = !output_all && !cparams.embeddings_nextn;
++        for (size_t il = (size_t) model.hparams.dsv4_dec_first() + 1; yoco_call && il < cparams.embeddings_layer_inp.size(); ++il) {
++            yoco_call = !cparams.embeddings_layer_inp[il];
++        }
++        if (yoco_call) {
++            const llama_batch & b = balloc->get_batch();
++            std::vector<llama_pos> first_out(LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
++            std::vector<llama_pos> start    (LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
++            std::vector<llama_pos> end      (LLAMA_MAX_SEQ, -1);
++            for (int32_t i = 0; i < b.n_tokens; ++i) {
++                for (int32_t s = 0; s < b.n_seq_id[i]; ++s) {
++                    const llama_seq_id seq = b.seq_id[i][s];
++                    if (b.logits[i]) {
++                        first_out[seq] = std::min(first_out[seq], b.pos[i]);
++                    }
++                    start[seq] = std::min(start[seq], b.pos[i]);
++                    end[seq]   = std::max(end[seq], b.pos[i] + 1);
++                }
++            }
++            bool any = false;
++            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
++                if (end[s] < 0) {
++                    continue;
++                }
++                const llama_pos lo = (first_out[s] < end[s] ? first_out[s] + 1 : end[s]) - yoco_k;
++                if (lo <= start[s]) {
++                    continue;
++                }
++                yoco_lo[s] = lo;
++                any = true;
++                if (p4_reach > 0) {
++                    // MODE=mask: no ubatch skips the decoder in this sequence; else the whole ubatches below the bound do
++                    p4_dec_start[s] = yoco_mask ? -1 : std::max(p4_dec_start[s], lo);
++                }
++            }
++            yoco_n_calls += any ? 1 : 0;
++        }
++    }
++
+     // SiegeLadder P9: the expert stream's host tier holds what a prompt touches while it runs; a long call begins the
+     // holding (anew from position 0), a few short calls in a row end it - llama_moe_stream::batch_begin
+     if (auto * ms = model.moe_stream()) {
+@@ -2448,6 +2564,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     int64_t p4_ub_call  = 0;
+     int64_t p4_tok_call = 0;
+     int64_t n_ub_call   = 0;
++    // SiegeLadder C7: this call's ubatches with the bound in their graph, and the decoder rows C7b left without experts
++    int64_t yoco_ub_call  = 0;
++    int64_t yoco_row_call = 0;
+ 
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+@@ -2477,10 +2596,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             p4_tok_call += ubatch.n_tokens;
+         }
+ 
++        // SiegeLadder C7: this ubatch's bound (its graph's masks; none with NOBOUND) and C7b's first row whose decoder
++        // experts load - set for its build and run and reset at once, like P4's flag
++        int64_t yoco_row0 = 0;
++        cparams.dsv4_yoco_lo = -1;
++        if (yoco_k > 0 && !cparams.dsv4_enc_only) {
++            const int32_t lo = yoco_ubatch_lo(ubatch, yoco_row0);
++            cparams.dsv4_yoco_lo = yoco_nobound ? -1 : lo;
++            yoco_row0 = yoco_rows ? yoco_row0 : 0;
++            yoco_ub_call  += lo >= 0 ? 1 : 0;
++            yoco_row_call += yoco_row0;
++        }
++        auto * yoco_ms = yoco_k > 0 ? model.moe_stream() : nullptr;
++        if (yoco_ms) {
++            yoco_ms->c7_row0   = yoco_row0;
++            yoco_ms->c7_layer0 = model.hparams.dsv4_dec_first();
++        }
++
+         ggml_status status;
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+         cparams.dsv4_enc_only = false;
++        cparams.dsv4_yoco_lo  = -1;
++        if (yoco_ms) {
++            yoco_ms->c7_row0 = 0;
++        }
+ 
+         if (!res) {
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+@@ -2658,6 +2798,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 "since the start)\n", __func__, (long long) p4_ub_call, (long long) n_ub_call, (long long) p4_tok_call,
+                 n_tokens_all, (long long) p4_n_ubatch, (long long) p4_n_tokens);
+     }
++    if (yoco_k > 0) {
++        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
++            if (yoco_lo[s] >= 0) {
++                LLAMA_LOG_INFO("%s: SiegeLadder C7: sequence %d - the decoder from position %d of a call ending at %u tokens; "
++                        "%lld ubatch(es) with the bound in the graph, %lld decoder rows without routed experts (C7b)\n",
++                        __func__, s, (int) yoco_lo[s], n_tokens_all, (long long) yoco_ub_call, (long long) yoco_row_call);
++            }
++        }
++    }
+ 
+     // SiegeLadder P1: this call had outputs while the head was out - it comes back and computes them now
+     if (cparams.head_out && !p1_groups.empty()) {
+@@ -3094,7 +3243,14 @@ ggml_cgraph * llama_context::graph_reserve(
+ 
+     auto * res = gf_res_reserve.get();
+ 
++    // SiegeLadder C7: a prompt ubatch may carry the decoder layers' masks with the bound - reserve with them in the graph
++    const int32_t save_yoco_lo = cparams.dsv4_yoco_lo;
++    if (yoco_k > 0 && n_tokens > 1 && !yoco_nobound) {
++        cparams.dsv4_yoco_lo = 0;
++    }
++
+     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
++    cparams.dsv4_yoco_lo = save_yoco_lo;
+ 
+     res->reset();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 710a3e7..02d1ae0 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -380,6 +380,21 @@ private:
+     int64_t  p4_n_tokens = 0;              // ... and their tokens
+     bool p4_enc_only(const llama_ubatch & ubatch) const;
+ 
++    // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, off by default; docs/v41/c7-design.md; DeepInfer's YoCo prefill truncation):
++    // per decode call and sequence, yoco_lo = min(first output + 1, the call's end) - K. When it lies past the sequence's
++    // first position in the call, the decoder (layers 20-39) keeps only the call's last K positions: rows at or past
++    // yoco_lo see the raw window of those layers only from yoco_lo on (a lower bound on their SWA masks, all three
++    // attention paths: dense, P13's chunks, D10's sparse chunks); whole ubatches below it run P4's encoder graph; and
++    // (C7b) the decoder rows below it in the ubatch holding it load and compute no routed experts. The compressed
++    // attention, layers 0-19 and layer 20's cache writes are as before. Lossy against the exact path
++    int32_t  yoco_k       = 0;             // K; 0 = off
++    bool     yoco_mask    = false;         // LLAMA_DSV4_YOCO_MODE=mask: the bound alone - no skips at all (the check's reference)
++    bool     yoco_nobound = false;         // LLAMA_DSV4_YOCO_NOBOUND=1: the skips without the bound (a negative control)
++    bool     yoco_rows    = true;          // LLAMA_DSV4_YOCO_ROWS=0: no C7b
++    std::vector<llama_pos> yoco_lo;        // [LLAMA_MAX_SEQ] for the current call, -1 = not active
++    int64_t  yoco_n_calls = 0;             // calls with the bound active so far
++    int32_t  yoco_ubatch_lo(const llama_ubatch & ubatch, int64_t & row0) const;
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index acd114d..8959369 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -55,6 +55,9 @@ struct llama_cparams {
+     bool head_out = false;   // SiegeLadder P1: the output head is released - graphs end at t_embd, no logits
+     bool dsv4_reserve_dense = false; // SiegeLadder D10: the graph being reserved takes a DSV4 ubatch's non-sparse plan
+     bool dsv4_enc_only      = false; // SiegeLadder P4: this ubatch runs V4.1's encoder only (llama_context::p4_enc_only)
++    // SiegeLadder C7 (LLAMA_DSV4_YOCO=K): this ubatch's decoder bound - its rows at or past it see the raw window of
++    // layers 20-39 only from it on (llama_context::yoco_lo); -1 - no bound in this ubatch's graph
++    int32_t dsv4_yoco_lo    = -1;
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5925dd2..1da3e2a 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1707,6 +1707,15 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+     int32_t     * rows = (int32_t     *) inp.p13_rows->data;
+     ggml_fp16_t * mask = (ggml_fp16_t *) inp.p13_mask->data;
+ 
++    // SiegeLadder C7: the decoder layers' chunk mask with the bound, filled in the same pass (see c7_lo)
++    ggml_fp16_t *   mask7 = nullptr;
++    const llama_pos lo7   = inp.c7_lo;
++    if (inp.c7_p13_mask && inp.c7_p13_mask->buffer && lo7 >= 0) {
++        GGML_ASSERT(inp.c7_p13_mask->type == GGML_TYPE_F16 && ggml_nbytes(inp.c7_p13_mask) == ggml_nbytes(inp.p13_mask));
++        GGML_ASSERT(ggml_backend_buffer_is_host(inp.c7_p13_mask->buffer));
++        mask7 = (ggml_fp16_t *) inp.c7_p13_mask->data;
++    }
++
+     const ggml_fp16_t f16_zero = llama_cast<ggml_fp16_t>(0.0f);
+     const ggml_fp16_t f16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+ 
+@@ -1771,6 +1780,13 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+                 const llama_pos p0 = cell_pos[r];
+                 m[r] = p0 >= 0 && p0 <= p1 && p1 - p0 < n_swa ? f16_zero : f16_ninf;
+             }
++            // SiegeLadder C7: the decoder layers' copy - a row at or past the bound sees no cell below it
++            if (mask7) {
++                ggml_fp16_t * m7 = mask7 + i*raw_len;
++                for (int64_t r = 0; r < raw_len; ++r) {
++                    m7[r] = p1 >= lo7 && cell_pos[r] < lo7 ? f16_ninf : m[r];
++                }
++            }
+         }
+     }
+ 
+@@ -1818,6 +1834,34 @@ static void dsv4_sparse_set_input(const llm_graph_input_dsv4 & inp, const llama_
+         }
+     }
+ 
++    // SiegeLadder C7: the decoder layers' mask, a row per query (a stream each): the same, plus -inf over the window entries
++    // below the bound for a query at or past it - entry k of query i is position pos[0] + i - (n_swa - 1) + k (the plan
++    // admits only consecutive positions)
++    if (inp.c7_sp_mask && inp.c7_sp_mask->buffer && inp.c7_lo >= 0) {
++        GGML_ASSERT(inp.c7_sp_mask->type == GGML_TYPE_F16 && inp.c7_sp_mask->ne[0] == plan.sp_kv &&
++                inp.c7_sp_mask->ne[3] == nt && ggml_backend_buffer_is_host(inp.c7_sp_mask->buffer));
++
++        const ggml_fp16_t f16_zero = llama_cast<ggml_fp16_t>(0.0f);
++        const ggml_fp16_t f16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
++        const llama_pos   lo       = inp.c7_lo;
++
++        ggml_fp16_t * m = (ggml_fp16_t *) inp.c7_sp_mask->data;
++        for (int64_t i = 0; i < nt; ++i) {
++            const llama_pos p  = ubatch.pos[0] + (llama_pos) i;
++            ggml_fp16_t *   mi = m + i*plan.sp_kv;
++            for (int64_t r = 0; r < plan.sp_kv; ++r) {
++                if (r < plan.sp_n_sel) {
++                    mi[r] = f16_zero;
++                } else if (r < plan.sp_n_sel + n_swa) {
++                    const llama_pos q = p - (n_swa - 1) + (llama_pos) (r - plan.sp_n_sel);
++                    mi[r] = p >= lo && q < lo ? f16_ninf : f16_zero;
++                } else {
++                    mi[r] = f16_ninf;
++                }
++            }
++        }
++    }
++
+     if (!(inp.sp_win[0] && inp.sp_win[0]->buffer) && !(inp.sp_win[1] && inp.sp_win[1]->buffer)) {
+         return;
+     }
+@@ -1890,6 +1934,39 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+     inp_raw->mctx = mctx->get_raw();
+     inp_raw->set_input(ubatch);
+ 
++    // SiegeLadder C7: the dense path's ring mask for the decoder layers - the plain one, then -inf over the cells below the
++    // bound for every query at or past it (one stream: the columns are the cells of the ubatch's sequence's ring)
++    if (c7_raw_mask && c7_raw_mask->buffer && c7_lo >= 0) {
++        const ggml_tensor * src = inp_raw->self_kq_mask;
++        GGML_ASSERT(src && src->buffer && src->type == c7_raw_mask->type && ggml_nbytes(src) == ggml_nbytes(c7_raw_mask));
++        GGML_ASSERT(ggml_backend_buffer_is_host(src->buffer) && ggml_backend_buffer_is_host(c7_raw_mask->buffer));
++        GGML_ASSERT(c7_raw_mask->ne[3] == 1);
++        memcpy(c7_raw_mask->data, src->data, ggml_nbytes(src));
++
++        const llama_kv_cells & cells = mctx->get_raw()->get_cells(ubatch->seq_id[0][0]);
++        const int64_t          n_kv  = c7_raw_mask->ne[0];
++        std::vector<uint8_t> below((size_t) n_kv, 0);
++        for (int64_t j = 0; j < n_kv && j < (int64_t) cells.size(); ++j) {
++            below[j] = !cells.is_empty((uint32_t) j) && cells.pos_get((uint32_t) j) < c7_lo;
++        }
++        const bool f16 = c7_raw_mask->type == GGML_TYPE_F16;
++        for (int64_t i = 0; i < (int64_t) ubatch->n_tokens && i < c7_raw_mask->ne[1]; ++i) {
++            if (ubatch->pos[i] < c7_lo) {
++                continue;
++            }
++            for (int64_t j = 0; j < n_kv; ++j) {
++                if (!below[j]) {
++                    continue;
++                }
++                if (f16) {
++                    ((ggml_fp16_t *) c7_raw_mask->data)[i*n_kv + j] = llama_cast<ggml_fp16_t>(-INFINITY);
++                } else {
++                    ((float *) c7_raw_mask->data)[i*n_kv + j] = -INFINITY;
++                }
++            }
++        }
++    }
++
+     dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
+     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
+     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+@@ -1943,6 +2020,10 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
+     // SiegeLadder P13: the chunks are graph structure (views, widths, how many FlashAttention calls)
+     res &= dsv4_p13_build_plan(params.cparams, params.hparams, mctx, params.ubatch) == p13;
+ 
++    // SiegeLadder C7: the masks are graph structure, the bound itself input - set_input fills them with the new one
++    res &= c7_built == (params.cparams.dsv4_yoco_lo >= 0 && n_stream == 1);
++    c7_lo = params.cparams.dsv4_yoco_lo;
++
+     return res;
+ }
+ 
+@@ -4946,6 +5027,45 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+         }
+     }
+ 
++    // SiegeLadder C7: the decoder layers' masks with the bound (see c7_lo) - for the path this ubatch's attention takes.
++    // One stream only (llama_context::yoco_ubatch_lo admits one sequence); unused ones are not in the graph
++    inp->c7_lo    = cparams.dsv4_yoco_lo;
++    inp->c7_built = inp->c7_lo >= 0 && n_stream == 1;
++    if (inp->c7_built) {
++        const auto & p13 = inp->p13;
++        if (p13.n_chunk == 0) {
++            const ggml_tensor * m = inp->inp_raw->self_kq_mask;
++            inp->c7_raw_mask = ggml_new_tensor_4d(ctx0, m->type, m->ne[0], m->ne[1], m->ne[2], m->ne[3]);
++            ggml_set_input(inp->c7_raw_mask);
++            ggml_set_name(inp->c7_raw_mask, "dsv4_c7_kq_mask");
++        } else {
++            inp->c7_p13_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, p13.raw_len, ubatch.n_tokens);
++            ggml_set_input(inp->c7_p13_mask);
++            ggml_set_name(inp->c7_p13_mask, "dsv4_c7_p13_kq_mask");
++            for (int64_t c = 0; c < p13.n_chunk; ++c) {
++                const int64_t i0 = p13.t0[c];
++                const int64_t n  = p13.t0[c + 1] - i0;
++                ggml_tensor * m = inp->c7_p13_mask;
++                inp->c7_p13_mask_c.push_back(p13.n_chunk == 1 ? m :
++                        ggml_view_2d(ctx0, m, p13.raw_len, n, m->nb[1], (size_t) i0*m->nb[1]));
++            }
++            if (p13.sparse) {
++                // a row per query (a stream each in the sparse chunks): on the card once per graph, as sp_win's
++                inp->c7_sp_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, p13.sp_kv, 1, 1, ubatch.n_tokens);
++                ggml_set_input(inp->c7_sp_mask);
++                ggml_set_name(inp->c7_sp_mask, "dsv4_c7_sp_kq_mask");
++                ggml_tensor * mc = p13.n_chunk == 1 ? inp->c7_sp_mask : ggml_cont(ctx0, inp->c7_sp_mask);
++                for (int64_t c = 0; c < p13.n_chunk; ++c) {
++                    const int64_t i0 = p13.t0[c];
++                    const int64_t n  = p13.t0[c + 1] - i0;
++                    inp->c7_sp_mask_c.push_back(p13.n_chunk == 1 ? mc :
++                            ggml_view_4d(ctx0, mc, p13.sp_kv, 1, 1, n, mc->nb[1], mc->nb[2], mc->nb[3],
++                                    (size_t) i0*mc->nb[3]));
++                }
++            }
++        }
++    }
++
+     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 2be72f5..3ccfb40 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -687,6 +687,18 @@ public:
+     std::vector<ggml_tensor *> sp_win_c[2];                        // [sp_kv - sp_n_sel, n_c]
+     ggml_tensor *              sp_mask     = nullptr;              // F16 [sp_kv, 1, 1, 1]
+ 
++    // SiegeLadder C7 (docs/v41/c7-design.md): the decoder bound of this graph (cparams.dsv4_yoco_lo at build, again at
++    // can_reuse; -1 - none) and the masks the decoder layers (dsv4_dec_first() on) read instead of the plain ones - each
++    // the plain mask plus -inf wherever a query at or past the bound would see a window cell below it: the dense path's
++    // ring mask (no P13 plan), P13's chunk mask, and D10's mask, per query since the bound differs between queries
++    int32_t                    c7_lo       = -1;
++    bool                       c7_built    = false;
++    ggml_tensor *              c7_raw_mask = nullptr;              // like inp_raw->self_kq_mask, one stream
++    ggml_tensor *              c7_p13_mask = nullptr;              // F16 [raw_len, n_tokens]
++    std::vector<ggml_tensor *> c7_p13_mask_c;                      // [raw_len, n_c]
++    ggml_tensor *              c7_sp_mask  = nullptr;              // F16 [sp_kv, 1, 1, n_tokens]
++    std::vector<ggml_tensor *> c7_sp_mask_c;                       // [sp_kv, 1, 1, n_c]
++
+     // SiegeLadder G29: D11's sparse decode reads the compressed mask input as a column view - one view per graph and
+     // group (0 csa, 1 hca), made by the first layer that needs it, so the scheduler copies it once per token, not once
+     // per compressed layer (a view of an input is not an input: each distinct one got its own synchronous copy)
+@@ -1007,6 +1019,8 @@ struct llm_graph_params {
+             cparams.head_out                == other.cparams.head_out                &&
+             // SiegeLadder P4: an encoder-only graph ends at the first decoder layer's cache writes
+             cparams.dsv4_enc_only           == other.cparams.dsv4_enc_only           &&
++            // SiegeLadder C7: a graph with the bound reads its own masks in the decoder layers (the bound itself is input)
++            (cparams.dsv4_yoco_lo >= 0)     == (other.cparams.dsv4_yoco_lo >= 0)     &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 6597d3f..b011418 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -873,6 +873,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+             oracle_false = 0.0f;
+         }
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE_FALSE_LOW")) {
++        oracle_false_low = atoi(p) != 0; // SiegeLadder G39b; see oracle_false_low in the header
++    }
+     // drop rule; see drop_w in the header. Lossy: it changes the output whenever it fires. On by default (0.14 with
+     // DROP_ALL) since SiegeLadder 18.10; LLAMA_MOE_STREAM_DROP_W=0 is the exact path
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_W")) {
+@@ -1057,6 +1060,25 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
+         g35_lazy = std::max(0, std::min(2, atoi(p)));
+     }
++    // SiegeLadder G40; see g40_k in the header (off by default, a measurement)
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40")) {
++        g40_k = std::max(0, std::min(64, atoi(p)));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_H")) {
++        g40_h = (float) std::strtod(p, nullptr);
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_LOW")) {
++        g40_low = atoi(p) != 0;
++    }
++    if (g40_k > 0 && g35_depth <= 0) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G40 needs G35's lens (LLAMA_MOE_STREAM_G35 > 0); ignored\n", __func__);
++        g40_k = 0;
++    }
++    if (g40_k > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: G40 (measurement): up to %d of the lens's best with a share of %.3f or more staged "
++                "into VRAM %d calls ahead%s\n", __func__, g40_k, g40_h >= 0.0f ? g40_h : g35_h, g35_depth,
++                g40_low ? ", onto q_stage_low (the bus's windows)" : "");
++    }
+     if (g35_depth > 0 && runahead_k > 0) {
+         LLAMA_LOG_INFO("%s: moe stream: G35 gives way to runahead (the graph builds no lens next to it)\n", __func__);
+     } else if (g35_depth > 0) {
+@@ -1929,9 +1951,11 @@ static std::atomic<bool>    d14_on{false};
+ static std::atomic<int64_t> d14_episodes{0};
+ static std::atomic<int64_t> d14_total_us{0};
+ 
+-void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, const char * dir) {
+-    mirrors.clear();
+-    mirrors.resize(files.size());
++void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, const char * dirs) {
++    for (auto & m : mirrors) {
++        m.clear();
++    }
++    n_mirrors = 0;
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_MIRROR_AT")) {
+         mirror_at = std::max(0, atoi(p));
+     }
+@@ -1953,56 +1977,92 @@ void llama_moe_stream::open_mirrors(const std::vector<std::string> & paths, cons
+     uint8_t * buf_a = (uint8_t *) moe_aligned_alloc(blk + 2*MOE_STREAM_DIRECT_ALIGN);
+     uint8_t * buf_b = (uint8_t *) moe_aligned_alloc(blk + 2*MOE_STREAM_DIRECT_ALIGN);
+     GGML_ASSERT(buf_a != nullptr && buf_b != nullptr);
+-    std::string base = dir;
+-    if (!base.empty() && base.back() != '/' && base.back() != '\\') {
+-        base += '/';
+-    }
+-    int    n_open = 0;
+-    double gb     = 0.0;
+-    for (size_t i = 0; i < paths.size() && i < files.size(); i++) {
+-        const size_t      cut   = paths[i].find_last_of("/\\");
+-        const std::string mpath = base + (cut == std::string::npos ? paths[i] : paths[i].substr(cut + 1));
+-        FILE * probe = ggml_fopen(mpath.c_str(), "rb");
+-        if (probe == nullptr) {
+-            continue; // no copy of this part
+-        }
+-        fclose(probe);
+-        std::unique_ptr<llama_file> m;
+-        try {
+-            m.reset(new llama_file(mpath.c_str(), "rb", use_direct_io));
+-        } catch (const std::exception & e) {
+-            LLAMA_LOG_WARN("%s: P16: cannot open the copy '%s': %s\n", __func__, mpath.c_str(), e.what());
+-            continue;
++    // one folder's copies into set; returns how many parts it holds (the log lines keep this function's name)
++    const char * fn = __func__;
++    auto open_set = [&](const std::string & dir, llama_files & set, double & gb) {
++        set.clear();
++        set.resize(files.size());
++        std::string base = dir;
++        if (!base.empty() && base.back() != '/' && base.back() != '\\') {
++            base += '/';
++        }
++        int n_open = 0;
++        gb = 0.0;
++        for (size_t i = 0; i < paths.size() && i < files.size(); i++) {
++            const size_t      cut   = paths[i].find_last_of("/\\");
++            const std::string mpath = base + (cut == std::string::npos ? paths[i] : paths[i].substr(cut + 1));
++            FILE * probe = ggml_fopen(mpath.c_str(), "rb");
++            if (probe == nullptr) {
++                continue; // no copy of this part
++            }
++            fclose(probe);
++            std::unique_ptr<llama_file> m;
++            try {
++                m.reset(new llama_file(mpath.c_str(), "rb", use_direct_io));
++            } catch (const std::exception & e) {
++                LLAMA_LOG_WARN("%s: P16: cannot open the copy '%s': %s\n", fn, mpath.c_str(), e.what());
++                continue;
++            }
++            const size_t sz = files[i]->size();
++            if (m->size() != sz || m->has_direct_io() != files[i]->has_direct_io()) {
++                LLAMA_LOG_WARN("%s: P16: the copy '%s' is not the part (size %zu vs %zu, direct %d vs %d) - not used\n",
++                        fn, mpath.c_str(), m->size(), sz, (int) m->has_direct_io(), (int) files[i]->has_direct_io());
++                continue;
++            }
++            const size_t n = std::min(blk, sz);
++            bool same = true;
++            for (int k = 0; k <= 16 && same; k++) {
++                size_t off = k == 16 ? sz - n : (sz - n) / 16 * k;
++                off &= ~(size_t) (MOE_STREAM_DIRECT_ALIGN - 1);
++                const size_t    len = std::min(n, sz - off);
++                const uint8_t * a   = llama_moe_stream_pread(*files[i], buf_a, len, off, use_direct_io, /*worker_id =*/ -1);
++                const uint8_t * b   = llama_moe_stream_pread(*m,        buf_b, len, off, use_direct_io, /*worker_id =*/ -1);
++                same = a != nullptr && b != nullptr && memcmp(a, b, len) == 0;
++            }
++            if (!same) {
++                LLAMA_LOG_WARN("%s: P16: the copy '%s' has other bytes than the part - not used\n", fn, mpath.c_str());
++                continue;
++            }
++            gb += sz / 1e9;
++            n_open++;
++            set[i] = std::move(m);
+         }
+-        const size_t sz = files[i]->size();
+-        if (m->size() != sz || m->has_direct_io() != files[i]->has_direct_io()) {
+-            LLAMA_LOG_WARN("%s: P16: the copy '%s' is not the part (size %zu vs %zu, direct %d vs %d) - not used\n",
+-                    __func__, mpath.c_str(), m->size(), sz, (int) m->has_direct_io(), (int) files[i]->has_direct_io());
++        return n_open;
++    };
++    // the folders, ';'-separated (a drive letter's ':' stays inside a path)
++    const std::string list = dirs;
++    int n_open_all = 0;
++    for (size_t pos = 0; pos <= list.size();) {
++        const size_t      semi = list.find(';', pos);
++        const std::string dir  = list.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
++        pos = semi == std::string::npos ? list.size() + 1 : semi + 1;
++        if (dir.empty()) {
+             continue;
+         }
+-        const size_t n = std::min(blk, sz);
+-        bool same = true;
+-        for (int k = 0; k <= 16 && same; k++) {
+-            size_t off = k == 16 ? sz - n : (sz - n) / 16 * k;
+-            off &= ~(size_t) (MOE_STREAM_DIRECT_ALIGN - 1);
+-            const size_t    len = std::min(n, sz - off);
+-            const uint8_t * a   = llama_moe_stream_pread(*files[i], buf_a, len, off, use_direct_io, /*worker_id =*/ -1);
+-            const uint8_t * b   = llama_moe_stream_pread(*m,        buf_b, len, off, use_direct_io, /*worker_id =*/ -1);
+-            same = a != nullptr && b != nullptr && memcmp(a, b, len) == 0;
+-        }
+-        if (!same) {
+-            LLAMA_LOG_WARN("%s: P16: the copy '%s' has other bytes than the part - not used\n", __func__, mpath.c_str());
+-            continue;
++        if (n_mirrors >= MOE_STREAM_MIRRORS) {
++            LLAMA_LOG_WARN("%s: P16: more than %d copy folders - '%s' and the rest not used\n", __func__,
++                    MOE_STREAM_MIRRORS, dir.c_str());
++            break;
++        }
++        double    gb     = 0.0;
++        const int n_open = open_set(dir, mirrors[n_mirrors], gb);
++        LLAMA_LOG_INFO("%s: P16: copies of %d of %zu parts in %s (%.1f GB); a slab goes to a copy while the primary has "
++                ">= %d reads in flight and that copy < %d\n", __func__, n_open, files.size(), dir.c_str(), gb, mirror_at,
++                mirror_max);
++        if (n_open > 0) {
++            mirror_dir[n_mirrors++] = dir;
++            n_open_all += n_open;
++        } else {
++            mirrors[n_mirrors].clear();
+         }
+-        gb += sz / 1e9;
+-        n_open++;
+-        mirrors[i] = std::move(m);
+     }
+     moe_aligned_free(buf_a);
+     moe_aligned_free(buf_b);
+-    LLAMA_LOG_INFO("%s: P16: copies of %d of %zu parts in %s (%.1f GB); a slab goes to a copy while the primary has >= %d "
+-            "reads in flight and the copies < %d\n", __func__, n_open, files.size(), dir, gb, mirror_at, mirror_max);
+-    if (d14_adapt_s > 0 && n_open > 0) {
++    if (n_mirrors > 1) {
++        LLAMA_LOG_INFO("%s: P16: %d copy folders - the overflow goes to the copy of the part with the fewest reads in "
++                "flight\n", __func__, n_mirrors);
++    }
++    if (d14_adapt_s > 0 && n_open_all > 0) {
+         LLAMA_LOG_WARN("%s: moe stream: D14 switch on standby - a primary read of %.0f ms or more sends reads to the copies "
+                 "from %d in flight for %d s after it (LLAMA_MOE_STREAM_MIRROR_ADAPT)\n", __func__, d14_adapt_thr/1000.0,
+                 d14_adapt_at, d14_adapt_s);
+@@ -2013,7 +2073,12 @@ const uint8_t * llama_moe_stream::pread_slab(uint32_t file_idx, uint8_t * stagin
+     llama_file * f     = files[file_idx].get();
+     bool         mir   = false;
+     int32_t      at    = mirror_at;
+-    const bool   adapt = d14_adapt_s > 0 && file_idx < mirrors.size() && mirrors[file_idx] != nullptr;
++    // the part's copies (P16, up to MOE_STREAM_MIRRORS folders)
++    bool has_copy = false;
++    for (int32_t k = 0; k < n_mirrors && !has_copy; k++) {
++        has_copy = file_idx < mirrors[k].size() && mirrors[k][file_idx] != nullptr;
++    }
++    const bool   adapt = d14_adapt_s > 0 && has_copy;
+     if (adapt) {
+         // SiegeLadder D14, adaptive: inside an episode the copies take reads earlier; the first read after it closes it
+         if (ggml_time_us() < d14_until_us.load(std::memory_order_relaxed)) {
+@@ -2025,13 +2090,25 @@ const uint8_t * llama_moe_stream::pread_slab(uint32_t file_idx, uint8_t * stagin
+                     __func__, span/1e6, mirror_at);
+         }
+     }
+-    if (file_idx < mirrors.size() && mirrors[file_idx] != nullptr &&
+-            io_inflight_pri.load(std::memory_order_relaxed) >= at &&
+-            io_inflight_mir.load(std::memory_order_relaxed) < mirror_max) {
+-        f   = mirrors[file_idx].get();
++    // the overflow goes to the copy of the part with the fewest reads in flight, if it has fewer than mirror_max
++    int32_t k_mir = -1;
++    if (has_copy && io_inflight_pri.load(std::memory_order_relaxed) >= at) {
++        int32_t best = mirror_max;
++        for (int32_t k = 0; k < n_mirrors; k++) {
++            if (file_idx < mirrors[k].size() && mirrors[k][file_idx] != nullptr) {
++                const int32_t v = io_inflight_mir[k].load(std::memory_order_relaxed);
++                if (v < best) {
++                    best  = v;
++                    k_mir = k;
++                }
++            }
++        }
++    }
++    if (k_mir >= 0) {
++        f   = mirrors[k_mir][file_idx].get();
+         mir = true;
+     }
+-    std::atomic<int32_t> & n = mir ? io_inflight_mir : io_inflight_pri;
++    std::atomic<int32_t> & n = mir ? io_inflight_mir[k_mir] : io_inflight_pri;
+     const int32_t in_flight = n.fetch_add(1, std::memory_order_relaxed) + 1;
+     const bool    timed     = mir || slow_read_us > 0 || adapt;
+     const int64_t t0 = timed ? ggml_time_us() : 0;
+@@ -2053,6 +2130,7 @@ const uint8_t * llama_moe_stream::pread_slab(uint32_t file_idx, uint8_t * stagin
+     if (mir) {
+         io_mirror_n.fetch_add(1, std::memory_order_relaxed);
+         io_mirror_bytes.fetch_add((int64_t) len, std::memory_order_relaxed);
++        io_mirror_bytes_k[k_mir].fetch_add((int64_t) len, std::memory_order_relaxed);
+         // SiegeLadder D14: the copy's own latency, apart from the primary drive's (io_record counts both together)
+         io_mir_lat.n  += 1;
+         io_mir_lat.us += d;
+@@ -2142,7 +2220,7 @@ static void moe_p11_quiesce_locked(llama_moe_stream & m, std::unique_lock<std::m
+             std::lock_guard<std::mutex> up(m.upload_mtx);
+             m.flush_stage_copies_sync_locked();
+         }
+-        bool idle = m.q_demand.empty() && m.q_stage.empty();
++        bool idle = m.q_demand.empty() && m.q_stage.empty() && m.q_stage_low.empty();
+         for (const auto & sl : m.layers) {
+             if (!idle) {
+                 break;
+@@ -2461,9 +2539,23 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 (!spec_idle || (n_io_busy == 0 && q_demand.empty() && q_stage.empty()));
+     };
+ 
++    // SiegeLadder G39b / G40: a staged guess that may well be wrong - only while no demand or other staged load is queued
++    // and no other low one is in flight (the bus's windows; an upload cannot be preempted)
++    bool had_low = false;
++    auto low_open = [&]{
++        return !q_stage_low.empty() && n_low_inflight == 0 && q_demand.empty() && q_stage.empty();
++    };
++
+     std::unique_lock<std::mutex> lk(mtx);
+     while (true) {
+-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_stage.empty() || spec_open(); });
++        if (had_low) {
++            had_low = false;
++            n_low_inflight--;
++            if (!q_stage_low.empty()) {
++                cv_work.notify_all(); // the next low one may go now
++            }
++        }
++        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_stage.empty() || spec_open() || low_open(); });
+         if (shutting_down) {
+             break;
+         }
+@@ -2488,8 +2580,14 @@ void llama_moe_stream::worker_loop(int worker_id) {
+             // the wait predicate admits an empty q_demand here only with q_spec open to this worker
+             w = q_spec.front();
+             q_spec.pop_front();
++        } else if (low_open()) {
++            w = q_stage_low.front();
++            q_stage_low.pop_front();
++            n_low_inflight++;
++            had_low = true;
++            stats.n_low_served++;
+         } else {
+-            continue; // not reached: the wait predicate admitted this worker for one of the three
++            continue; // not reached: the wait predicate admitted this worker for one of the four
+         }
+ 
+         auto & sl = *w.sl;
+@@ -2855,12 +2953,14 @@ bool llama_moe_stream::on_drive_locked(const llama_moe_stream_layer & sl, int32_
+ // item per expert meant one worker read 2-3 tensors in a for loop, strictly one at
+ // a time, which is the whole reason the drive saw a queue depth of 1.6. One item
+ // per tensor lets that many workers pull in parallel out of the same pool.
+-void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage, bool notify) {
++void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage, bool notify,
++        bool low) {
+     const int32_t n = (int32_t) sl.weights.size();
+-    auto & q = stage ? q_stage : q_demand;
++    auto & q = stage && low ? q_stage_low : stage ? q_stage : q_demand;
+     for (int32_t w = 0; w < n; w++) {
+         llama_moe_stream_work it = { &sl, expert, slot, sl.slot_gen[slot], w };
+         it.staged = stage;
++        it.low    = stage && low;
+         q.push_back(it);
+     }
+     // notify_all, not notify_one: several items just arrived and one woken worker
+@@ -3092,8 +3192,10 @@ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+         } else {
+             stage_experts_locked(*layers[il_f], experts.data(), experts.size());
+         }
+-        // SiegeLadder G39: the wrong ones after the call's own (see oracle_false in the header)
+-        if (oracle_false > 0.0f) {
++        // SiegeLadder G39: the wrong ones after the call's own (see oracle_false in the header) - once a call, when it is
++        // first staged (VRAM_AHEAD calls before it): at d >= 2 each call is staged again a call later, and drawing anew
++        // then doubled them (runs.md 4.215: f = 0.5 at d = 2 gave 1.0 a call; the counters have the real number)
++        if (oracle_false > 0.0f && j0 == idx + vram_ahead) {
+             const float   whole = std::floor(oracle_false);
+             const int32_t n_f   = (int32_t) whole + (moe_hash01((uint64_t) j0, 0x39) < oracle_false - whole ? 1 : 0);
+             if (n_f <= 0) {
+@@ -3148,13 +3250,13 @@ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+                 }
+             }
+             stage_experts_locked(sf, oracle_false_pick.data(), oracle_false_pick.size(), /*add_keep =*/ true,
+-                    /*wrong =*/ true);
++                    /*wrong =*/ true, /*low =*/ oracle_false_low);
+         }
+     }
+ }
+ 
+ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep,
+-        bool wrong) {
++        bool wrong, bool low) {
+     if (!add_keep) {
+         std::fill(sf.keep.begin(), sf.keep.end(), 0);
+     }
+@@ -3189,7 +3291,7 @@ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const i
+             stats.n_stage_false++;
+             stats.n_stage_false_drive += from_drive;
+         }
+-        enqueue_slot_locked(sf, e, v, /*stage =*/ true);
++        enqueue_slot_locked(sf, e, v, /*stage =*/ true, /*notify =*/ true, low);
+         stats.n_stage++;
+     }
+ }
+@@ -3314,6 +3416,25 @@ void llama_moe_stream::g35_speculate(llama_moe_stream_layer & sl, const ggml_ten
+     if (q_spec.size() > q0) {
+         cv_work.notify_all();   // once for the lens
+     }
++    // SiegeLadder G40: the same lens's best into the target layer's VRAM slots now (see g40_k in the header) - staged as
++    // the oracle's VRAM_AHEAD stages: victims from that layer's own slots, which nothing on the card reads before its call
++    if (g40_k > 0) {
++        const double h = g40_h >= 0.0f ? g40_h : g35_h;
++        g40_pick.clear();
++        for (int64_t k = 0; k < n_top && (int32_t) g40_pick.size() < g40_k; k++) {
++            const int32_t e = top[k];
++            if ((double) sc[e] >= h*sum && st.expert_slot.find(e) == st.expert_slot.end()) {
++                g40_pick.push_back(e);
++            }
++        }
++        if (!g40_pick.empty()) {
++            const int64_t s0 = stats.n_stage;
++            const int64_t d0 = stats.n_stage_drive;
++            stage_experts_locked(st, g40_pick.data(), g40_pick.size(), /*add_keep =*/ false, /*wrong =*/ false, g40_low);
++            stats.n_g40_staged += stats.n_stage - s0;
++            stats.n_g40_drive  += stats.n_stage_drive - d0;
++        }
++    }
+ }
+ 
+ // Queue a host-tier fill for an expert this layer has NOT been asked for yet. Bounded, because
+@@ -3605,6 +3726,13 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 stats.n_g35_cand, (double) stats.n_g35_cand/stats.n_g35_posts, stats.n_g35_spec,
+                 (double) stats.n_g35_spec/stats.n_g35_posts, stats.n_g35_now);
+     }
++    if (g40_k > 0 || stats.n_low_served > 0) {
++        // SiegeLadder G40 / G39b: their ready / still loading / not asked for are in the "staged from the drive" line
++        LLAMA_LOG_WARN("%s: %smoe stream: G40 (measurement): %" PRId64 " experts staged from the lens (%.2f a lens), %" PRId64
++                " of them from the drive; %" PRId64 " slabs served from q_stage_low\n", __func__, pfx, stats.n_g40_staged,
++                stats.n_g35_posts > 0 ? (double) stats.n_g40_staged/stats.n_g35_posts : 0.0, stats.n_g40_drive,
++                stats.n_low_served);
++    }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+         // critical path, and so does runahead's second half (counted in the gap between the halves above)
+@@ -3707,6 +3835,11 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 LLAMA_LOG_WARN("%s: %smoe stream: P16 reads from the copies = %" PRId64 ", %.2f GB (%.1f%% of the bytes)\n",
+                         __func__, pfx, io_mirror_n.load(), io_mirror_bytes.load()/1e9,
+                         b_all > 0 ? 100.0*io_mirror_bytes.load()/b_all : 0.0);
++                for (int32_t k = 0; n_mirrors > 1 && k < n_mirrors; k++) {
++                    LLAMA_LOG_WARN("%s: %smoe stream: P16   from %s: %.2f GB (%.1f%%)\n", __func__, pfx,
++                            mirror_dir[k].c_str(), io_mirror_bytes_k[k].load()/1e9,
++                            b_all > 0 ? 100.0*io_mirror_bytes_k[k].load()/b_all : 0.0);
++                }
+                 // SiegeLadder D14: the copies' own share of the drive latencies above (which count every read)
+                 const io_path & q = io_mir_lat;
+                 if (q.n.load() > 0) {
+@@ -5604,13 +5737,20 @@ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint
+ 
+ // wave 0 of a ubatch: record the distinct touched experts (sl.uniq, first-use order) and split them
+ // into consecutive groups of plan_capacity, one group per wave (sl.expert_wave[e] = e's wave)
+-void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n) {
++void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n, uint32_t n_ids) {
+     stats.n_calls++;
+     start_workers_locked();
+ 
++    // SiegeLadder C7b: in the decoder layers the rows before c7_row0 plan no expert (see c7_row0 in the header) - only
++    // in the wave-skip mode, where emit_wave_slots leaves their pairs out by id
++    const int64_t n_tok = n_ids > 0 ? n/(int64_t) n_ids : 0;
++    sl.plan_row0 = c7_row0 > 0 && c7_layer0 >= 0 && sl.il >= c7_layer0 && c7_row0 < n_tok &&
++            llama_moe_stream_wave_skip(sl, n_tok) ? c7_row0 : 0;
++    c7_n_rows += sl.plan_row0;
++
+     sl.touched.assign(sl.n_expert, 0);
+     sl.uniq.clear();
+-    for (int64_t i = 0; i < n; i++) {
++    for (int64_t i = sl.plan_row0*(int64_t) n_ids; i < n; i++) {
+         const int32_t e = ids[i];
+         GGML_ASSERT(e >= 0 && (uint32_t) e < sl.n_expert);
+         if (!sl.touched[e]) {
+@@ -5775,6 +5915,10 @@ void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_
+         // the GEMM leaves out every pair of another wave; no parking slot, no mask
+         stats.n_waves_skip++;
+         for (int64_t i = 0; i < n_tok*(int64_t) n_ids; i++) {
++            if (i < sl.plan_row0*(int64_t) n_ids) {
++                out[i] = LLAMA_MOE_STREAM_SKIP_ID; // SiegeLadder C7b: a decoder row without consequence (plan_waves_locked)
++                continue;
++            }
+             const int32_t e = ids[i];
+             GGML_ASSERT(sl.expert_wave[e] != 0xff);
+             if (sl.expert_wave[e] != (uint8_t) w) {
+@@ -5887,7 +6031,7 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+             }
+             mgr->p11_reset_layer_locked(*sl, sl->n_slots);
+         }
+-        mgr->plan_waves_locked(*sl, ids, n);
++        mgr->plan_waves_locked(*sl, ids, n, (uint32_t) a->ne[0]);
+         if (mgr->p11_active) {
+             mgr->p11_read_ahead_locked(*sl); // the next layer's experts into the host tier while this one runs
+         }
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 3df07e6..b9a9ab6 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -260,6 +260,7 @@ struct llama_moe_stream_layer {
+     std::vector<uint8_t> expert_wave; // [n_expert] wave each touched expert belongs to, 0xff = untouched
+     std::vector<int32_t> plan_pool;   // resident slots the masked-out pairs of this wave park on
+     std::vector<int32_t> pool_used;   // scratch: pool slots already used in the current token row
++    int64_t              plan_row0 = 0; // SiegeLadder C7b: this call's rows before it plan no expert (llama_moe_stream::c7_row0)
+ 
+     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
+ 
+@@ -328,6 +329,8 @@ struct llama_moe_stream_work {
+     // Came from q_stage: a guess for a later call (A4b staging, A' prediction). With the stage dispatcher on,
+     // its copy waits until the copy engine has no demand left (see llama_moe_stream::stage_inflight).
+     bool     staged = false;
++    // Came from q_stage_low (SiegeLadder G39b / G40): a staged guess that may well be wrong, served after every other one
++    bool     low    = false;
+ };
+ 
+ // The smallest expert cache the multi-pass path can work with.
+@@ -646,6 +649,12 @@ struct llama_moe_stream {
+     // stops before the first decoder layer's FFN, and nothing reads ahead into a layer it will not run. Set at graph build
+     // (models/deepseek4.cpp); like the layers' build-time fields it belongs to the latest build (G23's n_build)
+     int32_t                 graph_last_moe = -1;
++    // SiegeLadder C7b (llama_context, per ubatch; docs/v41/c7-design.md): in the decoder layers (c7_layer0 on) a wave plan
++    // takes no routed expert of the ubatch's rows before c7_row0 - rows without consequence under C7's bound - and their
++    // pairs are left out of the GEMM; only in the wave-skip mode, where a pair is left out by its id
++    int64_t                 c7_row0   = 0;
++    int32_t                 c7_layer0 = -1;
++    int64_t                 c7_n_rows = 0; // rows so left, summed over layers and calls
+ 
+     size_t size_bufs() const;
+ 
+@@ -703,15 +712,22 @@ struct llama_moe_stream {
+     // SiegeLadder P16 (LLAMA_MOE_STREAM_MIRROR=dir, off by default): byte-identical copies of the GGUF parts on a second
+     // drive, same indices as files (nullptr where a part has no copy). A slab is read from the copy only while the
+     // primary drive already has mirror_at reads in flight and the copy fewer than mirror_max: decode's shallow queue
+-    // stays on the fast drive, a prompt's overflow goes to the second one. Same bytes either way - only the drive differs
+-    llama_files mirrors;
++    // stays on the fast drive, a prompt's overflow goes to the second one. Same bytes either way - only the drive differs.
++    // Since 25.10 (SiegeLadder runs.md 4.212: F: + E: + C: read 22.3 GB/s together against 18.9 for F: + E:) the key takes
++    // up to MOE_STREAM_MIRRORS folders separated by ';' - each copy with its own reads in flight, each below mirror_max;
++    // the overflow goes to the copy of the part with the fewest in flight (one folder - the same as before)
++    static constexpr int MOE_STREAM_MIRRORS = 3;
++    llama_files mirrors[MOE_STREAM_MIRRORS];
++    std::string mirror_dir[MOE_STREAM_MIRRORS];
++    int32_t     n_mirrors  = 0;
+     int32_t mirror_at  = 8;  // LLAMA_MOE_STREAM_MIRROR_AT
+-    int32_t mirror_max = 4;  // LLAMA_MOE_STREAM_MIRROR_MAX
++    int32_t mirror_max = 4;  // LLAMA_MOE_STREAM_MIRROR_MAX, per copy
+     std::atomic<int32_t> io_inflight_pri{0};
+-    std::atomic<int32_t> io_inflight_mir{0};
++    std::atomic<int32_t> io_inflight_mir[MOE_STREAM_MIRRORS] = {};
+     std::atomic<int64_t> io_mirror_n{0};
+     std::atomic<int64_t> io_mirror_bytes{0};
+-    void open_mirrors(const std::vector<std::string> & paths, const char * dir);
++    std::atomic<int64_t> io_mirror_bytes_k[MOE_STREAM_MIRRORS] = {};
++    void open_mirrors(const std::vector<std::string> & paths, const char * dirs);
+     // a slab of part file_idx into staging (see llama_moe_stream_pread), from the part or its copy
+     const uint8_t * pread_slab(uint32_t file_idx, uint8_t * staging, size_t len, size_t offs, int worker_id);
+ 
+@@ -839,6 +855,14 @@ struct llama_moe_stream {
+     int32_t  g35_depth       = 2;
+     int32_t  g35_m           = 8;
+     float    g35_h           = 0.14f;
++    // SiegeLadder G40 (LLAMA_MOE_STREAM_G40=k, a measurement, off by default; theories G40): G35's lens put to staging -
++    // of the lens's G35_M best, up to k whose share of its top n_used is at least G40_H (default G35_H) and that hold no
++    // VRAM slot are staged into the target layer's slots now, d = G35's depth calls before their call (as the oracle's
++    // VRAM_AHEAD = d does with a perfect guess); G40_LOW=1 - onto q_stage_low (the bus's windows). The math is untouched
++    int32_t  g40_k           = 0;
++    float    g40_h           = -1.0f; // < 0: G35_H
++    bool     g40_low         = false;
++    std::vector<int32_t> g40_pick; // scratch of g35_speculate, under mtx
+     // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer
+     // before, it never makes the host wait (a lens exists only for L + d < the last layer + 1, so L + 1 always exists);
+     // the read-ahead starts a layer later, so G35=3 with it leads as G35=2 without it. =2 (v4): layer L's own first half
+@@ -861,6 +885,9 @@ struct llama_moe_stream {
+     // are plausible, like a predictor's: experts the target layer's last 8 calls used that this call does not and that
+     // hold no VRAM slot, by the draw; if those run out, any other expert of the layer that holds none
+     float   oracle_false  = 0.0f;
++    // LLAMA_MOE_STREAM_ORACLE_FALSE_LOW=1 (G39b): the wrong ones onto q_stage_low - into the bus's windows, behind every
++    // right staging (in q_stage they pushed the right ones of the next calls back, runs.md 4.215)
++    bool    oracle_false_low = false;
+     std::vector<int32_t> oracle_false_pick;                   // scratch of stage_ahead_locked, under mtx
+     std::vector<std::pair<float, int32_t>> oracle_false_cand; // the same
+     // Drop rule (proposed by the user 2026-10-15; lossy, so opt-in and measured by KL first). A step waits
+@@ -1106,6 +1133,12 @@ struct llama_moe_stream {
+     // slot still LOADING re-queues it on q_demand, which promotes it.
+     std::deque<llama_moe_stream_work> q_stage;
+ 
++    // SiegeLadder G39b / G40: staged loads that may well be wrong (ORACLE_FALSE_LOW's wrong ones, G40_LOW's guesses) -
++    // served only while q_demand and q_stage are empty, one at a time: the bus's windows, not a place in the copy queue
++    // ahead of a right guess (runs.md 4.215: in q_stage a wrong one pushed the right ones of later calls back)
++    std::deque<llama_moe_stream_work> q_stage_low;
++    int32_t n_low_inflight = 0; // under mtx
++
+     // Drained only when q_demand is empty, so speculation can never delay a load the graph is
+     // waiting on. Bounded: a queue that grows faster than it drains is prefetching the past.
+     std::deque<llama_moe_stream_work> q_spec;
+@@ -1153,6 +1186,11 @@ struct llama_moe_stream {
+         // SiegeLadder G39: of n_stage, the wrong experts ORACLE_FALSE staged on purpose, and of those the ones from the drive
+         int64_t n_stage_false       = 0;
+         int64_t n_stage_false_drive = 0;
++        // SiegeLadder G40: of n_stage, the lens's guesses (and of those the ones from the drive); slabs served from
++        // q_stage_low (G39b / G40)
++        int64_t n_g40_staged        = 0;
++        int64_t n_g40_drive         = 0;
++        int64_t n_low_served        = 0;
+         // M15: VRAM evictions by who took the slot (bind_why), and decode misses on an expert evicted <= 1 / 2-4 /
+         // 5-16 / > 16 tokens before, by who evicted it
+         int64_t n_evict_why[4] = {};
+@@ -1278,14 +1316,15 @@ struct llama_moe_stream {
+     // the split is what raises queue depth on a single stream. stage = onto q_stage instead of q_demand;
+     // notify = false: the caller wakes the pool itself once it has queued everything (G24)
+     void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage = false,
+-            bool notify = true);
++            bool notify = true, bool low = false);
+ 
+     // A4b: reserve slots and queue loads for the experts of calls idx+1..idx+vram_ahead
+     void stage_ahead_locked(int64_t idx, int32_t il_now);
+     // reserve slots of layer sf and queue staged loads for these experts (the body of both staging paths);
+-    // add_keep: protect them on top of the experts a previous staging of the same call protected; wrong: G39's wrong ones
++    // add_keep: protect them on top of the experts a previous staging of the same call protected; wrong: G39's wrong ones;
++    // low: their loads onto q_stage_low (G39b / G40)
+     void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep = false,
+-            bool wrong = false);
++            bool wrong = false, bool low = false);
+     // 3a: act on the prediction of the next streamed layer after sl_now; pred is [k, n_tok] I32
+     void predict_locked(const llama_moe_stream_layer & sl_now, const int32_t * pred, int64_t k, int64_t n_tok);
+ 
+@@ -1300,7 +1339,7 @@ struct llama_moe_stream {
+     void trace_and_speculate_locked(llama_moe_stream_layer & sl);
+ 
+     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
+-    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
++    void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n, uint32_t n_ids); // wave 0: build the plan
+     void stage_wave_locked(std::unique_lock<std::mutex> & lk, llama_moe_stream_layer & sl, int32_t w, uint32_t n_ids); // make wave w resident + preload next
+     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_tok); // write the slot ids
+ };
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 99fb3ca..a69c216 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1197,7 +1197,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
+     cb(csa_k, "csa_comp_k", il);
+ 
+-    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
++    // SiegeLadder C7: a decoder layer of a graph with the bound reads the ring mask with it (dense path; see c7_lo)
++    ggml_tensor * raw_mask = inp_dsv4->c7_raw_mask != nullptr && il >= hparams.dsv4_dec_first() ? inp_dsv4->c7_raw_mask :
++            inp_attn->get_kq_mask();
+ 
+     // SiegeLadder P13: the parts only - the top-k mask at the full width (a top-k mask built on a narrower width could
+     // point past it: set_rows out of range), the compressed K and the ring after the write; the chunks of queries make
+@@ -1407,7 +1409,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+     cb(k_all, "hca_k_all", il);
+ 
+-    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
++    // SiegeLadder C7: as in build_csa_lid_attention (V4's HCA flavour; V4.1's decoder goes there)
++    ggml_tensor * raw_mask = inp_dsv4->c7_raw_mask != nullptr && il >= hparams.dsv4_dec_first() ? inp_dsv4->c7_raw_mask :
++            inp_attn->get_kq_mask();
+     ggml_tensor * hca_mask = inp_hca.kq_mask;
+ 
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+@@ -2045,14 +2049,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+                 kc = ggml_reshape_4d(ctx0, kc, n_embd_head, 1, p13.sp_kv, n);
+                 cb(kc, "sp_k", il);
+ 
+-                oc = build_attn_mha(qc, kc, kc, nullptr, inp_dsv4->sp_mask, sinks, nullptr, kq_scale, il);
++                // SiegeLadder C7: a decoder layer of a graph with the bound - its mask row per query (see c7_lo)
++                ggml_tensor * sm = !inp_dsv4->c7_sp_mask_c.empty() && il >= hparams.dsv4_dec_first() ?
++                        inp_dsv4->c7_sp_mask_c[c] : inp_dsv4->sp_mask;
++                oc = build_attn_mha(qc, kc, kc, nullptr, sm, sinks, nullptr, kq_scale, il);
+             } else {
+                 // K: the chunk's window rows, then the compressed columns up to its widest query. Both lengths are multiples
+                 // of 256 - FlashAttention with the 512-wide head runs nowhere else but on the CPU
+                 ggml_tensor * kc = ggml_view_4d(ctx0, raw_rows, n_embd_head, 1, p13.raw_len, 1,
+                         raw_rows->nb[1], raw_rows->nb[1], raw_rows->nb[1]*p13.raw_len,
+                         (size_t) (c*p13.raw_len)*raw_rows->nb[1]);
+-                ggml_tensor * mc = inp_dsv4->p13_mask_c[c];
++                // SiegeLadder C7: a decoder layer of a graph with the bound - the chunk's mask with it (see c7_lo)
++                ggml_tensor * mc = !inp_dsv4->c7_p13_mask_c.empty() && il >= hparams.dsv4_dec_first() ?
++                        inp_dsv4->c7_p13_mask_c[c] : inp_dsv4->p13_mask_c[c];
+                 GGML_ASSERT(mc->ne[0] == p13.raw_len && mc->ne[1] == n);
+                 if (pa.comp_k) {
+                     const int64_t w = (*widths)[c];

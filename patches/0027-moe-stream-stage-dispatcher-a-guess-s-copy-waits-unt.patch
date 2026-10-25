@@ -1,0 +1,432 @@
+From da34f4511a108e8c6423a11524327602b282394d Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:27:21 +0000
+Subject: [PATCH 27/91] moe-stream : stage dispatcher - a guess's copy waits
+ until the copy engine has no demand left, at most 2 staged slabs in flight
+
+Every copy goes into one in-order stream, and a staged slab (a guess for a later call: the oracle's VRAM_AHEAD, A''s
+PRED_VRAM) used to enter it the moment its read finished, ahead of the current call's demand copies. Now the read
+still starts at once, but the worker leaves the copy in stage_copies with its slab pinned in L2. A dispatcher thread
+enqueues one only when the latest demand copy has landed (its event) and fewer than N staged copies are in flight (a
+ring of N events), so a demand copy waits behind at most N staged slabs. A call that finds a staged slot still
+loading takes its queued copies at once, as demand, and parts still being read follow (slot_wanted). A slot is
+RESIDENT once all its copies are enqueued, as with the async uploads. On detach (or a second context) the deferred
+copies are made synchronously. LLAMA_MOE_STREAM_STAGE_INFLIGHT=N, default 2, 0 = off; it needs the per-slot fences
+and acts only where something stages.
+
+SiegeLadder runs.md 4.40, main mode: the oracle at recall 1.0 17.27 -> 17.77 / 17.97 tok/s (18.00 with the default),
+with A''s false guesses 13.5 -> 14.49 / 14.38, A' top 3 12.16 -> 12.52; the base unchanged (12.19, nothing to
+dispatch); text = trace in every run; A' top-3 staging with and without it gives the same KL (0.000000, max 5.2e-05).
+The rejected stage gate (holding the staged reads too) lost 5-10%. False guesses stay costly through bus volume: 457
+copies per token instead of 312, the bus 72-77% busy.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 203 ++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   |  44 +++++++++
+ 2 files changed, 245 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 343edb0..15e654e 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -598,6 +598,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SLOT_FENCE")) {
+         slot_fence = std::strtol(p, nullptr, 10) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_STAGE_INFLIGHT")) {
++        stage_inflight = std::max(0, (int) std::strtol(p, nullptr, 10));
++    }
+ }
+ 
+ // stop and join the I/O workers before the cache buffers and files they use are destroyed
+@@ -609,11 +612,15 @@ llama_moe_stream::~llama_moe_stream() {
+         q_spec.clear();
+     }
+     cv_work.notify_all();
++    cv_stage.notify_all();
+     save_trace();
+ 
+     for (auto & w : workers) {
+         w.join();
+     }
++    if (stage_thread.joinable()) {
++        stage_thread.join();
++    }
+ 
+     // the copies still in flight read L2 memory and write the cache buffers: let them land first
+     if (up_backend) {
+@@ -622,6 +629,14 @@ llama_moe_stream::~llama_moe_stream() {
+     if (up_fence) {
+         ggml_backend_event_free(up_fence);
+     }
++    for (ggml_backend_event_t ev : stage_ring) {
++        ggml_backend_event_free(ev);
++    }
++    for (const auto & c : stage_copies) {
++        if (l2) {
++            l2->release(c.l2_slot); // deferred guesses never copied: their slabs were pinned for nothing
++        }
++    }
+     for (auto & sl : layers) {
+         if (sl) {
+             for (ggml_backend_event_t ev : sl->slot_up_event) {
+@@ -667,6 +682,7 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+         std::lock_guard<std::mutex> lock(mtx);
+         std::lock_guard<std::mutex> up(upload_mtx);
+         ggml_backend_synchronize(up_backend);
++        flush_stage_copies_sync_locked();
+         for (const auto & p : up_l2_pending) {
+             if (l2) {
+                 l2->release(p.second);
+@@ -710,10 +726,24 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+             }
+         }
+     }
++    // stage dispatcher: N events after the latest staged copies, made once; it needs the per-slot fences
++    bool stage_events = stage_inflight > 0 && slot_events;
++    while (stage_events && (int32_t) stage_ring.size() < stage_inflight) {
++        ggml_backend_event_t ev = ggml_backend_event_new(dev);
++        if (ev == nullptr) {
++            stage_events = false;
++            break;
++        }
++        stage_ring.push_back(ev);
++    }
+     std::lock_guard<std::mutex> lock(mtx);
+     std::lock_guard<std::mutex> up(upload_mtx); // the workers read compute_backend under upload_mtx
+     compute_backend = backend;
+     slot_fence      = slot_events;
++    stage_inflight  = stage_events ? stage_inflight : 0;
++    if (stage_inflight > 0 && !stage_thread.joinable()) {
++        stage_thread = std::thread([this] { stage_dispatch_loop(); }); // blocks on mtx until this returns
++    }
+     LLAMA_LOG_INFO("%s: MoE expert streaming: slab uploads are asynchronous on a stream of their own, "
+             "fenced %s (LLAMA_MOE_STREAM_ASYNC_UPLOAD=0: synchronous per slab)\n", __func__,
+             slot_fence ? "per slot (LLAMA_MOE_STREAM_SLOT_FENCE=0: once per call at the stream's tail)" : "once per call");
+@@ -728,6 +758,7 @@ void llama_moe_stream::detach_backend(ggml_backend_t backend) {
+     std::lock_guard<std::mutex> lock(mtx);
+     std::lock_guard<std::mutex> up(upload_mtx);
+     ggml_backend_synchronize(up_backend);
++    flush_stage_copies_sync_locked();
+     for (const auto & p : up_l2_pending) {
+         if (l2) {
+             l2->release(p.second);
+@@ -814,6 +845,128 @@ void llama_moe_stream::drain_l2_locked() {
+     up_l2_pending.resize(keep);
+ }
+ 
++void llama_moe_stream::enqueue_stage_copy_locked(const stage_copy & c, bool demand) {
++    auto & sl = *c.sl;
++    if (c.gen != sl.slot_gen[c.slot] || sl.slot_state[c.slot] != LLAMA_MOE_STREAM_SLOT_LOADING) {
++        if (l2) {
++            l2->release(c.l2_slot); // the slot was reserved again: this guess's slab is not wanted any more
++        }
++        n_stage_dropped++;
++        return;
++    }
++    const auto & wt = sl.weights[c.weight];
++    {
++        std::lock_guard<std::mutex> up(upload_mtx);
++        if (compute_backend != nullptr && (size_t) c.slot < sl.slot_up_event.size()) {
++            ggml_backend_tensor_set_async(up_backend, wt.cache, c.data, (size_t) c.slot*wt.nb_expert, wt.nb_expert);
++            const uint64_t seq = ++up_seq;
++            ggml_backend_event_record(sl.slot_up_event[c.slot], up_backend);
++            sl.slot_up_seq[c.slot] = seq;
++            up_l2_pending.emplace_back(seq, c.l2_slot); // released once a fence covers this copy
++            if (demand) {
++                demand_ev  = sl.slot_up_event[c.slot];
++                demand_seq = seq;
++            } else if (!stage_ring.empty()) {
++                ggml_backend_event_record(stage_ring[stage_ring_n % stage_ring.size()], up_backend);
++                stage_ring_n++;
++            }
++        } else {
++            ggml_backend_tensor_set(wt.cache, c.data, (size_t) c.slot*wt.nb_expert, wt.nb_expert);
++            if (l2) {
++                l2->release(c.l2_slot);
++            }
++        }
++    }
++    // published as any other part: RESIDENT once the slot's last part is enqueued
++    if (sl.slot_parts_left[c.slot] > 0 && --sl.slot_parts_left[c.slot] == 0) {
++        sl.slot_state[c.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++    }
++    cv_done.notify_all();
++}
++
++void llama_moe_stream::want_stage_slot_locked(llama_moe_stream_layer & sl, int32_t slot) {
++    if (stage_inflight <= 0) {
++        return;
++    }
++    sl.slot_wanted[slot] = 1; // parts still being read go at once too (the worker checks this flag)
++    for (auto it = stage_copies.begin(); it != stage_copies.end();) {
++        if (it->sl == &sl && it->slot == slot) {
++            const stage_copy c = *it;
++            it = stage_copies.erase(it);
++            enqueue_stage_copy_locked(c, /*demand =*/ true);
++            n_stage_taken++;
++        } else {
++            ++it;
++        }
++    }
++}
++
++void llama_moe_stream::flush_stage_copies_sync_locked() {
++    // upload_mtx is held, so the copies are made here rather than through enqueue_stage_copy_locked
++    for (const auto & c : stage_copies) {
++        auto & sl = *c.sl;
++        if (c.gen == sl.slot_gen[c.slot] && sl.slot_state[c.slot] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++            const auto & wt = sl.weights[c.weight];
++            ggml_backend_tensor_set(wt.cache, c.data, (size_t) c.slot*wt.nb_expert, wt.nb_expert);
++            if (sl.slot_parts_left[c.slot] > 0 && --sl.slot_parts_left[c.slot] == 0) {
++                sl.slot_state[c.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++            }
++        }
++        if (l2) {
++            l2->release(c.l2_slot);
++        }
++    }
++    stage_copies.clear();
++    cv_done.notify_all();
++}
++
++void llama_moe_stream::stage_dispatch_loop() {
++    std::unique_lock<std::mutex> lk(mtx);
++    while (true) {
++        cv_stage.wait(lk, [&]{ return shutting_down || !stage_copies.empty(); });
++        if (shutting_down) {
++            break;
++        }
++        // The gate is on the device and is waited for outside the locks: the latest demand copy has landed, and
++        // so has the staged copy N back (only this thread records those). A demand copy enqueued after this one
++        // waits behind at most N staged slabs.
++        ggml_backend_event_t ev_d  = nullptr;
++        ggml_backend_event_t ev_s  = nullptr;
++        uint64_t             seq_d = 0;
++        {
++            std::lock_guard<std::mutex> up(upload_mtx);
++            ev_d  = demand_ev;
++            seq_d = demand_seq;
++            if (!stage_ring.empty() && stage_ring_n >= stage_ring.size()) {
++                ev_s = stage_ring[stage_ring_n % stage_ring.size()];
++            }
++        }
++        lk.unlock();
++        if (ev_d) {
++            ggml_backend_event_synchronize(ev_d);
++        }
++        if (ev_s) {
++            ggml_backend_event_synchronize(ev_s);
++        }
++        lk.lock();
++        if (shutting_down) {
++            break;
++        }
++        bool newer_demand = false;
++        {
++            std::lock_guard<std::mutex> up(upload_mtx);
++            newer_demand = demand_seq != seq_d;
++        }
++        if (newer_demand || stage_copies.empty()) {
++            continue; // a demand copy came meanwhile (it goes first), or a call took the queued copies itself
++        }
++        const stage_copy c = stage_copies.front();
++        stage_copies.pop_front();
++        enqueue_stage_copy_locked(c, /*demand =*/ c.sl->slot_wanted[c.slot] != 0);
++        n_stage_dispatched++;
++    }
++}
++
+ ggml_tensor * llama_moe_stream::create_cache_tensor(
+         int32_t il, ggml_backend_buffer_type_t buft, const ggml_tensor * meta,
+         uint16_t file_idx, size_t offs) {
+@@ -870,6 +1023,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+         sl->expert_pinned.resize(n_expert, 0);
+         sl->slot_pinned  .resize(n_slots, 0);
+         sl->slot_staged  .resize(n_slots, 0);
++        sl->slot_wanted  .resize(n_slots, 0);
+         // JigSaw (21/08): marca os N primeiros da linha desta camada como pinaveis.
+         if (pin_budget > 0) {
+             const char * pl = std::getenv("LLAMA_MOE_STREAM_PIN_LIST");
+@@ -1142,7 +1296,9 @@ void llama_moe_stream::worker_loop(int worker_id) {
+ 
+         lk.unlock();
+ 
+-        bool ok = true;
++        bool       ok          = true;
++        bool       is_deferred = false; // stage dispatcher: the copy of this guess is left to it
++        stage_copy deferred    = {};
+         {
+             const auto & wt = sl.weights[w.weight];
+             const size_t offs = wt.offs + (size_t) w.expert*wt.nb_expert;
+@@ -1192,6 +1348,18 @@ void llama_moe_stream::worker_loop(int worker_id) {
+ 
+             if (data == nullptr) {
+                 ok = false;
++            } else if (w.staged && stage_inflight > 0 && (filled_slot != SIZE_MAX || pinned_slot != SIZE_MAX)) {
++                // stage dispatcher: a guess's copy waits until the copy engine has no demand left, or until its
++                // call needs it (decided under the lock below); the slab stays pinned in L2 until the copy is fenced
++                size_t l2_slot = pinned_slot;
++                if (filled_slot != SIZE_MAX) {
++                    l2->commit_pinned(filled_slot, filled_head);
++                    l2_slot = filled_slot;
++                }
++                filled_slot = SIZE_MAX;
++                pinned_slot = SIZE_MAX;
++                deferred    = { &sl, w.slot, w.gen, w.weight, data, l2_slot };
++                is_deferred = true;
+             } else {
+                 // The READ above is the parallel part and stays outside the lock;
+                 // only the upload is serialised. See upload_mtx in the header for
+@@ -1217,6 +1385,10 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                             // the slot's event now follows its latest copy on the in-order stream
+                             ggml_backend_event_record(sl.slot_up_event[w.slot], up_backend);
+                             sl.slot_up_seq[w.slot] = seq;
++                            if (!w.staged) {
++                                demand_ev  = sl.slot_up_event[w.slot]; // the stage dispatcher waits for this one
++                                demand_seq = seq;
++                            }
+                         }
+                         if (filled_slot != SIZE_MAX) {
+                             l2->commit_pinned(filled_slot, filled_head);
+@@ -1243,6 +1415,22 @@ void llama_moe_stream::worker_loop(int worker_id) {
+ 
+         lk.lock();
+ 
++        if (is_deferred) {
++            if (w.gen != sl.slot_gen[w.slot]) {
++                l2->release(deferred.l2_slot); // stale: the slot was reserved again while this read was out
++                cv_done.notify_all();
++                continue;
++            }
++            if (compute_backend == nullptr || sl.slot_wanted[w.slot]) {
++                enqueue_stage_copy_locked(deferred, /*demand =*/ true); // its call waits for it (or no async path)
++            } else {
++                stage_copies.push_back(deferred);
++                n_stage_deferred++;
++                cv_stage.notify_one();
++            }
++            continue; // the part is published when its copy is enqueued
++        }
++
+         // Re-check the generation: this worker held no lock while reading, and the
+         // slot may have been evicted and re-reserved for another expert meanwhile.
+         // Decrementing that generation's counter would publish a slot whose tensors
+@@ -1338,6 +1526,7 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+         stats.n_stage_waste++;
+     }
+     sl.slot_staged[slot]     = 0; // stage_ahead_locked sets it again for its own reservations
++    sl.slot_wanted[slot]     = 0;
+ }
+ 
+ // Queue one read per weight tensor of this slot. THE POINT OF THE SPLIT: a single
+@@ -1348,7 +1537,9 @@ void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t
+     const int32_t n = (int32_t) sl.weights.size();
+     auto & q = stage ? q_stage : q_demand;
+     for (int32_t w = 0; w < n; w++) {
+-        q.push_back({ &sl, expert, slot, sl.slot_gen[slot], w });
++        llama_moe_stream_work it = { &sl, expert, slot, sl.slot_gen[slot], w };
++        it.staged = stage;
++        q.push_back(it);
+     }
+     // notify_all, not notify_one: several items just arrived and one woken worker
+     // would take one and leave the rest queued behind a sleeping pool - exactly the
+@@ -1825,6 +2016,12 @@ void llama_moe_stream::print_stats(const char * role) const {
+     LLAMA_LOG_WARN("%s: %smoe stream: slab uploads %s: %" PRIu64 " enqueued, %" PRId64 " fences\n", __func__, pfx,
+             compute_backend == nullptr ? "synchronous per slab" :
+             slot_fence ? "asynchronous, fenced per slot" : "asynchronous, fenced at the stream's tail", up_seq, n_up_fences);
++    if (stage_inflight > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: staged copies behind demand (at most %d in flight): %" PRId64 " deferred, "
++                "%" PRId64 " dispatched, %" PRId64 " taken by their call, %" PRId64 " dropped, %zu still queued\n",
++                __func__, pfx, stage_inflight, n_stage_deferred, n_stage_dispatched, n_stage_taken, n_stage_dropped,
++                stage_copies.size());
++    }
+     if (stats.n_wave_calls > 0) {
+         LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms, skipping = %" PRId64 "\n",
+                 __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0, stats.n_waves_skip);
+@@ -2360,6 +2557,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             const int32_t s = it->second;
+             const bool loading = sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING;
+             if (loading) {
++                mgr->want_stage_slot_locked(*sl, s); // stage dispatcher: its deferred copies go now, as demand
+                 mgr->enqueue_slot_locked(*sl, e, s);
+                 waited = true;
+             }
+@@ -2593,6 +2791,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+                 // already in the cache (resident, or still loading from the previous wave's preload)
+                 const int32_t s = it->second;
+                 if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++                    want_stage_slot_locked(sl, s); // stage dispatcher: a staged slot's deferred copies go now
+                     enqueue_slot_locked(sl, e, s); // promote to demand, wait for it
+                     waited = true;
+                 } else {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 94e73c0..887ba9b 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -121,6 +121,9 @@ struct llama_moe_stream_layer {
+     // llama_moe_stream::fence_slots_locked
+     std::vector<ggml_backend_event_t> slot_up_event; // [n_slots], made by attach_backend
+     std::vector<uint64_t>             slot_up_seq;   // [n_slots]
++    // [n_slots] stage dispatcher, guarded by mgr->mtx: a call waits for this LOADING slot, so its staged copies go
++    // at once, as demand. Set when a call finds the slot still loading, cleared by every new reservation.
++    std::vector<uint8_t>              slot_wanted;
+     // drop rule (LLAMA_MOE_STREAM_DROP_W): the weight multiplier of each [n_expert_used, n_tokens] pair of
+     // the current call - 0 for a dropped pair, 1 (or the renormalising factor) for the rest - written by
+     // the remap and copied out by llama_moe_stream_drop_mask; the experts dropped; per-expert scratch
+@@ -187,6 +190,9 @@ struct llama_moe_stream_work {
+     // time -- the router of layer L needs the output of L-1 -- so the drive never sees a queue
+     // deeper than ~4 and gives 4,33 GB/s of the 10,04 it reaches at depth 6.
+     bool     spec   = false;
++    // Came from q_stage: a guess for a later call (A4b staging, A' prediction). With the stage dispatcher on,
++    // its copy waits until the copy engine has no demand left (see llama_moe_stream::stage_inflight).
++    bool     staged = false;
+ };
+ 
+ // The smallest expert cache the multi-pass path can work with.
+@@ -590,6 +596,44 @@ struct llama_moe_stream {
+     // copy - one wait per op - and later copies (another wave's preloads, staging for later calls) go on.
+     bool                 slot_fence      = true;
+ 
++    // Stage dispatcher (SiegeLadder 17.10, theory G1; LLAMA_MOE_STREAM_STAGE_INFLIGHT=N, default 2, 0 = off; needs
++    // slot_fence; acts only where something stages - the oracle's VRAM_AHEAD, A''s PRED_VRAM).
++    // Every copy goes into one in-order stream, and a staged slab (a guess for a later call) used to enter it the
++    // moment its read finished, ahead of the current call's demand copies: with A''s ~1.25 false guesses per call
++    // the oracle at full recall fell from 17.0 to 13.5 tok/s, and the extra time was the GPU waiting for its own
++    // copies behind the guesses (runs.md 4.40). Holding the staged READS back made it worse (the stage gate,
++    // 4.40). Here the read starts at once as before, but the worker leaves the COPY in stage_copies, its slab
++    // pinned in L2; the dispatcher thread enqueues one only when the latest demand copy has landed and fewer than
++    // N staged copies are in flight, so a demand copy waits behind at most N staged slabs (~0.12 ms each). A call
++    // that finds a staged slot still loading takes its queued copies at once, as demand (slot_wanted). Measured
++    // (runs.md 4.40, N = 2): the oracle at recall 1.0 17.0-17.3 -> 17.8-18.0 tok/s, with A''s false guesses 13.5 ->
++    // 14.4, A' top 3 12.2 -> 12.5; text = trace, KL as staging without it; the base unchanged (nothing to dispatch).
++    struct stage_copy {
++        llama_moe_stream_layer * sl;
++        int32_t         slot;
++        uint64_t        gen;
++        int32_t         weight;
++        const uint8_t * data;    // inside l2_slot, which stays pinned until the copy is fenced
++        size_t          l2_slot;
++    };
++    int32_t                           stage_inflight   = 2;
++    std::deque<stage_copy>            stage_copies;           // read, not yet enqueued (mtx)
++    std::vector<ggml_backend_event_t> stage_ring;             // events after the last N staged copies (upload_mtx)
++    uint64_t                          stage_ring_n     = 0;   // staged copies the dispatcher enqueued (upload_mtx)
++    ggml_backend_event_t              demand_ev        = nullptr; // event after the latest demand copy (upload_mtx)
++    uint64_t                          demand_seq       = 0;   // that copy's seq (upload_mtx)
++    std::thread                       stage_thread;
++    std::condition_variable           cv_stage;
++    int64_t n_stage_deferred = 0, n_stage_dispatched = 0, n_stage_taken = 0, n_stage_dropped = 0; // (mtx)
++    void stage_dispatch_loop();
++    // under mtx: enqueue a deferred staged copy (demand: the call needs it now; updates demand_ev) and publish its
++    // part, or drop it if its slot was reserved again
++    void enqueue_stage_copy_locked(const stage_copy & c, bool demand);
++    // under mtx: a call needs this staged slot now - its queued copies go at once, and so will the rest
++    void want_stage_slot_locked(llama_moe_stream_layer & sl, int32_t slot);
++    // under mtx and upload_mtx, with the upload stream idle: copy every deferred slab the plain way (detach)
++    void flush_stage_copies_sync_locked();
++
+     // called by the context once its backends exist; the first GPU backend on the cache's device is
+     // taken. detach_backend() before that backend is freed (the context's destructor).
+     void attach_backend(ggml_backend_t backend);

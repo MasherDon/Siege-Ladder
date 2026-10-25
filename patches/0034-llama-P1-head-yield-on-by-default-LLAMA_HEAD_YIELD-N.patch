@@ -1,0 +1,727 @@
+From 0a1881221b2ce6d3db17c1d92e6d2787941b77ed Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 10:00:06 +0000
+Subject: [PATCH 34/91] llama : P1 head yield, on by default
+ (LLAMA_HEAD_YIELD=N, default 64, 0 = off) - the output head gets a GPU buffer
+ of its own; a decode call of more than N tokens releases it and runs at -ub
+ with the head's VRAM in the compute buffers, the graph ends at the normed
+ hidden state and the output rows keep it; at the end of a call with outputs
+ the compute buffers shrink to N tokens, the CUDA pool gives its peak back
+ (new ggml_backend_cuda_trim: cuMemUnmap while nothing is in use, the CUDA
+ graphs dropped), the head is read back from its file through the stream's
+ handles (~185-206 ms for 1.23 GiB) and a small graph computes the logits -
+ bitwise those of the full graph (SiegeLadder runs.md 4.48: 129 of 129 rows at
+ 4K -ub 512; the 30K consultant at -ub 1024 / 1536 keeps the head on the card:
+ decode +18..+28%, prefill unchanged). DeepSeek V4 only, not next to MTP /
+ paired / embedding contexts; a call it cannot finish (all outputs, more than
+ 64, backend samplers) gets the head back first and the full -ub reserve.
+ Also: runahead's default K = min(6, n_expert_used) (a K = 5 / 4 model never
+ uses a sixth guess, runs.md 4.47); attach_backend's WDDM note and VRAM probe
+ only for the GPU backend (the CPU pass printed the note twice and probed 16
+ GiB of RAM); LLAMA_HEAD_YIELD_DEBUG=1 prints a hash of every output row's
+ logits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml-cuda.h        |   5 +
+ ggml/src/ggml-cuda/common.cuh   |   4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  55 +++++++++
+ src/llama-context.cpp           | 213 +++++++++++++++++++++++++++++++-
+ src/llama-context.h             |  16 +++
+ src/llama-cparams.h             |   1 +
+ src/llama-model.cpp             |  91 ++++++++++++++
+ src/llama-model.h               |   9 ++
+ src/llama-moe-stream.cpp        |  45 ++++++-
+ src/llama-moe-stream.h          |  10 ++
+ src/models/deepseek4.cpp        |   7 ++
+ 11 files changed, 452 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+index 1cd81ee..339b278 100644
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -40,6 +40,11 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
+ GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
+ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
+ 
++// waits for the device, gives back the device memory of the backend's temporary-buffer pools and drops its CUDA
++// graphs (their kernels captured pool addresses); returns the bytes released. Only between graph computations.
++// Also reachable as the proc address "ggml_backend_cuda_trim" (SiegeLadder P1)
++GGML_BACKEND_API size_t ggml_backend_cuda_trim(ggml_backend_t backend);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
+ #ifdef  __cplusplus
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index d27d8ac..0159d0d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1169,6 +1169,10 @@ struct ggml_cuda_pool {
+ 
+     virtual void * alloc(size_t size, size_t * actual_size) = 0;
+     virtual void free(void * ptr, size_t size) = 0;
++
++    // give the pool's device memory back while nothing is allocated from it (the caller has synchronized the
++    // device); returns the bytes released. SiegeLadder P1: a long prompt's peak would otherwise stay mapped
++    virtual size_t trim() { return 0; }
+ };
+ 
+ template<typename T>
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 06e6fa7..93bb6f4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -455,6 +455,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
+         }
+     }
+ 
++    size_t trim() override {
++        // the cached buffers are the free ones - those handed out are not in buffer_pool
++        const size_t before = pool_size;
++        clear_pool();
++        return before - pool_size;
++    }
++
+     void * alloc(size_t size, size_t * actual_size) override {
+ #ifdef DEBUG_CUDA_MALLOC
+         int nnz = 0;
+@@ -693,6 +700,28 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+         // all deallocations must be in reverse order of the allocations
+         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
+     }
++
++    size_t trim() override {
++        // the physical memory goes back (its handles were released right after mapping, so unmapping frees it);
++        // the address range stays reserved, and a later growth maps the same addresses from the bottom again
++        if (pool_addr == 0 || pool_size == 0 || pool_used != 0) {
++            return 0;
++        }
++        ggml_cuda_set_device(device);
++#if defined(GGML_USE_HIP)
++        for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
++            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
++        }
++        mappings.clear();
++#else
++        CU_CHECK(cuMemUnmap(pool_addr, pool_size));
++#endif
++        const size_t freed = pool_size;
++        pool_size = 0;
++        GGML_LOG_INFO("%s: cuda pool[%d][%d] trimmed: %.1f MiB given back\n", __func__, device, stream_no,
++                freed/1048576.0);
++        return freed;
++    }
+ };
+ #endif // defined(GGML_USE_VMM)
+ 
+@@ -4578,6 +4607,29 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
+     }
+ }
+ 
++size_t ggml_backend_cuda_trim(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return 0;
++    }
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(cuda_ctx->device);
++    // every queued kernel that took pool memory has to be done with it before the memory is unmapped
++    CUDA_CHECK(cudaDeviceSynchronize());
++    size_t freed = 0;
++    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
++        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
++            if (cuda_ctx->pools[d][s] != nullptr) {
++                freed += cuda_ctx->pools[d][s]->trim();
++            }
++        }
++    }
++#ifdef USE_CUDA_GRAPH
++    // a captured graph replays the pool addresses it was captured with, and they are unmapped now
++    cuda_ctx->cuda_graphs.clear();
++#endif
++    return freed;
++}
++
+ 
+ // backend device
+ 
+@@ -5388,6 +5440,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
++        return (void *)ggml_backend_cuda_trim;
++    }
+     return nullptr;
+ }
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 843f99b..eeba635 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -475,6 +475,42 @@ llama_context::llama_context(
+             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+         }
+ 
++        // SiegeLadder P1 (LLAMA_HEAD_YIELD=N, default 64, 0 = off; see p1_ub_small): decided before the first
++        // reserve, which then sizes the compute buffers for N tokens with the head on the card. On by default since
++        // 17.10: the logits are bitwise those of the full graph (runs.md 4.48); a context it does not fit stays as
++        // it was, and says so only when N was asked for
++        const char * hy   = std::getenv("LLAMA_HEAD_YIELD");
++        const int    hy_n = hy != nullptr ? atoi(hy) : 64;
++        if (hy_n > 0) {
++            const uint32_t n = (uint32_t) hy_n;
++            const char * why = nullptr;
++            if (!model.head_yield_ready()) {
++                why = "the output head is not alone in a GPU buffer with an expert stream to read it back";
++            } else if (model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_DEEPSEEK41) {
++                why = "only the DeepSeek V4 graph can end without the head";
++            } else if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.ctx_other != nullptr ||
++                    cparams.embeddings || cparams.embeddings_nextn) {
++                why = "MTP, paired and embedding contexts use the head (or the hidden state) on their own";
++            } else if (n >= cparams.n_ubatch) {
++                why = "-ub is not above N, so no batch would release the head";
++            }
++            if (why == nullptr && model.head_is_released() && !model.head_restore()) {
++                why = "a context before this one left the head released, and it cannot be read back";
++            }
++            if (why != nullptr) {
++                if (hy != nullptr) {
++                    LLAMA_LOG_WARN("%s: LLAMA_HEAD_YIELD=%u is off: %s\n", __func__, n, why);
++                } else {
++                    LLAMA_LOG_INFO("%s: head yield off: %s\n", __func__, why);
++                }
++            } else {
++                p1_ub_small = n;
++                LLAMA_LOG_INFO("%s: head yield: a batch of more than %u tokens releases the output head and runs at "
++                        "-ub %u; between such batches the compute buffers are sized for %u tokens\n", __func__,
++                        n, cparams.n_ubatch, n);
++            }
++        }
++
+         sched_reserve();
+ 
+         if (!cparams.flash_attn) {
+@@ -631,7 +667,7 @@ void llama_context::sched_reserve() {
+     const int64_t t_start_us = ggml_time_us();
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_reserve());
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -778,6 +814,107 @@ void llama_context::sched_reserve() {
+             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+ }
+ 
++uint32_t llama_context::n_ubatch_reserve() const {
++    // SiegeLadder P1: with the head on the card the buffers are sized for the batches that keep it there
++    return (p1_ub_small > 0 && !cparams.head_out && !p1_full) ? p1_ub_small : cparams.n_ubatch;
++}
++
++void llama_context::p1_enter() {
++    if (sched) {
++        ggml_backend_sched_synchronize(sched.get());
++    }
++    model.head_release();
++    cparams.head_out   = true;
++    p1_full            = false;
++    sched_need_reserve = true; // decode reserves next: the -ub graphs without the head, in its room
++    LLAMA_LOG_INFO("%s: head yield: output head released\n", __func__);
++}
++
++bool llama_context::p1_leave() {
++    const int64_t t0 = ggml_time_us();
++    if (sched) {
++        ggml_backend_sched_synchronize(sched.get()); // the hidden states have landed in p1_hidden
++    }
++    // the prompt's compute buffers go first - their room, and the CUDA pool's peak, is where the head comes back to
++    gf_res_prev.reset();
++    gf_res_reserve.reset();
++    sched.reset();
++    size_t trimmed = 0;
++    for (auto & backend : backends) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
++        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        auto * trim_fn = reg != nullptr ? (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim") : nullptr;
++        if (trim_fn != nullptr) {
++            trimmed += trim_fn(backend.get());
++        }
++    }
++    double t_read_ms = 0.0;
++    if (!model.head_restore(&t_read_ms)) {
++        // no head, no logits: the context cannot go on
++        p1_groups.clear();
++        return false;
++    }
++    cparams.head_out = false;
++    p1_full          = false;
++    bool ok = true;
++    int64_t n_rows = 0;
++    for (const auto & [row0, n] : p1_groups) {
++        ok = ok && p1_logits(row0, n);
++        n_rows += n;
++    }
++    p1_groups.clear();
++    sched_need_reserve = true;
++    sched_reserve();
++    LLAMA_LOG_INFO("%s: head yield: head back in %.1f ms (read %.1f ms), logits of %lld rows, the CUDA pool gave back "
++            "%.1f MiB\n", __func__, (ggml_time_us() - t0)/1000.0, t_read_ms, (long long) n_rows, trimmed/1048576.0);
++    return ok;
++}
++
++bool llama_context::p1_logits(int64_t row0, int64_t n_rows) {
++    // the head's own op on the rows the full graph would have fed it: ggml_mul_mat(output, normed hidden), one per
++    // ubatch as there, on the head's backend - its own small graph and allocator, so the scheduler is not involved
++    const int64_t n_vocab = model.vocab.n_tokens();
++    ggml_backend_dev_t hdev = ggml_backend_buft_get_device(model.head_buft());
++    ggml_backend_t be = nullptr;
++    for (auto & backend : backends) {
++        if (ggml_backend_get_device(backend.get()) == hdev) {
++            be = backend.get();
++            break;
++        }
++    }
++    if (be == nullptr || logits.data == nullptr) {
++        LLAMA_LOG_ERROR("%s: head yield: no backend for the head or no logits buffer\n", __func__);
++        return false;
++    }
++    ggml_init_params ip = {
++        /*.mem_size   =*/ 8*ggml_tensor_overhead() + ggml_graph_overhead_custom(8, false),
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx_h(ggml_init(ip));
++    ggml_tensor * h = ggml_new_tensor_2d(ctx_h.get(), GGML_TYPE_F32, p1_n_embd, n_rows);
++    ggml_set_input(h);
++    ggml_tensor * lg = ggml_mul_mat(ctx_h.get(), model.output, h);
++    ggml_set_output(lg);
++    ggml_cgraph * g = ggml_new_graph_custom(ctx_h.get(), 8, false);
++    ggml_build_forward_expand(g, lg);
++    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
++    bool ok = ggml_gallocr_alloc_graph(galloc, g);
++    if (ok) {
++        ggml_backend_tensor_set(h, p1_hidden.data() + row0*p1_n_embd, 0, ggml_nbytes(h));
++        ok = ggml_backend_graph_compute(be, g) == GGML_STATUS_SUCCESS;
++        if (ok) {
++            ggml_backend_tensor_get(lg, logits.data + row0*n_vocab, 0, ggml_nbytes(lg));
++        }
++    }
++    ggml_gallocr_free(galloc);
++    if (!ok) {
++        LLAMA_LOG_ERROR("%s: head yield: the logits of rows %lld..%lld failed\n", __func__, (long long) row0,
++                (long long) (row0 + n_rows - 1));
++    }
++    return ok;
++}
++
+ void llama_context::synchronize() {
+     if (!sched) {
+         return;
+@@ -899,7 +1036,7 @@ bool llama_context::memory_update(bool optimize) {
+         }
+ 
+         const uint32_t n_seqs = cparams.n_seq_max;
+-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_reserve());
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+ 
+@@ -1858,6 +1995,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     }
+     embd_seq.clear();
+ 
++    // SiegeLadder P1: which side of a long prompt this call is on (see p1_ub_small)
++    if (p1_ub_small > 0) {
++        // a call P1 can finish: logits only, a few rows, no backend sampling (its tensors hang off the logits)
++        const bool p1_ok = !output_all && !has_samplers && n_outputs_all <= 64;
++        if (cparams.head_out && !p1_ok) {
++            // the head-less graph cannot serve this batch: the head comes back first
++            if (!p1_leave()) {
++                return -2;
++            }
++        }
++        if (!cparams.head_out && n_tokens_all > p1_ub_small) {
++            if (p1_ok) {
++                p1_enter();
++            } else if (!p1_full) {
++                LLAMA_LOG_WARN("%s: head yield: a batch of %u tokens with %u outputs keeps the head - the compute "
++                        "buffers grow to -ub %u\n", __func__, n_tokens_all, n_outputs_all, cparams.n_ubatch);
++                p1_full = true;
++                sched_need_reserve = true;
++            }
++        }
++        if (cparams.head_out) {
++            // sized once, before any copy into it is queued
++            p1_n_embd = model.hparams.n_embd;
++            p1_hidden.resize((size_t) n_outputs_all*p1_n_embd);
++            p1_groups.clear();
++        }
++        // a phase change re-reserves here, before this call's tokens are queued: sched_reserve synchronizes, and
++        // the perf counters would book them as done at once
++        sched_reserve();
++    }
++
+     if (t_compute_start_us == 0) {
+         t_compute_start_us = ggml_time_us();
+     }
+@@ -2008,6 +2176,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             }
+         }
+ 
++        // SiegeLadder P1: the head is out - the output rows' normed hidden states wait for it in p1_hidden
++        if (cparams.head_out && n_outputs > 0) {
++            ggml_tensor * t_h = res->get_embd();
++            GGML_ASSERT(t_h != nullptr && t_h->ne[0] == p1_n_embd && t_h->ne[1] == n_outputs);
++            GGML_ASSERT((n_outputs_prev + n_outputs)*p1_n_embd <= (int64_t) p1_hidden.size());
++            ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h);
++            GGML_ASSERT(backend_h != nullptr);
++            ggml_backend_tensor_get_async(backend_h, t_h, p1_hidden.data() + n_outputs_prev*p1_n_embd, 0,
++                    n_outputs*p1_n_embd*sizeof(float));
++            p1_groups.emplace_back(n_outputs_prev, n_outputs);
++        }
++
+         // extract embeddings
+         if (embd.data && t_embd && n_outputs > 0) {
+             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+@@ -2106,6 +2286,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         n_tokens_prev  += ubatch.n_tokens;
+     } while (mctx->next());
+ 
++    // SiegeLadder P1: this call had outputs while the head was out - it comes back and computes them now
++    if (cparams.head_out && !p1_groups.empty()) {
++        if (!p1_leave()) {
++            return -2;
++        }
++    }
++
++    // SiegeLadder P1 check (LLAMA_HEAD_YIELD_DEBUG=1): a hash of every output row's logits - a run with P1 and one
++    // without must print the same lines
++    static const bool p1_debug = std::getenv("LLAMA_HEAD_YIELD_DEBUG") != nullptr;
++    if (p1_debug && n_outputs_all > 0 && logits.data != nullptr) {
++        if (sched) {
++            ggml_backend_sched_synchronize(sched.get());
++        }
++        static int64_t n_call = 0;
++        for (int64_t r = 0; r < n_outputs_all; r++) {
++            const float * row = logits.data + r*n_vocab;
++            uint64_t h = 1469598103934665603ull;
++            const uint8_t * p = (const uint8_t *) row;
++            for (size_t i = 0; i < (size_t) n_vocab*sizeof(float); i++) {
++                h = (h ^ p[i])*1099511628211ull;
++            }
++            const int64_t best = std::max_element(row, row + n_vocab) - row;
++            LLAMA_LOG_INFO("%s: head yield check: call %lld row %lld of %u tokens: logits %016llx, top %lld\n", __func__,
++                    (long long) n_call, (long long) r, n_tokens_all, (unsigned long long) h, (long long) best);
++        }
++        n_call++;
++    }
++
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+     n_outputs = n_outputs_all;
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa..da627c8 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -345,6 +345,22 @@ private:
+ 
+     bool sched_need_reserve = true;
+ 
++    // SiegeLadder P1 (LLAMA_HEAD_YIELD=N): a batch of more than N tokens releases the output head (1.2 GiB of BF16
++    // on V4.1) and runs at n_ubatch with the head's VRAM in the compute buffers; its output rows keep their normed
++    // hidden states, and at the end of the call the compute buffers shrink to N tokens, the CUDA pool gives its
++    // peak back, the head is read back from its file and a small graph computes the logits - the same op on the
++    // same rows as the full graph would have run
++    uint32_t p1_ub_small = 0;      // N; 0 = off
++    bool     p1_full     = false;  // a batch P1 cannot take runs at n_ubatch with the head in place
++    int64_t  p1_n_embd   = 0;      // row size of the kept hidden states
++    std::vector<float> p1_hidden;  // [n_outputs_all][p1_n_embd] while the head is out
++    std::vector<std::pair<int64_t, int64_t>> p1_groups; // (first output row, rows) per ubatch, in order
++
++    uint32_t n_ubatch_reserve() const;  // the batch size the compute buffers are sized for
++    void p1_enter();                    // release the head: the next sched_reserve sizes the buffers for n_ubatch
++    bool p1_leave();                    // head back, logits of p1_groups, buffers for N tokens
++    bool p1_logits(int64_t row0, int64_t n_rows);
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 5018170..41ac7c4 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -52,6 +52,7 @@ struct llama_cparams {
+     bool op_offload;
+     bool kv_unified;
+     bool pipeline_parallel;
++    bool head_out = false;   // SiegeLadder P1: the output head is released - graphs end at t_embd, no logits
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index b7c22df..0d47c7a 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1042,6 +1042,14 @@ struct llama_model::impl {
+     // MoE expert SSD streaming state, null when not enabled
+     std::unique_ptr<llama_moe_stream> moe_stream;
+ 
++    // SiegeLadder P1 (LLAMA_HEAD_YIELD): the output head in a VRAM buffer of its own, released while a long prompt
++    // runs and read back from its file afterwards (through the stream's handles: the file is not mapped any more)
++    ggml_backend_buffer_ptr    head_buf;
++    ggml_backend_buffer_type_t head_buft      = nullptr;
++    int32_t                    head_file_idx  = -1;
++    size_t                     head_file_offs = 0;
++    bool                       head_released  = false;
++
+     std::vector<float> tensor_split_owned;
+ };
+ 
+@@ -1502,6 +1510,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
+             }
+             pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
++            pimpl->moe_stream->cap_runahead(hparams.n_expert_used);
+             // JigSaw: o orcamento de pins e clampado AQUI, onde n_expert_used existe. Um pin
+             // rouba um slot ao pool dinamico e o plano de vagas exige 3*n_expert_used slots
+             // dinamicos - sem este clamp o prefill entra em deadlock (medido 22/08, 24s-p8).
+@@ -1850,6 +1859,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                 }
+             } else {
++                // SiegeLadder P1 (LLAMA_HEAD_YIELD=N, default 64, 0 = off): the output head gets a GPU buffer of its
++                // own, so a prompt longer than N tokens can hand its VRAM to the compute buffers and read it back from its
++                // file afterwards (bitwise the same logits, runs.md 4.48). The tensor is allocated here, so the
++                // allocation below skips it and load_all_data writes into it
++                const char * hy = std::getenv("LLAMA_HEAD_YIELD");
++                const int hy_n = hy != nullptr ? atoi(hy) : 64;
++                if (hy_n > 0 && pimpl->moe_stream && output != nullptr && output->data == nullptr &&
++                        ggml_get_tensor(ctx, ggml_get_name(output)) == output &&
++                        ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                    const auto * w = ml.get_weight(ggml_get_name(output));
++                    ggml_backend_buffer_t hb = w ? ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, output)) : nullptr;
++                    if (hb == nullptr) {
++                        throw std::runtime_error(format("unable to allocate the %s buffer of the output head", ggml_backend_buft_name(buft)));
++                    }
++                    GGML_ASSERT(ggml_backend_tensor_alloc(hb, output, ggml_backend_buffer_get_base(hb)) == GGML_STATUS_SUCCESS);
++                    ggml_backend_buffer_set_usage(hb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                    pimpl->head_buf.reset(hb);
++                    pimpl->head_buft      = buft;
++                    pimpl->head_file_idx  = (int32_t) w->idx;
++                    pimpl->head_file_offs = w->offs;
++                    LLAMA_LOG_INFO("%s: %10s head buffer size = %8.2f MiB (released while a prompt of more than %d tokens "
++                            "runs; LLAMA_HEAD_YIELD=0 keeps it with the weights)\n", __func__, ggml_backend_buft_name(buft),
++                            ggml_backend_buffer_get_size(hb)/1048576.0, hy_n);
++                }
+                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+             }
+             if (buf == nullptr) {
+@@ -2036,6 +2069,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
+             }
+         }
+     }
++    // SiegeLadder P1: the head's own buffer, while it is on the card
++    if (pimpl->head_buf) {
++        ret[pimpl->head_buft] += ggml_backend_buffer_get_size(pimpl->head_buf.get());
++    }
+     return ret;
+ }
+ 
+@@ -2325,6 +2362,60 @@ llama_moe_stream * llama_model::moe_stream() const {
+     return pimpl->moe_stream.get();
+ }
+ 
++bool llama_model::head_yield_ready() const {
++    return pimpl->head_buft != nullptr && pimpl->moe_stream != nullptr && pimpl->head_file_idx >= 0 && output != nullptr;
++}
++
++bool llama_model::head_is_released() const {
++    return pimpl->head_released;
++}
++
++ggml_backend_buffer_type_t llama_model::head_buft() const {
++    return pimpl->head_buft;
++}
++
++void llama_model::head_release() const {
++    if (!head_yield_ready() || pimpl->head_released) {
++        return;
++    }
++    // ggml_backend_tensor_alloc wants both null again, and a graph that still referenced the head would now fail
++    // loudly (gallocr would try to place 1.2 GiB in the compute buffer) instead of reading freed memory
++    output->data   = nullptr;
++    output->buffer = nullptr;
++    pimpl->head_buf.reset();
++    pimpl->head_released = true;
++}
++
++bool llama_model::head_restore(double * t_read_ms) const {
++    if (!head_yield_ready() || !pimpl->head_released) {
++        return true;
++    }
++    ggml_backend_buffer_t hb = ggml_backend_buft_alloc_buffer(pimpl->head_buft, ggml_backend_buft_get_alloc_size(pimpl->head_buft, output));
++    if (hb == nullptr) {
++        LLAMA_LOG_ERROR("%s: the output head's %s buffer cannot be allocated again\n", __func__, ggml_backend_buft_name(pimpl->head_buft));
++        return false;
++    }
++    GGML_ASSERT(ggml_backend_tensor_alloc(hb, output, ggml_backend_buffer_get_base(hb)) == GGML_STATUS_SUCCESS);
++    ggml_backend_buffer_set_usage(hb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    const int64_t t0 = ggml_time_us();
++    ggml_tensor * t = output;
++    const bool ok = pimpl->moe_stream->read_bytes((uint32_t) pimpl->head_file_idx, pimpl->head_file_offs, ggml_nbytes(t),
++            [t](const uint8_t * data, size_t off, size_t n) { ggml_backend_tensor_set(t, data, off, n); });
++    if (t_read_ms) {
++        *t_read_ms = (ggml_time_us() - t0)/1000.0;
++    }
++    if (!ok) {
++        LLAMA_LOG_ERROR("%s: the output head could not be read back from file %d\n", __func__, pimpl->head_file_idx);
++        output->data   = nullptr;
++        output->buffer = nullptr;
++        ggml_backend_buffer_free(hb);
++        return false;
++    }
++    pimpl->head_buf.reset(hb);
++    pimpl->head_released = false;
++    return true;
++}
++
+ void llama_moe_stream_print_stats(const llama_model * model, const char * role) {
+     if (model && model->moe_stream()) {
+         model->moe_stream()->print_stats(role);
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 960299a..f6261e0 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -695,6 +695,15 @@ struct llama_model {
+     // the pointee is mutable (residency changes during decode), only the pointer is owned here
+     llama_moe_stream * moe_stream() const;
+ 
++    // SiegeLadder P1 (LLAMA_HEAD_YIELD): the output head sits alone in a GPU buffer and can be read back from its
++    // file. Released, model.output has no data and no buffer, and no graph may reference it until head_restore.
++    // Const like moe_stream(): what changes is the head's residency, which every context of the model shares
++    bool head_yield_ready() const;
++    bool head_is_released() const;
++    ggml_backend_buffer_type_t head_buft() const;
++    void head_release() const;
++    bool head_restore(double * t_read_ms = nullptr) const; // allocates the buffer again and reads the bytes back
++
+     const struct ggml_tensor * get_tensor(const char * name) const;
+ 
+     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 16783f8..38d876f 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -556,6 +556,7 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         runahead_k = (uint32_t) std::max(0, atoi(ra_env));
+     } else if (spec_oracle.empty() && pred_vram == 0 && pred_ram == 0 && pred_stage == 0 && drop_w <= 0.0f) {
+         runahead_k = 6;
++        runahead_default = true;
+     } else {
+         runahead_k = 0;
+         LLAMA_LOG_INFO("%s: moe stream: runahead stays off next to the oracle / A' / the drop rule "
+@@ -703,8 +704,12 @@ llama_moe_stream::~llama_moe_stream() {
+ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+     // M11: the end of the context's construction - every load-time buffer is in place, and what is left of the
+     // process's VRAM budget is all the CUDA pool can grow into (with "Prefer No Sysmem Fallback" a growth past it
+-    // is a crash in the middle of a prompt: -ub 2048 at 12K, runs.md 4.43)
+-    {
++    // is a crash in the middle of a prompt: -ub 2048 at 12K, runs.md 4.43). The context attaches every backend,
++    // the CPU one too: the note and the probe are for the GPU (runs.md 4.47 - the CPU pass printed the note twice
++    // and "probed" 16 GiB of ordinary RAM)
++    const bool on_gpu = backend != nullptr && ggml_backend_get_device(backend) != nullptr &&
++            ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
++    if (on_gpu) {
+         // The DXGI budget is not the limit: runs went 100-440 MiB past it. What failed, in every configuration
+         // probed (SiegeLadder runs.md 4.44, RTX 5070 Ti, driver 617.42), was ~330 MiB short of the dedicated size.
+         const double limit_margin = 330.0;
+@@ -1264,6 +1269,42 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+     hot_decay_interval = MOE_STREAM_HOT_DECAY_TOKENS * n_streamed;
+ }
+ 
++void llama_moe_stream::cap_runahead(uint32_t n_expert_used) {
++    if (runahead_default && n_expert_used > 0 && runahead_k > n_expert_used) {
++        runahead_k = n_expert_used;
++        pred_vram  = runahead_k;
++        LLAMA_LOG_INFO("%s: moe stream: runahead stages %u guesses per call - the experts the graph routes to\n",
++                __func__, runahead_k);
++    }
++}
++
++bool llama_moe_stream::read_bytes(uint32_t file_idx, size_t offs, size_t len,
++        const std::function<void(const uint8_t * data, size_t off, size_t n)> & sink) {
++    if (file_idx >= files.size()) {
++        return false;
++    }
++    const size_t piece = 64ull << 20;
++    // the staging slack of llama_moe_stream_pread: an unaligned head and tail of one sector each
++    uint8_t * staging = (uint8_t *) moe_aligned_alloc(piece + 2*MOE_STREAM_DIRECT_ALIGN);
++    if (staging == nullptr) {
++        return false;
++    }
++    bool ok = true;
++    for (size_t done = 0; done < len && ok; ) {
++        const size_t n = std::min(piece, len - done);
++        // -1: the shared handle - no worker reads through it
++        const uint8_t * data = llama_moe_stream_pread(*files[file_idx], staging, n, offs + done, use_direct_io, /*worker_id =*/ -1);
++        if (data == nullptr) {
++            ok = false;
++            break;
++        }
++        sink(data, done, n);
++        done += n;
++    }
++    moe_aligned_free(staging);
++    return ok;
++}
++
+ // spawn the I/O thread pool on first use (from the remap callback, under mtx)
+ void llama_moe_stream::start_workers_locked() {
+     if (workers_started) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 36c07b2..ccdb221 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -418,6 +418,12 @@ struct llama_moe_stream {
+     // reopen the GGUF files for streaming reads
+     void open_files(const std::vector<std::string> & paths);
+ 
++    // read len bytes of file file_idx from offs in 64 MiB pieces, handing each to sink(data, offset within the
++    // range, size). Through the shared handle, so from one thread at a time (the workers keep their own handles).
++    // SiegeLadder P1: the output head comes back this way after a long prompt
++    bool read_bytes(uint32_t file_idx, size_t offs, size_t len,
++            const std::function<void(const uint8_t * data, size_t off, size_t n)> & sink);
++
+     size_t size_bufs() const;
+ 
+     // role names the model instance this manager belongs to and is printed in front of every
+@@ -516,6 +522,10 @@ struct llama_moe_stream {
+     // into the next layer as A' does (predict_locked: runahead drives it through pred_vram, so the two exclude each
+     // other), then waits for this layer's loads. The exact layer runs after it unchanged: the output is the same.
+     uint32_t runahead_k = 0;
++    bool     runahead_default = false; // K came from the ctor, not the environment: cap_runahead may lower it
++    // the default K is the number of experts the graph routes to, 6 at most: at K = 5 / 4 (--override-kv
++    // expert_used_count) a sixth guess is never used and pays for its copy (SiegeLadder runs.md 4.47)
++    void cap_runahead(uint32_t n_expert_used);
+     // measurement (LLAMA_MOE_STREAM_RA_DEBUG, bits; how runs.md 4.42 found the dead fused node): 1 - the second half
+     // stages nothing; 2 - the approximate pass skips the next layer's attention (its output taken as zero, as A'
+     // does); 4 - the split remap alone, no approximate pass; 8 - the exact sum gets its own shared expert, in the
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 867e870..070a2d2 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2058,6 +2058,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
++    // SiegeLadder P1: while a long prompt runs the head's VRAM belongs to the compute buffers - the graph ends at
++    // the normed hidden state of the output rows, and the context computes their logits once the head is back
++    if (cparams.head_out) {
++        ggml_build_forward_expand(gf, cur);
++        return;
++    }
++
+     cur = ggml_mul_mat(ctx0, model.output, cur);
+     cb(cur, "result_output", -1);
+     res->t_logits = cur;

@@ -1,0 +1,41 @@
+From a1f0d48e692f8c4f67c0357af910b5e7f9b346db Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 17:27:30 +0000
+Subject: [PATCH 11/91] tests : V4.1 expert and dense perf cases at decode,
+ prefill-wave and ubatch sizes
+
+test-backend-ops perf now runs the DeepSeek V4.1-Flash Q2mix expert GEMMs the way the expert stream runs
+them - 18 cache slots, top-6, gate/up IQ2_XXS 5120->2304 and down Q2_K 2304->5120 - at n = 1 (decode),
+n = 96 (one prefill wave at -ub 2048, ~32 tokens per expert) and n = 2048, plus the dense Q8_0 projections
+of a layer at n = 1 and 2048. On an RTX 5070 Ti (SiegeLadder runs.md 4.24): 27 / 40 us at n = 1,
+33 / 24 TFLOPS per wave, 96 / 67 TFLOPS at n = 2048; dense Q8_0 at n = 2048 120 TFLOPS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/test-backend-ops.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 5d1abfb..2c49806 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9764,6 +9764,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  384, 1,  5120, {1, 1}, {1, 1}));   // router
+         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 1,  5120, {1, 1}, {1, 1}));   // for scale
+     }
++    // SiegeLadder: V4.1 routed experts as the stream runs them - 18 cache slots, top-6 (gate/up IQ2_XXS 5120->2304,
++    // down Q2_K 2304->5120). n = 1: decode; n = 96: one prefill wave at -ub 2048 (~576 pairs over the 18 slots);
++    // n = 2048: a whole ubatch on 18 slots (the upper bound of what one wave could batch).
++    for (int n : {1, 96, 2048}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 18, 6, false, 2304, n, 5120));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 18, 6, false, 5120, n, 2304));
++    }
++    // dense Q8_0 projections of a V4.1 layer: attn_q_b 1280->32768, attn_output_b 8192->5120, shared expert 5120->2304
++    for (int n : {1, 2048}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32768, n, 1280, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  5120, n, 8192, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  2304, n, 5120, {1, 1}, {1, 1}));
++    }
+ 
+     // Conv2d: K=CRS=NPQ=4096 matmul performance
+     uint32_t                        iwh_idx  = 0;

@@ -1,0 +1,80 @@
+From 7abf47fff2eb0ca99d92119ca530b8baf6edc4f6 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:15:26 +0000
+Subject: [PATCH 56/91] moe-stream : P11 on by default (a pool of 64 slots;
+ LLAMA_MOE_STREAM_P11=0 turns it off)
+
+The user's decision after SiegeLadder runs.md 4.85-4.93: the 30K document 187 -> 107 s (+75%), 64K 421 -> 279 s,
+128K 1 364 -> 903 s (+51% each), test4's 2.2K / 8.9K prompts +37% / +79%, decode after the prompt unchanged; on
+router-112 the 12 prompts P11 acts on give dNLL -0.0030 [-0.0087, +0.0027], top-1 727 -> 727, 7 of 12 bitwise equal
+to the base. Not bit-exact against the per-layer cache (the waves' composition changes MMQ's split, as any change of
+the prefill's ubatch or cache state does).
+
+Only a call P1 sends the head away for (more than LLAMA_HEAD_YIELD tokens, few outputs) enters P11, so -ub 1 decode,
+perplexity's all-logits calls and contexts where P1 is off are unchanged. A configuration P11 cannot serve (JigSaw
+pins, the cache not one CUDA buffer with skipping waves, a per-layer cache larger than the pool) now says so as a
+warning only when LLAMA_MOE_STREAM_P11 was set, otherwise as info (p11_explicit), like P1's head yield.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 21 +++++++++++++++++----
+ src/llama-moe-stream.h   |  7 ++++---
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 778c857..6f3affd 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -942,9 +942,17 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_SKIP_MIN")) {
+         skip_min_tokens = std::max<int64_t>(2, std::strtoll(s, nullptr, 10));
+     }
+-    // SiegeLadder P11: the pool all layers' waves share while a long prompt runs with the cache released (header)
+-    if (const char * s = std::getenv("LLAMA_MOE_STREAM_P11")) {
+-        p11_slots = (uint32_t) std::max(0, atoi(s));
++    // SiegeLadder P11: the pool all layers' waves share while a long prompt runs with the cache released (header).
++    // On by default since 2026-10-19 with 64 slots (LLAMA_MOE_STREAM_P11=0 turns it off) - the user's decision after
++    // SiegeLadder runs.md 4.85-4.93: the 30K document 187 -> 107 s, 64K 421 -> 279 s, 128K 1 364 -> 903 s, test4's
++    // 2.2K / 8.9K prompts +37% / +79%, decode after the prompt unchanged; router-112 dNLL -0.0030 [-0.0087, +0.0027]
++    // on the 12 prompts P11 acts on (not bit-exact: the waves' composition changes MMQ's split, as any change of the
++    // prefill's ubatch or cache state does). Only a call P1 sends the head away for (more than LLAMA_HEAD_YIELD tokens,
++    // few outputs) enters it, so -ub 1 decode and perplexity's all-logits calls never do
++    {
++        const char * s = std::getenv("LLAMA_MOE_STREAM_P11");
++        p11_slots    = s == nullptr ? 64u : (uint32_t) std::max(0, atoi(s));
++        p11_explicit = s != nullptr;
+     }
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_P11_AHEAD")) {
+         p11_ahead = (uint32_t) std::max(0, atoi(s));
+@@ -1827,7 +1835,12 @@ bool llama_moe_stream::p11_enter() {
+         }
+     }
+     if (why != nullptr) {
+-        LLAMA_LOG_WARN("%s: P11 off (%s); the prompt runs on the per-layer cache\n", __func__, why);
++        // a configuration P11 cannot serve says so loudly only when it was asked for (like P1's head yield)
++        if (p11_explicit) {
++            LLAMA_LOG_WARN("%s: P11 off (%s); the prompt runs on the per-layer cache\n", __func__, why);
++        } else {
++            LLAMA_LOG_INFO("%s: P11 off (%s); the prompt runs on the per-layer cache\n", __func__, why);
++        }
+         p11_slots = 0;
+         return false;
+     }
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index d9137ca..4df3e2f 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -564,9 +564,10 @@ struct llama_moe_stream {
+     // being, and a layer's slot table starts empty at its first wave (in between the pool held other layers' experts;
+     // the layers run one after another, and each wave's CPU split follows a synchronize of the compute stream, so the
+     // previous layer's GEMMs are done before a slot is written again). After the prompt the cache is allocated again,
+-    // empty. LLAMA_MOE_STREAM_P11=N - a pool of N slots (0 or unset - off)
+-    uint32_t p11_slots  = 0;
+-    bool     p11_active = false;
++    // empty. LLAMA_MOE_STREAM_P11=N - a pool of N slots (unset - 64, on by default since 2026-10-19; 0 - off)
++    uint32_t p11_slots    = 0;
++    bool     p11_active   = false;
++    bool     p11_explicit = false; // LLAMA_MOE_STREAM_P11 was set: a configuration P11 cannot serve is a warning
+     // called by P1 after the compute stream is synchronized; false - P11 not possible here, nothing changed
+     bool p11_enter();
+     // called by P1 after the compute buffers are freed and the CUDA pool trimmed; aborts if the cache does not fit

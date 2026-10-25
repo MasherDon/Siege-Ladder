@@ -1,0 +1,66 @@
+From 1969b62844bf15d1b0ff9b933a0a0e65b9143606 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 20:23:35 +0000
+Subject: [PATCH 21/91] dsv4 : sparse attention at decode on by default; a
+ dense-path control for FA's summation order
+
+The sparse path's long-context KL against the dense path (0.00073, top-1 99.81%) equals the dense path's own
+KL when its K rows only move inside FlashAttention's tiles and blocks: LLAMA_DSV4_DENSE_SHIFT=1 puts one
+masked zero row in front of K and 255 behind it, which gives 0.00078 (top-1 99.85%) against the same base.
+So the gather is exact up to summation order, and it is now on by default; LLAMA_DSV4_SPARSE_DECODE=0
+turns it off. Padding only at the end would not move anything: FA drops trailing tiles that are fully
+masked (KV_max).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/deepseek4.cpp | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 7323b4f..6542e7e 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1117,10 +1117,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     // top-k with -inf, so its cost grows with the context. One token in one stream can read only the picked
+     // blocks: gather their K rows and their mask entries (a pick may still be masked when fewer positions are
+     // valid than top-k). The masked positions add exp(-inf) = 0, so the result is the same up to summation
+-    // order. Opt-in for now: LLAMA_DSV4_SPARSE_DECODE=1.
++    // order: its KL against the dense path (0.0007 at 4K context) equals the dense path's own when its K rows
++    // only move inside FlashAttention's tiles (LLAMA_DSV4_DENSE_SHIFT below). On by default;
++    // LLAMA_DSV4_SPARSE_DECODE=0 turns it off.
+     static const bool sparse_decode = [] {
+         const char * s = std::getenv("LLAMA_DSV4_SPARSE_DECODE");
+-        return s != nullptr && atoi(s) != 0;
++        return s == nullptr || atoi(s) != 0;
+     }();
+     const int64_t n_sel = top_k->ne[0];
+     if (sparse_decode && cparams.flash_attn && q->ne[2] == 1 && raw_k->ne[3] == 1 && n_sel < n_csa &&
+@@ -1172,6 +1174,28 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+     cb(kq_mask, "csa_lid_kq_mask", il);
+ 
++    // Noise-floor control for the sparse path's KL (measurement only): LLAMA_DSV4_DENSE_SHIFT=s puts s masked zero
++    // rows in front of K and 256 - s behind it. The math is the same, but every real row moves to another place in
++    // FlashAttention's tiles and blocks, so the KL against the plain dense run is the kernel's summation-order floor.
++    // Padding only at the end would change nothing: FA cuts trailing tiles that are masked whole (KV_max).
++    static const int64_t dense_shift = [] {
++        const char * s = std::getenv("LLAMA_DSV4_DENSE_SHIFT");
++        return s != nullptr ? (int64_t) atoll(s) : (int64_t) 0;
++    }();
++    if (dense_shift > 0 && dense_shift < 256) {
++        const int64_t back = 256 - dense_shift;
++        auto zeros = [&](int64_t n) {
++            ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, k_all->ne[0], k_all->ne[1], n, k_all->ne[3]);
++            return ggml_cast(ctx0, ggml_fill(ctx0, t, 0.0f), k_all->type);
++        };
++        auto masked = [&](int64_t n) {
++            ggml_tensor * t = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
++            return ggml_cast(ctx0, ggml_fill(ctx0, t, -INFINITY), kq_mask->type);
++        };
++        k_all   = ggml_concat(ctx0, ggml_concat(ctx0, zeros(dense_shift), k_all, 2), zeros(back), 2);
++        kq_mask = ggml_concat(ctx0, ggml_concat(ctx0, masked(dense_shift), kq_mask, 0), masked(back), 0);
++    }
++
+     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);

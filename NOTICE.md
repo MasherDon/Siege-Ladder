@@ -6,7 +6,10 @@ projects keep their own licenses:
 | what | origin | license |
 |---|---|---|
 | `patches/` — changes to llama.cpp source files | llama.cpp / ggml, through JigSawPT's DeepSeek-V4.1 fork (`github.com/JigSawPT/llama.cpp`, branch `dsv41-porte`) | MIT, © 2023-2026 the ggml authors — keep `LICENSE` of llama.cpp with the patched files |
-| code adapted from Project Maya (marked in the file headers) | `github.com/mw00/project-maya` | MIT, © 2026 Peasant Smith and the Project Maya contributors |
+
+Some changes follow ideas of other projects, named in the patches' comments: DeepInfer's YoCo prefill truncation,
+Strata's fused SwiGLU op, ds4's logit and token-text conventions. These are our own implementations; no code from those
+projects (or from Project Maya) is included.
 
 No model weights are included. The assembly script downloads them from their own repositories, each under its own
 license (see the model cards; all three were MIT on 2026-10-25): DeepSeek's official DeepSeek-V4.1-Flash-1017 release

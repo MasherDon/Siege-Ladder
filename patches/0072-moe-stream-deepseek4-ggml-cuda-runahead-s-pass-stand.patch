@@ -1,0 +1,457 @@
+From 5b4fd127ffddb511b10c51ca75f46e37e6b8c995 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:57:42 +0000
+Subject: [PATCH 72/91] moe-stream, deepseek4, ggml-cuda : runahead's pass
+ stands in for the real attention of layer L+1 when every pair of layer L was
+ resident at the first half (SiegeLadder G32, opt-in: LLAMA_MOE_STREAM_G32=1;
+ 0 - counted only, the default; 2 - copies built, never skipped)
+
+Then the pass's MoE of L is the exact one bit for bit (multipliers 1, G30's shared rows, the same sum order), so its
+attention of L+1 - the stream, the carried mix, the index top-k and every cache row - is the real one. The real block
+of L+1 ends in copies of its results into the pass's tensors; the first half of L takes its nodes out of the compute
+(GGML_TENSOR_FLAG_COMPUTE, bound per compute by process_ubatch, every flag given back after it) and the pass's values
+stand. The CUDA graph key of a split carries the pattern of left-out nodes (needed with G23: a reused split skips the
+property check). Not for the candidate source layer or a layer whose input is exported. LLAMA_MOE_STREAM_G32_CHECK=1:
+no node outside a block reads into it but its copies. Draft: an agent (SiegeLadder docs/v41/g32-design.md).
+Checks (oracle o43): G32=1 - text = trace with 11 450 blocks left out (53.8% of 21 280); G32=2 - text = trace; the range
+check - 0 reads from outside in 570 blocks. Speed: short context +0.2% (the card draws ~10% less; exact runahead waits
+on expert copies), 30K answers +2.3% (ABBA, within the run-to-run spread).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  17 ++++-
+ src/llama-context.cpp           |  13 ++++
+ src/llama-graph.cpp             |   1 +
+ src/llama-graph.h               |  12 +++
+ src/llama-moe-stream.cpp        |  65 ++++++++++++++++
+ src/llama-moe-stream.h          |  20 +++++
+ src/models/deepseek4.cpp        | 127 ++++++++++++++++++++++++++++++++
+ 7 files changed, 254 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c1b6a19..7a68a78 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2627,7 +2627,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ }
+ 
+ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+-    return cgraph->nodes[0];
++    // SiegeLadder G32: the host may take nodes of a split out of a compute (GGML_TENSOR_FLAG_COMPUTE off, set between the
++    // splits); each pattern of left-out nodes is a CUDA graph of its own, so the two patterns of a split neither replay
++    // each other's capture nor re-capture when they alternate. The node properties compared below include the flags, so
++    // a shared key would only cost captures, never a wrong replay. No left-out node - the first node, as before; else an
++    // address inside the first node's own struct, which no other split's key can be
++    uint64_t sig = 0;
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 && !ggml_cuda_is_view_or_noop(node)) {
++            sig = (sig ^ (uint64_t) (i + 1))*0x100000001b3ull;
++        }
++    }
++    if (sig == 0) {
++        return cgraph->nodes[0];
++    }
++    return (const char *) cgraph->nodes[0] + 1 + sig % (sizeof(ggml_tensor) - 1);
+ }
+ 
+ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 728c3d1..d4afbc9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1795,9 +1795,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
++    // SiegeLadder G32: this graph's attention blocks that runahead's first halves may leave out, bound for this compute
++    // only - a reused graph binds its own again, a reserve graph is never bound, and every flag taken off is given back
++    // once all splits are launched (the flags matter only to the launches and captures)
++    llama_moe_stream * g32_ms = res->g32.empty() ? nullptr : model.moe_stream();
++    if (g32_ms != nullptr) {
++        for (const auto & g : res->g32) {
++            g32_ms->g32_bind_layer(g.il, &g.nodes);
++        }
++    }
++
+     llama_moe_stream_nvtx_push("graph_compute");
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     llama_moe_stream_nvtx_pop();
++    if (g32_ms != nullptr) {
++        g32_ms->g32_unbind();
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 30c68aa..a77ffdc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2169,6 +2169,7 @@ void llm_graph_result::reset() {
+ 
+     inputs.clear();
+     fused_nodes.clear();
++    g32.clear();
+ 
+     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 2b13f2c..d4cd463 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -999,6 +999,15 @@ struct llm_graph_fused_node {
+     int il;
+ };
+ 
++// SiegeLadder G32 (DeepSeek V4.1 runahead, decode): the real attention block of layer il + 1, which the first half of
++// layer il's remap may leave out of the compute (GGML_TENSOR_FLAG_COMPUTE off) when runahead's pass computed it exactly.
++// nodes: the block's nodes in graph order, the copies of its results into the pass's tensors last; empty - the layer is
++// only counted (LLAMA_MOE_STREAM_G32=0). Bound to the expert stream for one compute by llama_context::process_ubatch
++struct llm_graph_g32 {
++    int32_t il = -1;
++    std::vector<ggml_tensor *> nodes;
++};
++
+ class llm_graph_result {
+ public:
+     llm_graph_result(int64_t max_nodes);
+@@ -1059,6 +1068,9 @@ public:
+     std::vector<llm_graph_input_ptr> inputs;
+     std::vector<llm_graph_fused_node> fused_nodes;
+ 
++    // SiegeLadder G32: see llm_graph_g32; filled by the model graph, cleared by reset()
++    std::vector<llm_graph_g32> g32;
++
+     ggml_context_ptr ctx_compute;
+ 
+     // memory buffers used to evaluate the model
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 036ac5e..b781d2d 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -858,6 +858,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_REUSE")) {
+         ra_reuse = atoi(p) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G32")) {
++        g32 = std::min(2, std::max(0, atoi(p))); // SiegeLadder G32; see g32 in the header
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_L2_SCAN_MIN")) {
+         scan_min_tokens = std::max<int64_t>(2, atoll(p));
+     }
+@@ -892,6 +895,12 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+             LLAMA_LOG_WARN("%s: moe stream: runahead's pass attends with the heads of the first %d output groups%s (G21)\n",
+                     __func__, ra_groups, ra_groups_scale ? ", scaled up to all" : "");
+         }
++        if (g32 > 0) {
++            LLAMA_LOG_WARN("%s: moe stream: runahead: G32 %s - when every pair of layer L is resident at the end of the first "
++                    "half, the real attention of L+1 %s\n", __func__, g32 == 1 ? "on" : "built, never used (=2)",
++                    g32 == 1 ? "is left out of the compute and the pass's stands" : "still runs, its results copied into the "
++                    "pass's tensors");
++        }
+     }
+     if (drop_w > 0.0f) {
+         LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy%s): an expert held in neither VRAM nor the host tier with "
+@@ -3085,6 +3094,12 @@ void llama_moe_stream::print_stats(const char * role) const {
+         LLAMA_LOG_WARN("%s: %smoe stream: runahead: G32 - %" PRId64 " calls (%.1f%%) had every pair resident at the end of "
+                 "the first half (the pass's input to the next layer was the real one)\n", __func__, pfx, stats.n_ra_full,
+                 100.0*stats.n_ra_full/stats.n_ra_calls);
++        if (stats.n_g32_calls > 0) {
++            LLAMA_LOG_WARN("%s: %smoe stream: runahead: G32 - of %" PRId64 " calls whose next layer's attention the pass "
++                    "computes in full, %" PRId64 " (%.1f%%) had it exact; %" PRId64 " left the real one out of the compute "
++                    "(LLAMA_MOE_STREAM_G32=%d)\n", __func__, pfx, stats.n_g32_calls, stats.n_g32_full,
++                    100.0*stats.n_g32_full/stats.n_g32_calls, stats.n_g32_skip, g32);
++        }
+     }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+@@ -3719,10 +3734,60 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+     if (!sl.ra_valid) {
+         mgr.stats.n_ra_invalid++;
+     }
++    // G32: every pair reads its own expert in the pass at multiplier 1 (no substitute), and the exact path's multipliers
++    // are 1 too (the drop rule's, with runahead next to it: nothing resident is dropped, nothing renormalised) - the
++    // pass's MoE of this layer is the exact one, so its attention of the next layer is the real one. Before the card
++    // split that holds the real one is launched (two host splits later), its block leaves the compute: the CUDA backend
++    // skips nodes without GGML_TENSOR_FLAG_COMPUTE, and a CUDA graph of the split is captured per pattern of them
++    if (sl.g32_counted) {
++        mgr.stats.n_g32_calls++;
++        bool exact_ones = true;
++        for (const float f : sl.exact_mask) {
++            exact_ones = exact_ones && f == 1.0f;
++        }
++        if (n_kept == n && sl.ra_valid && sub == nullptr && exact_ones) {
++            mgr.stats.n_g32_full++;
++            if (mgr.g32 == 1 && sl.g32_nodes != nullptr) {
++                for (ggml_tensor * t : *sl.g32_nodes) {
++                    if (t->flags & GGML_TENSOR_FLAG_COMPUTE) {
++                        t->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
++                        mgr.g32_cleared.push_back(t);
++                    }
++                }
++                mgr.stats.n_g32_skip++;
++            }
++        }
++    }
+     mgr.fence_slots_locked(sl, out, (size_t) n);
+     sl.ra_t_issue = ggml_time_us();
+ }
+ 
++// G32: bound around each compute by llama_context::process_ubatch - the graph's eligible blocks (llm_graph_g32) to the
++// layers whose first half decides, then every flag taken off during the compute given back and the bindings dropped
++void llama_moe_stream::g32_bind_layer(int32_t il, const std::vector<ggml_tensor *> * nodes) {
++    llama_moe_stream_layer * sl = layer(il);
++    if (sl == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lk(mtx);
++    sl->g32_counted = true;
++    sl->g32_nodes   = nodes != nullptr && !nodes->empty() ? nodes : nullptr;
++}
++
++void llama_moe_stream::g32_unbind() {
++    std::lock_guard<std::mutex> lk(mtx);
++    for (ggml_tensor * t : g32_cleared) {
++        t->flags |= GGML_TENSOR_FLAG_COMPUTE;
++    }
++    g32_cleared.clear();
++    for (auto & sl : layers) {
++        if (sl) {
++            sl->g32_counted = false;
++            sl->g32_nodes   = nullptr;
++        }
++    }
++}
++
+ // C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; see subst in the header): what each routed expert of
+ // the call is to it, in llama_moe_stream_layer::subst_mark
+ enum : uint8_t {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index b7291e8..5afb1f1 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -240,6 +240,13 @@ struct llama_moe_stream_layer {
+     bool                 ra_reuse_ok = false;
+     std::vector<uint8_t> ra_row_ok;
+ 
++    // SiegeLadder G32 (guarded by mgr->mtx; bound for one compute by llama_moe_stream::g32_bind_layer, cleared by
++    // g32_unbind): g32_counted - the computing graph has an eligible real attention block of the next layer (the pass
++    // computes it in full); g32_nodes - that block's nodes, which the first half takes out of the compute when every pair
++    // of the call is resident (LLAMA_MOE_STREAM_G32=1), null when they were not built (G32=0)
++    bool                               g32_counted = false;
++    const std::vector<ggml_tensor *> * g32_nodes   = nullptr;
++
+     // stable userdata for wave w (grows lazily); called at graph build time only
+     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
+ 
+@@ -749,6 +756,16 @@ struct llama_moe_stream {
+     // G30: the exact GEMMs reuse the pass's rows of the pairs resident at the first half (LLAMA_MOE_STREAM_RA_REUSE,
+     // default on; 0 = the exact path recomputes all of them, as before). Needs ra_skip
+     bool     ra_reuse        = true;
++    // G32: the real attention of layer L+1 left out of the compute when runahead's pass computed it exactly - every pair of
++    // layer L resident at the end of the first half (LLAMA_MOE_STREAM_G32: 0 off, the default - only counted; 1 on; 2 the
++    // block and its copies built, never left out: A/B of the copies). See llm_graph_g32 and the model graph (deepseek4)
++    int32_t  g32             = 0;
++    // the nodes whose GGML_TENSOR_FLAG_COMPUTE the first halves took off during the current compute (under mtx); g32_unbind
++    // gives it back, so no flag outlives the compute it was taken off for
++    std::vector<ggml_tensor *> g32_cleared;
++    // llama_context::process_ubatch, around each compute: the graph's blocks bound to their layers, then unbound
++    void g32_bind_layer(int32_t il, const std::vector<ggml_tensor *> * nodes);
++    void g32_unbind();
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
+     bool     skip_capable    = true;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+@@ -1044,6 +1061,9 @@ struct llama_moe_stream {
+         int64_t n_ra_reused   = 0; // G30: pairs whose exact row was the approximate pass's (skipped by the exact GEMMs)
+         int64_t n_ra_full     = 0; // G32 (measurement): calls whose every pair was resident at the end of the first half -
+                                    // the pass's input to the next layer is then exactly the real one
++        int64_t n_g32_calls   = 0; // G32: calls whose next layer's real attention block was eligible (g32_counted)
++        int64_t n_g32_full    = 0; // of those, the pass's attention was exact (all pairs resident, no substitute, mask 1)
++        int64_t n_g32_skip    = 0; // of those, the real block was left out of the compute (G32=1)
+         int64_t t_ra_gap_us   = 0; // time from the end of the first half to the start of the second (the approximate pass)
+         int64_t t_ra_lock_us  = 0; // of that, waiting for mgr->mtx at the start of the second half (G21)
+         int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index ea79d08..4a80b28 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -8,6 +8,7 @@
+ #include <cstdlib>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_set>
+ 
+ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
+     if (ext_factor == 0.0f) {
+@@ -2376,6 +2377,29 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     //   snapshots (n_rs_seq > 0) a second build would shift them twice, so runahead stays off there. V4.1 only.
+     const bool runahead = mstream != nullptr && hparams.dsv4_v41 && mstream->runahead_k > 0 && n_tokens == 1 &&
+                           cparams.n_rs_seq == 0;
++    // SiegeLadder G32 (LLAMA_MOE_STREAM_G32; 0 - off, the default: only counted; 1 - on; 2 - built but never left out,
++    //   for A/B of its copies): when every pair of layer L was resident at the end of runahead's first half, the pass's
++    //   MoE of L is the exact one bit for bit (weight multipliers 1, the same rows - G30 reuses them - the same sum
++    //   order), so its attention of L+1 - the stream after it, the carried mix, the top-k and every cache row it writes -
++    //   is the real one. The real attention block of L+1 then ends in copies of its results into the pass's tensors, and
++    //   everything after it reads those; the first half of L takes the block, copies included, out of the compute
++    //   (GGML_TENSOR_FLAG_COMPUTE, see llama_moe_stream::g32_bind_layer) and the pass's values stand. Not for the
++    //   candidate source (the pass leaves its candidate mask unbuilt, and the layers after it read the real one), a layer
++    //   whose input is exported (t_layer_inp, taken before its attention) or the pass's measurement modes (RA_DEBUG,
++    //   RA_GROUPS: its attention is not the real one then)
++    struct g32_pass_out {
++        ggml_tensor * x  = nullptr; // the stream after attention L+1
++        ggml_tensor * c  = nullptr; // the mix attention L+1 computed, which FFN L+1 collapses with
++        ggml_tensor * k  = nullptr; // the top-k of L+1, when L+1 is an index source
++        bool          ok = false;
++    };
++    std::vector<g32_pass_out> g32_pass((size_t) n_layer);
++    const int32_t g32_mode = mstream != nullptr ? mstream->g32 : 0;
++    auto g32_layer_ok = [&](int iln) {
++        return runahead && mstream->ra_debug == 0 && mstream->ra_groups == 0 &&
++               iln != hparams.dsv4_candidate_source_layer &&
++               !((size_t) iln < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[iln]);
++    };
+     auto build_runahead_next = [&](ggml_tensor * moe_approx, ggml_tensor * shexp, ggml_tensor * residual,
+             ggml_tensor * post, ggml_tensor * comb, int il) -> ggml_tensor * {
+         const int    iln = il + 1;
+@@ -2418,6 +2442,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                     mstream->ra_groups, mstream->ra_groups_scale);
+         }
+         x = build_hc_post(cur_a, res_a, post_a, comb_a, iln);
++        if (g32_layer_ok(iln)) {
++            // G32: the tensors the real attention block of L+1 copies its results into (see g32_pass_out)
++            g32_pass[iln] = { x, carry, topk_c != topk_carry_v ? topk_c : nullptr, true };
++        }
+         // FFN L+1's input collapses with the mix attention L+1 computed (the carry), as A' does. FFN L+1's own mix
+         // only feeds what comes after it, so it is not built: its post and comb would be dead fused nodes, and one
+         // dead fused node made resolve_fused_ops turn the fused hc comb off for the whole graph (runs.md 4.42)
+@@ -2445,6 +2473,25 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     cb(inpL, "hc_init", -1);
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        // G32: the attention block of this layer, which the first half of layer il - 1 may leave out. Its inputs go into
++        // the graph first, so the nodes added from here to its copies below are the block's own (the engram included)
++        const bool g32_here  = mstream != nullptr && il > 0 && g32_pass[il].ok && mstream->layer(il - 1) != nullptr;
++        const bool g32_build = g32_here && g32_mode > 0;
++        ggml_tensor * const g32_topk_in = topk_carry_v;
++        ggml_tensor * const g32_cand_in = cand_carry_v;
++        int g32_n0 = 0;
++        if (g32_build) {
++            ggml_build_forward_expand(gf, inpL);
++            ggml_build_forward_expand(gf, hc_carry_v);
++            if (topk_carry_v != nullptr) {
++                ggml_build_forward_expand(gf, topk_carry_v);
++            }
++            if (cand_carry_v != nullptr) {
++                ggml_build_forward_expand(gf, cand_carry_v);
++            }
++            g32_n0 = ggml_graph_n_nodes(gf);
++        }
++
+         if (inp_engram) {
+             for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+                 if ((int) hparams.engram_layer_ids[e] != il) {
+@@ -2484,6 +2531,33 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         inpL = build_hc_post(cur, residual, post, comb, il);
+         cb(inpL, "hc_attn_post", il);
+ 
++        if (g32_here) {
++            const g32_pass_out & gp = g32_pass[il];
++            const bool topk_new = topk_carry_v != g32_topk_in;
++            llm_graph_g32 g;
++            g.il = il - 1;
++            if (g32_build && cand_carry_v == g32_cand_in && topk_new == (gp.k != nullptr)) {
++                // the block's results into the pass's tensors (views of them from here on): with the block left out of
++                // the compute, the pass's own values stand in them
++                inpL       = ggml_cpy(ctx0, inpL, gp.x);
++                hc_carry_v = ggml_cpy(ctx0, hc_carry_v, gp.c);
++                ggml_build_forward_expand(gf, inpL);
++                ggml_build_forward_expand(gf, hc_carry_v);
++                if (topk_new) {
++                    topk_carry_v = ggml_cpy(ctx0, topk_carry_v, gp.k);
++                    ggml_build_forward_expand(gf, topk_carry_v);
++                }
++                const int g32_n1 = ggml_graph_n_nodes(gf);
++                g.nodes.reserve((size_t) (g32_n1 - g32_n0));
++                for (int i = g32_n0; i < g32_n1; ++i) {
++                    g.nodes.push_back(ggml_graph_node(gf, i));
++                }
++            }
++            if (g32_mode == 0 || !g.nodes.empty()) {
++                res->g32.push_back(std::move(g)); // G32=0: counted only
++            }
++        }
++
+         residual = inpL;
+         cur = build_hc_pre(inpL,
+                 model.layers[il].hc_ffn_fn,
+@@ -2619,10 +2693,62 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
++    // SiegeLadder G32 (LLAMA_MOE_STREAM_G32_CHECK=1, a debugging aid): a block the first half may leave out of the
++    // compute must be read from outside only through its copies into the pass's tensors - a node built lazily inside
++    // the block's range and read later (a shared mask, an input's view made once) would be left out with it. Views
++    // pass through to what they view: a view inside the block of a tensor computed outside it is harmless
++    auto g32_check = [&]() {
++        static const bool on = getenv("LLAMA_MOE_STREAM_G32_CHECK") != nullptr && atoi(getenv("LLAMA_MOE_STREAM_G32_CHECK")) != 0;
++        if (!on) {
++            return;
++        }
++        const int n_nodes = ggml_graph_n_nodes(gf);
++        for (const auto & g : res->g32) {
++            if (g.nodes.empty()) {
++                continue;
++            }
++            std::unordered_set<const ggml_tensor *> in(g.nodes.begin(), g.nodes.end());
++            // the copies into the pass's tensors: CPY nodes whose destination is computed outside the block (they are not
++            // all at its end - expanding the carry's copy appends the carry's own nodes after the stream's copy)
++            std::unordered_set<const ggml_tensor *> copies;
++            for (const ggml_tensor * n : g.nodes) {
++                if (n->op == GGML_OP_CPY && n->view_src != nullptr && in.count(n->view_src) == 0) {
++                    copies.insert(n);
++                }
++            }
++            int n_bad = 0;
++            for (int i = 0; i < n_nodes; ++i) {
++                const ggml_tensor * t = ggml_graph_node(gf, i);
++                if (in.count(t) != 0) {
++                    continue;
++                }
++                for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                    for (const ggml_tensor * x = t->src[s]; x != nullptr; x = x->view_src) {
++                        const bool view = x->op == GGML_OP_VIEW || x->op == GGML_OP_RESHAPE ||
++                                          x->op == GGML_OP_PERMUTE || x->op == GGML_OP_TRANSPOSE;
++                        if (view) {
++                            continue; // its data is its view_src's
++                        }
++                        if (in.count(x) != 0 && copies.count(x) == 0) {
++                            if (n_bad++ < 4) {
++                                LLAMA_LOG_WARN("%s: G32 check: the block of layer %d - %s (%s) is read by %s (%s) outside it\n",
++                                        __func__, g.il + 1, x->name, ggml_op_desc(x), t->name, ggml_op_desc(t));
++                            }
++                        }
++                        break;
++                    }
++                }
++            }
++            LLAMA_LOG_WARN("%s: G32 check: the block of layer %d - %zu nodes, %zu copies, %d reads from outside\n",
++                    __func__, g.il + 1, g.nodes.size(), copies.size(), n_bad);
++        }
++    };
++
+     // SiegeLadder P1: while a long prompt runs the head's VRAM belongs to the compute buffers - the graph ends at
+     // the normed hidden state of the output rows, and the context computes their logits once the head is back
+     if (cparams.head_out) {
+         ggml_build_forward_expand(gf, cur);
++        g32_check();
+         return;
+     }
+ 
+@@ -2631,6 +2757,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     res->t_logits = cur;
+ 
+     ggml_build_forward_expand(gf, cur);
++    g32_check();
+ }
+ 
+ 

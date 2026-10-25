@@ -1,0 +1,409 @@
+From b60246c9cb0ccca3e37c7ebb6611aa99af0ff184 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:19:44 +0000
+Subject: [PATCH 53/91] moe-stream : the expert cache released for a long
+ prompt, the waves of all layers from one shared pool (SiegeLadder P11,
+ LLAMA_MOE_STREAM_P11=N, off by default) - a long prompt's -ub is held by VRAM
+ (the compute buffer grows ~0.68 MiB per token of -ub at 32K), and every
+ ubatch copies ~70% of the experts of every layer to the card (SiegeLadder
+ runs.md 4.83: 69 MB per token at -ub 1536, 21 MB at 6144). While P1's head
+ yield is out, the manager now releases the expert cache buffer as P1 releases
+ the head (p11_enter, after waiting until no load writes a slot and the upload
+ stream has landed), and points every streamed layer's cache tensors into one
+ pool of N slots ([ne0, ne1, N] per weight, all layers sharing it); a layer's
+ slot table starts empty at its first wave (wave_ids), since the pool held
+ other layers' experts in between - safe because the layers run one after
+ another and each wave's CPU split follows a synchronize of the compute
+ stream. While it is active every ubatch takes the wave path (a plan that fits
+ one pass runs as two waves): the remap path may run while the card still
+ reads the pool (the mailbox) and its table would be stale. p11_leave (in
+ p1_leave, after the CUDA pool is trimmed and before the head comes back)
+ allocates the cache again, empty. A wave holds N/2 experts instead of 8, so
+ the per-wave passes (clamp, swiglu, ids, quantize - more than the expert
+ GEMMs themselves at 17 slots, runs.md 4.83) fall 4x at N = 64. SiegeLadder
+ runs.md 4.85, consultant 30K (17 slots): -ub 1536 182.9 tok/s vs 157.9
+ (+16%); -ub 6144 with the tier at 44 GiB (the larger CUDA_Host inputs need
+ room in the shared WDDM budget) 276.9 tok/s, 107 s vs 187.5 (+75%), 0.47 TB
+ from the drive vs 1.41, waves 2 480 vs 38 520; decode after the document
+ unchanged. Not bit-exact against the per-layer cache (the waves' composition
+ changes MMQ's split, as the cache state already does): the answers diverge
+ after 190 / 298 characters, the base against itself after 18-79. The default
+ path is unchanged (o30: counters equal to the unit, text = trace)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    |   8 ++
+ src/llama-graph.cpp      |  11 ++
+ src/llama-moe-stream.cpp | 257 +++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-stream.h   |  21 ++++
+ 4 files changed, 297 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 34b8979..f76f671 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -956,6 +956,10 @@ void llama_context::p1_enter() {
+         ggml_backend_sched_synchronize(sched.get());
+     }
+     model.head_release();
++    // SiegeLadder P11 (LLAMA_MOE_STREAM_P11=N): the expert cache gives its room to the prompt's buffers too
++    if (auto * ms = model.moe_stream(); ms != nullptr && ms->p11_slots > 0) {
++        ms->p11_enter();
++    }
+     cparams.head_out   = true;
+     p1_full            = false;
+     sched_need_reserve = true; // decode reserves next: the -ub graphs without the head, in its room
+@@ -980,6 +984,10 @@ bool llama_context::p1_leave() {
+             trimmed += trim_fn(backend.get());
+         }
+     }
++    // SiegeLadder P11: the expert cache back (empty) before the head, in the room the prompt's buffers left
++    if (auto * ms = model.moe_stream(); ms != nullptr && ms->p11_active) {
++        ms->p11_leave();
++    }
+     double t_read_ms = 0.0;
+     if (!model.head_restore(&t_read_ms)) {
+         // no head, no logits for this call. The context keeps a scheduler - the head-less one, head_out stays set
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5872300..e446d05 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2422,6 +2422,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 skip_planned);
+         n_stream_waves  = wb.n_waves;
+         stream_wave_cap = wb.cap;
++        // SiegeLadder P11 (llama_moe_stream::p11_slots): with the cache released every ubatch takes the wave path. Its
++        // CPU split follows a synchronize of the compute stream; the remap path may not (the mailbox lets the host
++        // remap while the card still reads the pool), and its slot table would be stale. A ubatch that fits in one
++        // pass runs as two waves, the second empty
++        if (msl->mgr->p11_active && n_stream_waves < 2) {
++            const uint32_t n_dyn   = msl->n_slots - msl->mgr->pin_budget;
++            const uint64_t n_touch = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
++            stream_wave_cap = skip_planned ? n_dyn/2 : (n_dyn - (uint32_t) n_expert_used)/2;
++            n_stream_waves  = (uint32_t) std::max<uint64_t>(2, (n_touch + stream_wave_cap - 1)/stream_wave_cap);
++            msl->graph_shexp = nullptr; // the mailbox's early shared expert (decode) is the remap path's; the model adds it anyway
++        }
+     }
+ 
+     ggml_tensor * ids_gemm  = selected_experts;
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 2f04a0a..720701f 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -942,6 +942,10 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_SKIP_MIN")) {
+         skip_min_tokens = std::max<int64_t>(2, std::strtoll(s, nullptr, 10));
+     }
++    // SiegeLadder P11: the pool all layers' waves share while a long prompt runs with the cache released (header)
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_P11")) {
++        p11_slots = (uint32_t) std::max(0, atoi(s));
++    }
+ 
+     // Router bias toward resident experts. Read once here rather than per call so a run cannot
+     // change policy halfway through and leave counters that describe two different experiments.
+@@ -1701,6 +1705,250 @@ bool llama_moe_stream::read_bytes(uint32_t file_idx, size_t offs, size_t len,
+     return ok;
+ }
+ 
++// SiegeLadder P11 (see p11_slots in the header) -------------------------------------------------------------------
++
++void llama_moe_stream::p11_reset_layer_locked(llama_moe_stream_layer & sl, uint32_t n) {
++    // generations only grow, so a work item made for the old table can never match a slot of the new one
++    uint64_t g = 0;
++    for (const uint64_t x : sl.slot_gen) {
++        g = std::max(g, x);
++    }
++    sl.n_slots = n;
++    sl.slot_expert    .assign(n, -1);
++    sl.slot_state     .assign(n, LLAMA_MOE_STREAM_SLOT_EMPTY);
++    sl.slot_claimed   .assign(n, 0);
++    sl.slot_parts_left.assign(n, 0);
++    sl.slot_gen       .assign(n, g + 1);
++    sl.slot_last_use  .assign(n, 0);
++    sl.keep           .assign(n, 0);
++    sl.slot_pinned    .assign(n, 0);
++    sl.slot_staged    .assign(n, 0);
++    sl.slot_src       .assign(n, 0);
++    sl.slot_t_res     .assign(n, 0);
++    sl.slot_t_wait    .assign(n, 0);
++    sl.slot_wanted    .assign(n, 0);
++    sl.expert_slot.clear();
++    sl.demand_slots.clear();
++    sl.plan_pool.clear();
++    sl.ra_ids.clear();
++    sl.ra_pending = false;
++    sl.ra_valid   = false;
++}
++
++// no load that writes a cache slot is queued or in flight (a LOADING slot stays so until its copy is enqueued), the
++// stage dispatcher's deferred copies are made, and the upload stream has landed everything: the slots' memory is free
++static void moe_p11_quiesce_locked(llama_moe_stream & m, std::unique_lock<std::mutex> & lk) {
++    for (;;) {
++        {
++            std::lock_guard<std::mutex> up(m.upload_mtx);
++            m.flush_stage_copies_sync_locked();
++        }
++        bool idle = m.q_demand.empty() && m.q_stage.empty();
++        for (const auto & sl : m.layers) {
++            if (!idle) {
++                break;
++            }
++            if (sl) {
++                idle = std::find(sl->slot_state.begin(), sl->slot_state.end(),
++                        (uint8_t) LLAMA_MOE_STREAM_SLOT_LOADING) == sl->slot_state.end();
++            }
++        }
++        if (idle || m.load_failed) {
++            break;
++        }
++        m.cv_done.wait_for(lk, std::chrono::milliseconds(2));
++    }
++    if (m.load_failed) {
++        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++    }
++    std::lock_guard<std::mutex> up(m.upload_mtx);
++    if (m.up_backend != nullptr) {
++        ggml_backend_synchronize(m.up_backend);
++    }
++    for (const auto & p : m.up_l2_pending) {
++        if (m.l2) {
++            m.l2->release(p.second);
++        }
++    }
++    m.up_l2_pending.clear();
++    m.up_fenced = m.up_seq;
++}
++
++bool llama_moe_stream::p11_enter() {
++    if (p11_slots == 0 || p11_active) {
++        return p11_active;
++    }
++    const int64_t t0 = ggml_time_us();
++    std::unique_lock<std::mutex> lk(mtx);
++
++    // one pool serves every streamed layer: the same weights in each (types, shapes, bytes per expert), one CUDA buffer
++    // type, skipping waves, no JigSaw pins. P1's start-up probe comes here before the context attaches its backend
++    // (attach_backend is the constructor's last step): no uploads then, and no slot events to extend
++    const llama_moe_stream_layer * ref = nullptr;
++    for (const auto & sl : layers) {
++        if (sl) {
++            ref = sl.get();
++            break;
++        }
++    }
++    const char * why = nullptr;
++    if (ref == nullptr) {
++        why = "no streamed layer";
++    } else if (ctxs.size() != 1 || !skip_capable || !wave_skip) {
++        why = "the cache is not one CUDA buffer with skipping waves";
++    } else if (pin_budget > 0) {
++        why = "JigSaw pins are on";
++    } else if (p11_slots < ref->n_slots || p11_slots < llama_moe_stream_min_slots((uint32_t) std::max<int32_t>(ref->n_used, 6), false) ||
++               p11_slots >= ref->n_expert) {
++        why = "the pool must hold at least the per-layer cache and fewer slots than a layer has experts";
++    }
++    for (const auto & sl : layers) {
++        if (why != nullptr || !sl) {
++            continue;
++        }
++        if (sl->n_slots != ref->n_slots || sl->weights.size() != ref->weights.size()) {
++            why = "the layers' caches differ";
++            continue;
++        }
++        for (size_t w = 0; w < sl->weights.size(); w++) {
++            const ggml_tensor * a = sl->weights[w].cache;
++            const ggml_tensor * b = ref->weights[w].cache;
++            if (a->type != b->type || a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1] ||
++                    sl->weights[w].nb_expert != ref->weights[w].nb_expert) {
++                why = "the layers' expert tensors differ";
++            }
++        }
++    }
++    if (why != nullptr) {
++        LLAMA_LOG_WARN("%s: P11 off (%s); the prompt runs on the per-layer cache\n", __func__, why);
++        p11_slots = 0;
++        return false;
++    }
++
++    moe_p11_quiesce_locked(*this, lk);
++
++    const uint32_t P = p11_slots;
++    ggml_init_params params = {
++        /*.mem_size   =*/ ggml_tensor_overhead()*(ref->weights.size() + 1),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    p11_ctx.reset(ggml_init(params));
++    std::vector<ggml_tensor *> pool;
++    for (const auto & wt : ref->weights) {
++        ggml_tensor * t = ggml_new_tensor_3d(p11_ctx.get(), wt.cache->type, wt.cache->ne[0], wt.cache->ne[1], P);
++        ggml_format_name(t, "p11_pool.%d", (int) pool.size());
++        pool.push_back(t);
++    }
++
++    // the cache goes first: its room is where the pool and the prompt's buffers come
++    p11_saved_slots = ref->n_slots;
++    for (auto & sl : layers) {
++        if (sl) {
++            for (auto & wt : sl->weights) {
++                wt.cache->data   = nullptr;
++                wt.cache->buffer = nullptr;
++            }
++        }
++    }
++    bufs.clear();
++
++    ggml_backend_buffer_type_t buft = ctxs[0].first;
++    p11_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(p11_ctx.get(), buft));
++    if (!p11_buf) {
++        // after the cache's 6 GB came back this does not happen; the cache is made again and the prompt goes without
++        for (auto & [b, ctx] : ctxs) {
++            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), b);
++            GGML_ASSERT(buf != nullptr);
++            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            bufs.emplace_back(buf);
++        }
++        p11_ctx.reset();
++        LLAMA_LOG_WARN("%s: P11 off: the pool of %u slots could not be allocated\n", __func__, P);
++        p11_slots = 0;
++        return false;
++    }
++    ggml_backend_buffer_set_usage(p11_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    ggml_backend_dev_t dev = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
++    for (auto & sl : layers) {
++        if (!sl) {
++            continue;
++        }
++        for (size_t w = 0; w < sl->weights.size(); w++) {
++            ggml_tensor * c = sl->weights[w].cache;
++            c->ne[2]  = P;
++            c->nb[3]  = c->nb[2]*P;
++            c->data   = pool[w]->data;
++            c->buffer = pool[w]->buffer;
++        }
++        p11_reset_layer_locked(*sl, P);
++        // per-slot fences for the pool's slots; p11_leave frees the ones past the cache's own
++        if (slot_fence && dev != nullptr && !sl->slot_up_event.empty() && sl->slot_up_event.size() < P) {
++            const size_t n0 = sl->slot_up_event.size();
++            sl->slot_up_event.resize(P, nullptr);
++            sl->slot_up_seq  .resize(P, 0);
++            for (size_t s = n0; s < P; s++) {
++                sl->slot_up_event[s] = ggml_backend_event_new(dev);
++            }
++        }
++    }
++    p11_active = true;
++    p11_n_enter++;
++    p11_t_us += ggml_time_us() - t0;
++    if (p11_n_enter == 1) {
++        LLAMA_LOG_INFO("%s: P11: the expert cache (%u slots per layer) released for the prompt; the waves of all layers "
++                "share a pool of %u slots (%.1f MiB), %.1f ms\n", __func__, p11_saved_slots, P,
++                ggml_backend_buffer_get_size(p11_buf.get())/1048576.0, (ggml_time_us() - t0)/1000.0);
++    }
++    return true;
++}
++
++void llama_moe_stream::p11_leave() {
++    if (!p11_active) {
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    std::unique_lock<std::mutex> lk(mtx);
++    moe_p11_quiesce_locked(*this, lk);
++
++    const uint32_t n = p11_saved_slots;
++    for (auto & sl : layers) {
++        if (!sl) {
++            continue;
++        }
++        for (auto & wt : sl->weights) {
++            ggml_tensor * c = wt.cache;
++            c->ne[2]  = n;
++            c->nb[3]  = c->nb[2]*n;
++            c->data   = nullptr;
++            c->buffer = nullptr;
++        }
++        p11_reset_layer_locked(*sl, n); // the cache comes back empty
++        if (sl->slot_up_event.size() > n) {
++            for (size_t s = n; s < sl->slot_up_event.size(); s++) {
++                if (sl->slot_up_event[s] != nullptr) {
++                    ggml_backend_event_free(sl->slot_up_event[s]);
++                }
++            }
++            sl->slot_up_event.resize(n);
++            sl->slot_up_seq  .resize(n);
++        }
++    }
++    p11_buf.reset();
++    p11_ctx.reset();
++    for (auto & [buft, ctx] : ctxs) {
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
++        if (buf == nullptr) {
++            GGML_ABORT("MoE expert streaming: P11 could not allocate the expert cache again after the prompt");
++        }
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        bufs.emplace_back(buf);
++    }
++    p11_active = false;
++    p11_t_us += ggml_time_us() - t0;
++}
++
+ // spawn the I/O thread pool on first use (from the remap callback, under mtx)
+ void llama_moe_stream::start_workers_locked() {
+     if (workers_started) {
+@@ -2799,6 +3047,10 @@ void llama_moe_stream::print_stats(const char * role) const {
+         LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms, skipping = %" PRId64 "\n",
+                 __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0, stats.n_waves_skip);
+     }
++    if (p11_n_enter > 0) {
++        LLAMA_LOG_INFO("%s: %smoe stream: P11: %" PRId64 " prompts ran with the cache released and a shared pool of %u slots; "
++                "release and re-allocation %.1f ms in all\n", __func__, pfx, p11_n_enter, p11_slots, p11_t_us/1000.0);
++    }
+ 
+     print_locality(pfx);
+ }
+@@ -4547,6 +4799,11 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+     mgr->stats.n_wave_calls++;
+ 
+     if (w == 0) {
++        if (mgr->p11_active) {
++            // SiegeLadder P11: since this layer's last wave the shared pool held other layers' experts. This split
++            // follows a synchronize of the compute stream (its ids came from the card), so their GEMMs are done
++            mgr->p11_reset_layer_locked(*sl, sl->n_slots);
++        }
+         mgr->plan_waves_locked(*sl, ids, n);
+     }
+     GGML_ASSERT(sl->plan_next_wave == w); // waves must run in order (enforced by the graph ordering token)
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 53951e4..2dc575d 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -558,6 +558,27 @@ struct llama_moe_stream {
+     bool read_bytes(uint32_t file_idx, size_t offs, size_t len,
+             const std::function<void(const uint8_t * data, size_t off, size_t n)> & sink);
+ 
++    // SiegeLadder P11: while a long prompt runs with the output head out (P1), the expert cache buffer is released
++    // too - its VRAM goes to the prompt's compute buffers, so -ub can be several times larger - and the waves of every
++    // streamed layer draw from ONE pool of p11_slots slots: each layer's cache tensors point into the pool for the time
++    // being, and a layer's slot table starts empty at its first wave (in between the pool held other layers' experts;
++    // the layers run one after another, and each wave's CPU split follows a synchronize of the compute stream, so the
++    // previous layer's GEMMs are done before a slot is written again). After the prompt the cache is allocated again,
++    // empty. LLAMA_MOE_STREAM_P11=N - a pool of N slots (0 or unset - off)
++    uint32_t p11_slots  = 0;
++    bool     p11_active = false;
++    // called by P1 after the compute stream is synchronized; false - P11 not possible here, nothing changed
++    bool p11_enter();
++    // called by P1 after the compute buffers are freed and the CUDA pool trimmed; aborts if the cache does not fit
++    void p11_leave();
++    // a layer's first wave while P11 is active: its slot table for the pool, all slots empty (wave_ids, under mtx)
++    void p11_reset_layer_locked(llama_moe_stream_layer & sl, uint32_t n);
++    ggml_context_ptr        p11_ctx;          // the pool's tensors, one per weight of a layer, [ne0, ne1, p11_slots]
++    ggml_backend_buffer_ptr p11_buf;          // ... and their buffer while P11 is active
++    uint32_t                p11_saved_slots = 0;
++    int64_t                 p11_n_enter = 0;  // prompts that ran with the pool
++    int64_t                 p11_t_us    = 0;  // time spent releasing and re-allocating the cache
++
+     size_t size_bufs() const;
+ 
+     // role names the model instance this manager belongs to and is printed in front of every

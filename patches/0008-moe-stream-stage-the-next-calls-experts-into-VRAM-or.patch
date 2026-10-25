@@ -1,0 +1,556 @@
+From 7a62d7fa667fb599264cad6bb421196812286310 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:30:33 +0000
+Subject: [PATCH 08/91] moe-stream : stage the next calls' experts into VRAM
+ (oracle), keep-first victims, NVTX, read counters
+
+- Staging (A4b; LLAMA_MOE_STREAM_VRAM_AHEAD=V, oracle only for now): the remap of call c, after
+  queueing its own demand, reserves slots for the experts of calls c+1..c+V in their layers and queues
+  the loads on q_stage (after demand, before speculation; the demand-only workers take it first, the
+  speculating ones only when there is nothing to speculate). The uploads then run while the GPU
+  computes instead of after the next router. Staged experts still count as misses, and the stats say
+  how many were ready when their call came. Exact: same text as the trace. Oracle 200 calls ahead,
+  17 I/O threads: 10.2 -> 13.3 tok/s (medians); copies overlapping compute 0.00 -> 10.5 ms per token.
+- keep_first (on; LLAMA_MOE_STREAM_KEEP_FIRST=0 for A/B): the remap protects every slot its call reads
+  before picking a victim. Before, a miss early in the list could evict an expert that a later entry of
+  the same call needed, which was then read straight back. Misses 59614 -> 58220 on the same text.
+- LLAMA_MOE_STREAM_SPEC_VRAM=1 (off): speculate experts that are in VRAM now as well. Measured worse
+  (10.5 vs 13.2 tok/s): the extra reads push useful slabs out of the host tier.
+- NVTX ranges, free without a profiler (header-only NVTX3 from the CUDA toolkit, found by CMake):
+  remap / stall / speculate / stage / victim on the graph thread, l2 / read / upload.wait / upload /
+  spec on the I/O threads, payload = layer.
+- Drive-read counters: time inside the positional read per path, a coarse histogram and the average
+  number of reads in flight, printed with the stats.
+
+SiegeLadder runs.md 4.21.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/CMakeLists.txt       |  11 ++
+ src/llama-moe-stream.cpp | 231 +++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h   |  40 ++++++-
+ 3 files changed, 268 insertions(+), 14 deletions(-)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 7218f0d..4f3fb51 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -58,6 +58,17 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
+ 
++# NVTX ranges in the expert streaming path (llama-moe-stream.cpp), for Nsight Systems. NVTX3 is
++# header-only and ships with the CUDA toolkit; nothing is linked.
++if (GGML_CUDA)
++    find_package(CUDAToolkit QUIET)
++    find_path(LLAMA_NVTX3_INCLUDE_DIR nvtx3/nvToolsExt.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
++    if (LLAMA_NVTX3_INCLUDE_DIR)
++        target_include_directories(llama PRIVATE ${LLAMA_NVTX3_INCLUDE_DIR})
++        target_compile_definitions(llama PRIVATE LLAMA_MOE_STREAM_NVTX)
++    endif()
++endif()
++
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index ddec7bd..5e24409 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -23,6 +23,46 @@
+ #include <unistd.h>
+ #endif
+ 
++// NVTX ranges for Nsight Systems: where the remap op and the I/O workers spend a token. Header-only
++// NVTX3 from the CUDA toolkit, defined by CMake when it is found; without a profiler attached a range
++// costs one call through a null function pointer. The payload is the layer, so a report can be split
++// per layer.
++#ifdef LLAMA_MOE_STREAM_NVTX
++#ifdef _WIN32
++// nvtx3 includes <windows.h>, whose min/max macros would break std::min/std::max below
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#endif
++#include <nvtx3/nvToolsExt.h>
++
++static void moe_nvtx_push(const char * name, int32_t il) {
++    nvtxEventAttributes_t a = {};
++    a.version        = NVTX_VERSION;
++    a.size           = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
++    a.messageType    = NVTX_MESSAGE_TYPE_ASCII;
++    a.message.ascii  = name;
++    a.payloadType    = NVTX_PAYLOAD_TYPE_INT32;
++    a.payload.iValue = il;
++    nvtxRangePushEx(&a);
++}
++
++static void moe_nvtx_pop() {
++    nvtxRangePop();
++}
++#else
++static void moe_nvtx_push(const char *, int32_t) {}
++static void moe_nvtx_pop() {}
++#endif
++
++struct moe_nvtx_range {
++    moe_nvtx_range(const char * name, int32_t il) { moe_nvtx_push(name, il); }
++    ~moe_nvtx_range() { moe_nvtx_pop(); }
++};
++
+ static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 9;
+ static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 18;
+ static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
+@@ -447,6 +487,21 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                        "anticipation stays off\n", __func__);
+         spec_ahead = 0;
+     }
++    // A4b. Staging into VRAM slots ahead of the call; for now it takes the future from the oracle only.
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_VRAM_AHEAD")) {
++        vram_ahead = atoi(p);
++    }
++    if (vram_ahead > 0 && spec_oracle.empty()) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_VRAM_AHEAD is set but no oracle was loaded; "
++                       "staging stays off\n", __func__);
++        vram_ahead = 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_VRAM")) {
++        spec_vram = std::strtol(p, nullptr, 10) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_KEEP_FIRST")) {
++        keep_first = std::strtol(p, nullptr, 10) != 0;
++    }
+ 
+     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+     use_direct_io = direct;
+@@ -557,6 +612,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+         sl->keep         .resize(n_slots, 0);
+         sl->expert_pinned.resize(n_expert, 0);
+         sl->slot_pinned  .resize(n_slots, 0);
++        sl->slot_staged  .resize(n_slots, 0);
+         // JigSaw (21/08): marca os N primeiros da linha desta camada como pinaveis.
+         if (pin_budget > 0) {
+             const char * pl = std::getenv("LLAMA_MOE_STREAM_PIN_LIST");
+@@ -717,6 +773,19 @@ void llama_moe_stream::start_workers_locked() {
+     }
+ }
+ 
++// one positional read finished (see io_path in the header); lock-free, called by every worker
++void llama_moe_stream::io_record(bool spec, int64_t t0_us, int64_t t1_us, size_t nbytes) {
++    auto & p = io[spec ? 1 : 0];
++    const int64_t d = t1_us - t0_us;
++    p.n     += 1;
++    p.us    += d;
++    p.bytes += (int64_t) nbytes;
++    for (int64_t m = p.us_max.load(); d > m && !p.us_max.compare_exchange_weak(m, d);) {}
++    p.hist[d < 1000 ? 0 : d < 2000 ? 1 : d < 4000 ? 2 : d < 8000 ? 3 : d < 16000 ? 4 : 5] += 1;
++    for (int64_t f = io_first_us.load(); t0_us < f && !io_first_us.compare_exchange_weak(f, t0_us);) {}
++    for (int64_t l = io_last_us.load(); t1_us > l && !io_last_us.compare_exchange_weak(l, t1_us);) {}
++}
++
+ // I/O worker: pops a reserved load, reads its expert slab(s) from the GGUF file into the cache
+ // slot, and marks the slot RESIDENT (or flags load_failed); stale/duplicate items are skipped
+ void llama_moe_stream::worker_loop(int worker_id) {
+@@ -727,7 +796,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+ 
+     std::unique_lock<std::mutex> lk(mtx);
+     while (true) {
+-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() ||
++        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_stage.empty() ||
+                 (!q_spec.empty() && worker_id >= n_spec_workers_from); });
+         if (shutting_down) {
+             break;
+@@ -736,12 +805,23 @@ void llama_moe_stream::worker_loop(int worker_id) {
+         // Demand always first -- but that is only half of it. A worker already executing a
+         // speculative read cannot be preempted, so with every worker speculating a demand item
+         // still waits for a whole 5,98 MiB read. Some workers therefore never speculate at all.
+-        const bool from_spec = q_demand.empty() && worker_id >= n_spec_workers_from;
+-        llama_moe_stream_work w = from_spec ? q_spec.front() : q_demand.front();
+-        if (from_spec) {
+-            q_spec.pop_front();
+-        } else {
++        // Staged loads (A4b) go to the demand-only workers first and to the speculating ones only when
++        // there is nothing to speculate. Measured 2026-10-14 with staging ahead of speculation on every
++        // worker: the speculative queue overflowed (61 of 75 thousand slabs read), so half the staged
++        // experts had to be read from the drive on the way and arrived late. Uploads go one at a time
++        // under upload_mtx anyway, so the demand-only workers are enough to keep the copies flowing.
++        const bool may_spec = worker_id >= n_spec_workers_from;
++        llama_moe_stream_work w;
++        if (!q_demand.empty()) {
++            w = q_demand.front();
+             q_demand.pop_front();
++        } else if (!q_stage.empty() && (!may_spec || q_spec.empty())) {
++            w = q_stage.front();
++            q_stage.pop_front();
++        } else {
++            // the wait predicate admits an empty q_demand here only with q_spec open to this worker
++            w = q_spec.front();
++            q_spec.pop_front();
+         }
+ 
+         auto & sl = *w.sl;
+@@ -757,6 +837,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+             const size_t offs = wt.offs + (size_t) w.expert*wt.nb_expert;
+             bool encheu = false;
+             lk.unlock();
++            moe_nvtx_push("spec", sl.il);
+             // has(), not find(): a guess must not count as a hit of the tier nor mark the slab
+             // as recently used. find() does both, and both would be the guess grading itself.
+             if (l2->has(wt.file_idx, offs, wt.nb_expert)) {
+@@ -765,8 +846,10 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 size_t    slot_l2 = 0;
+                 uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2);
+                 if (dst != nullptr) {
++                    const int64_t t_io = ggml_time_us();
+                     const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], dst,
+                             wt.nb_expert, offs, use_direct_io, worker_id);
++                    io_record(/*spec =*/ true, t_io, ggml_time_us(), wt.nb_expert);
+                     if (data == nullptr) {
+                         // a failed speculative read is not an error: drop the slot and carry on
+                         l2->abandon(slot_l2);
+@@ -777,6 +860,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 }
+                 // dst == nullptr means every slot is in flight; the guess is simply dropped
+             }
++            moe_nvtx_pop();
+             lk.lock();
+             // Under the lock, like every other write to stats in this file. Left outside it,
+             // two speculating workers lose each other's increments and print_stats reads a
+@@ -816,7 +900,9 @@ void llama_moe_stream::worker_loop(int worker_id) {
+ 
+             // 1. host tier. A hit skips the drive entirely and uploads from page-locked memory. A slab
+             //    still LOADING (a speculative read, usually) is waited for rather than read twice.
++            moe_nvtx_push("l2", sl.il);
+             const uint8_t * data = l2 ? l2->find_wait(wt.file_idx, offs, wt.nb_expert, &pinned_slot) : nullptr;
++            moe_nvtx_pop();
+ 
+             if (data == nullptr) {
+                 // 2. drive. The read lands DIRECTLY in an L2 slot when one is free, so the tier
+@@ -826,8 +912,12 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 size_t    slot_l2 = 0;
+                 uint8_t * dst     = l2 ? l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2) : nullptr;
+ 
++                moe_nvtx_push("read", sl.il);
++                const int64_t t_io = ggml_time_us();
+                 data = llama_moe_stream_pread(*files[wt.file_idx], dst ? dst : staging,
+                         wt.nb_expert, offs, use_direct_io, worker_id);
++                io_record(/*spec =*/ false, t_io, ggml_time_us(), wt.nb_expert);
++                moe_nvtx_pop();
+ 
+                 if (dst != nullptr) {
+                     if (data == nullptr) {
+@@ -850,7 +940,10 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 // only the upload is serialised. See upload_mtx in the header for
+                 // the measurement that made this necessary.
+                 {
++                    moe_nvtx_push("upload.wait", sl.il);
+                     std::lock_guard<std::mutex> up(upload_mtx);
++                    moe_nvtx_pop();
++                    moe_nvtx_range r_upload("upload", sl.il);
+                     ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
+                 }
+                 // Only now is the memory free to be reused by someone else.
+@@ -953,16 +1046,18 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+     // worker finishing afterwards must not decrement this generation's counter.
+     sl.slot_parts_left[slot] = (uint16_t) sl.weights.size();
+     sl.slot_claimed[slot]    = 0;
++    sl.slot_staged[slot]     = 0; // stage_ahead_locked sets it again for its own reservations
+ }
+ 
+ // Queue one read per weight tensor of this slot. THE POINT OF THE SPLIT: a single
+ // item per expert meant one worker read 2-3 tensors in a for loop, strictly one at
+ // a time, which is the whole reason the drive saw a queue depth of 1.6. One item
+ // per tensor lets that many workers pull in parallel out of the same pool.
+-void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
++void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage) {
+     const int32_t n = (int32_t) sl.weights.size();
++    auto & q = stage ? q_stage : q_demand;
+     for (int32_t w = 0; w < n; w++) {
+-        q_demand.push_back({ &sl, expert, slot, sl.slot_gen[slot], w });
++        q.push_back({ &sl, expert, slot, sl.slot_gen[slot], w });
+     }
+     // notify_all, not notify_one: several items just arrived and one woken worker
+     // would take one and leave the rest queued behind a sleeping pool - exactly the
+@@ -1064,6 +1159,53 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+     }
+ }
+ 
++// A4b. Reserve cache slots for the experts of the next vram_ahead calls and queue their loads now,
++// while the GPU still has this layer's experts and the next layer's attention to compute, instead of
++// after the next router: the uploads then overlap compute rather than follow it. Measured 2026-10-14
++// (SiegeLadder runs.md 4.21, Nsight with the oracle 200 calls ahead): expert uploads took 37 ms of a
++// ~100 ms token and overlapped compute for 0.00 ms.
++//
++// Victims come from the target layer's own slots and never one its call needs. A target layer is
++// idle until its call: the graph synchronises on every remap, so nothing on the GPU still reads its
++// slots, and the call itself waits for RESIDENT as for any other load. Without an evictable slot the
++// expert is left to demand. Math is untouched: this moves when an upload happens, not what is read.
++void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
++    for (int64_t j0 = idx + 1; j0 <= idx + vram_ahead && j0 < (int64_t) spec_oracle.size(); j0++) {
++        const int32_t il_f = spec_oracle[(size_t) j0].first;
++        if (il_f == il_now || il_f < 0 || (size_t) il_f >= layers.size() || !layers[il_f]) {
++            continue; // never the running layer: its slots are about to be read
++        }
++        auto & sf = *layers[il_f];
++        const auto & experts = spec_oracle[(size_t) j0].second;
++
++        std::fill(sf.keep.begin(), sf.keep.end(), 0);
++        for (const int32_t e : experts) {
++            const auto it = sf.expert_slot.find(e);
++            if (it != sf.expert_slot.end()) {
++                sf.keep[it->second] = 1;
++            }
++        }
++        for (const int32_t e : experts) {
++            if (e < 0 || (uint32_t) e >= sf.n_expert || sf.expert_slot.count(e)) {
++                continue;
++            }
++            const int32_t v = pick_victim_locked(sf, sf.keep.data());
++            if (v < 0) {
++                stats.n_stage_skip++;
++                continue;
++            }
++            if (!sf.seen[e]) {
++                stats.n_miss_cold++; // counted here, since the call will find the slot already reserved
++            }
++            reserve_slot_locked(sf, e, v);
++            sf.slot_staged[v] = 1;
++            sf.keep[v]        = 1;
++            enqueue_slot_locked(sf, e, v, /*stage =*/ true);
++            stats.n_stage++;
++        }
++    }
++}
++
+ // Queue a host-tier fill for an expert this layer has NOT been asked for yet. Bounded, because
+ // a speculative queue longer than the drive can drain is a queue of guesses about the past.
+ void llama_moe_stream::speculate_locked(llama_moe_stream_layer & sl, int32_t expert) {
+@@ -1073,8 +1215,11 @@ void llama_moe_stream::speculate_locked(llama_moe_stream_layer & sl, int32_t exp
+     if (q_spec.size() >= spec_queue_max) {
+         return;
+     }
+-    // already in the cache: the graph will not have to read it at all
+-    if (sl.expert_slot.find(expert) != sl.expert_slot.end()) {
++    // already in the cache: the graph will not have to read it at all -- if it is still there when the
++    // call comes. With spec_vram it is read into the host tier anyway (the worker's has() skips what is
++    // already there): many calls ahead the VRAM slot is often evicted before use, and then the slab is
++    // read from the drive on the critical path (2026-10-14, oracle 200 calls ahead: ~27 such reads per token).
++    if (!spec_vram && sl.expert_slot.find(expert) != sl.expert_slot.end()) {
+         return;
+     }
+     const int32_t n = (int32_t) sl.weights.size();
+@@ -1184,6 +1329,12 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_spec_queued, stats.n_spec_filled,
+                 stats.n_spec_queued > 0 ? 100.0*(stats.n_spec_queued - stats.n_spec_filled)/stats.n_spec_queued : 0.0);
+     }
++    if (vram_ahead > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: staged %" PRId64 " experts into VRAM %d call(s) ahead: %" PRId64 " ready on arrival, "
++                "%" PRId64 " still loading, %" PRId64 " left to demand (no free slot)%s\n",
++                __func__, pfx, stats.n_stage, vram_ahead, stats.n_stage_ready, stats.n_stage_late, stats.n_stage_skip,
++                spec_vram ? "; speculating VRAM-resident experts too" : "");
++    }
+     if (n_shift > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: miss-only shift swapped %" PRId64 " experts (%" PRId64 " from the host tier)\n",
+                 __func__, pfx, n_shift, n_shift_l2);
+@@ -1195,6 +1346,26 @@ void llama_moe_stream::print_stats(const char * role) const {
+     }
+     LLAMA_LOG_WARN("%s: %smoe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
+             __func__, pfx, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
++    {
++        const int64_t wall = io_last_us.load() - io_first_us.load();
++        const int64_t n_all = io[0].n.load() + io[1].n.load();
++        if (n_all > 0 && wall > 0) {
++            LLAMA_LOG_WARN("%s: %smoe stream: drive reads = %" PRId64 ", %.2f GB in %.2f s (%.2f GB/s), %.2f in flight on average\n",
++                    __func__, pfx, n_all, (io[0].bytes.load() + io[1].bytes.load())/1e9, wall/1e6,
++                    (io[0].bytes.load() + io[1].bytes.load())/1e3/wall, (io[0].us.load() + io[1].us.load())/(double) wall);
++            for (int k = 0; k < 2; k++) {
++                const auto & p = io[k];
++                if (p.n.load() == 0) {
++                    continue;
++                }
++                LLAMA_LOG_WARN("%s: %smoe stream: drive reads (%s) = %" PRId64 ", avg %.2f ms, max %.2f ms; "
++                        "<1 / 1-2 / 2-4 / 4-8 / 8-16 / >=16 ms: %" PRId64 " / %" PRId64 " / %" PRId64 " / %" PRId64 " / %" PRId64 " / %" PRId64 "\n",
++                        __func__, pfx, k ? "speculative" : "demand+stage", p.n.load(), p.us.load()/1000.0/p.n.load(),
++                        p.us_max.load()/1000.0, p.hist[0].load(), p.hist[1].load(), p.hist[2].load(), p.hist[3].load(),
++                        p.hist[4].load(), p.hist[5].load());
++            }
++        }
++    }
+     LLAMA_LOG_INFO("%s: %smoe stream: slot wait = %.2f ms total over %" PRId64 " waits (%.1f%% of the two stalls)\n",
+             __func__, pfx, stats.t_victim_us/1000.0, stats.n_victim_waits,
+             (stats.t_victim_us + stats.t_stall_us) > 0 ? 100.0*stats.t_victim_us/(stats.t_victim_us + stats.t_stall_us) : 0.0);
+@@ -1472,6 +1643,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
++    moe_nvtx_range r_remap("remap", sl->il);
++
+     GGML_ASSERT(a->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(a));
+     GGML_ASSERT(ggml_are_same_shape(a, dst));
+@@ -1527,16 +1700,39 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+     std::fill(sl->keep.begin(), sl->keep.end(), 0);
+     sl->demand_slots.clear();
+ 
++    // Every slot this call reads is protected BEFORE the first victim is picked. Marked one by one in
++    // the loop below, a miss early in uniq could evict an expert that a later entry of the same call
++    // would have found resident, and that expert was then read straight back. Measured 2026-10-14
++    // (SiegeLadder runs.md 4.21): staging, which marks first, missed 2.3% less on the same text.
++    // LLAMA_MOE_STREAM_KEEP_FIRST=0 restores the old order, for A/B. The math is the same either way.
++    if (mgr->keep_first) {
++        for (const int32_t e : sl->uniq) {
++            const auto it = sl->expert_slot.find(e);
++            if (it != sl->expert_slot.end()) {
++                sl->keep[it->second] = 1;
++            }
++        }
++    }
++
+     bool waited = false;
+     for (const int32_t e : sl->uniq) {
+         const auto it = sl->expert_slot.find(e);
+         if (it != sl->expert_slot.end()) {
+             const int32_t s = it->second;
+-            if (sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++            const bool loading = sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING;
++            if (loading) {
+                 mgr->enqueue_slot_locked(*sl, e, s);
+                 waited = true;
+             }
+-            mgr->stats.n_hit++;
++            if (sl->slot_staged[s]) {
++                // staged ahead for this very call (A4b): still a miss of the cache as it stood, so the
++                // hit rate stays comparable with runs without staging; what changed is when it loaded
++                sl->slot_staged[s] = 0;
++                mgr->stats.n_miss++;
++                (loading ? mgr->stats.n_stage_late : mgr->stats.n_stage_ready)++;
++            } else {
++                mgr->stats.n_hit++;
++            }
+             if (sl->slot_pinned[s]) mgr->stats.n_hit_pin++;
+             sl->keep[s] = 1;
+             sl->demand_slots.push_back(s);
+@@ -1549,6 +1745,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+                 // loads are issued, so the stall timer below cannot cover it. the two answer
+                 // different questions - t_stall_us is time spent waiting on the disk, this is time
+                 // spent waiting for the cache to give a slot back. they call for opposite fixes.
++                moe_nvtx_range r_victim("victim", sl->il);
+                 const int64_t t0 = ggml_time_us();
+                 do {
+                     mgr->cv_done.wait(lk);
+@@ -1574,9 +1771,19 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+     // Only now, with every demand load queued, is it safe to spend time on guesses: this
+     // runs under the lock the workers take to pick work up, so anything done here before
+     // the demand is enqueued delays the very loads the graph is about to wait on.
++    moe_nvtx_push("speculate", sl->il);
+     mgr->trace_and_speculate_locked(*sl);
++    moe_nvtx_pop();
++
++    // Staging next (A4b): after this call's own demand, so its loads stay first in line, and before the
++    // wait, so the next call's uploads can start while this one still waits on the drive.
++    if (mgr->vram_ahead > 0) {
++        moe_nvtx_range r_stage("stage", sl->il);
++        mgr->stage_ahead_locked(mgr->spec_calls - 1, sl->il);
++    }
+ 
+     if (waited) {
++        moe_nvtx_range r_stall("stall", sl->il);
+         const int64_t t0 = ggml_time_us();
+         mgr->cv_done.wait(lk, [&]{
+             if (mgr->load_failed) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 432af8a..daa3ff0 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -5,6 +5,7 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
+@@ -106,6 +107,9 @@ struct llama_moe_stream_layer {
+     //   LLAMA_MOE_STREAM_PIN_N    = quantos por camada pinar (0 = desligado)
+     std::vector<uint8_t> expert_pinned; // [n_expert] 1 = pinar quando carregar
+     std::vector<uint8_t> slot_pinned;   // [n_slots]  1 = nunca despejar
++    // [n_slots] reserved by stage-ahead (A4b) for a call that has not run yet; cleared when that call
++    // finds it, and by any new reservation of the slot
++    std::vector<uint8_t> slot_staged;
+     std::vector<int32_t> demand_slots; // slots the current call waits on
+ 
+     // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
+@@ -429,6 +433,14 @@ struct llama_moe_stream {
+     int64_t spec_frontier  = -1;
+     // workers with id below this never take speculative work, so demand always has a pool
+     int32_t n_spec_workers_from = 0;
++    // A4b, staging into VRAM (LLAMA_MOE_STREAM_VRAM_AHEAD, oracle only for now). The remap of call c also
++    // reserves cache slots for the experts of calls c+1..c+vram_ahead and queues their loads, so the
++    // uploads run while the GPU computes instead of after the next router. 0 = off, the default.
++    int32_t vram_ahead     = 0;
++    // speculate experts that are in the VRAM cache too (LLAMA_MOE_STREAM_SPEC_VRAM=1); see speculate_locked
++    bool    spec_vram      = false;
++    // the remap protects every slot its call reads before picking a victim (LLAMA_MOE_STREAM_KEEP_FIRST=0: off)
++    bool    keep_first     = true;
+     // One entry per remap call, in call order: the layer it ran on and the experts it touched.
+     // The index IS the call number, so replay needs no notion of token boundary -- two runs of
+     // the same prompt issue the same calls in the same order.
+@@ -463,6 +475,11 @@ struct llama_moe_stream {
+ 
+     std::deque<llama_moe_stream_work> q_demand;
+ 
++    // Staged loads (A4b): cache slots already reserved for a call that has not run yet. Served after
++    // q_demand, so a load the graph waits on now goes first, and before q_spec; the call that finds its
++    // slot still LOADING re-queues it on q_demand, which promotes it.
++    std::deque<llama_moe_stream_work> q_stage;
++
+     // Drained only when q_demand is empty, so speculation can never delay a load the graph is
+     // waiting on. Bounded: a queue that grows faster than it drains is prefetching the past.
+     std::deque<llama_moe_stream_work> q_spec;
+@@ -474,6 +491,18 @@ struct llama_moe_stream {
+ 
+     bool debug = false;
+ 
++    // Drive reads as the workers see them: time inside the positional read, outside every lock, kept
++    // apart for the demand/stage path [0] and speculation [1]. Measured 2026-10-14 (SiegeLadder runs.md
++    // 4.21): the drive itself answered a 3 MB read in ~1 ms at ~2 in flight, while NVTX under Nsight put
++    // the workers at ~5 ms per read with ~11 of them inside it; these counters say which, without a profiler.
++    struct io_path {
++        std::atomic<int64_t> n{0}, us{0}, us_max{0}, bytes{0};
++        std::atomic<int64_t> hist[6] = {}; // <1, 1-2, 2-4, 4-8, 8-16, >=16 ms
++    };
++    io_path io[2];
++    std::atomic<int64_t> io_first_us{INT64_MAX}, io_last_us{0};
++    void io_record(bool spec, int64_t t0_us, int64_t t1_us, size_t nbytes);
++
+     struct {
+         int64_t n_calls     = 0; // remap invocations
+         int64_t n_hit       = 0; // touched experts already resident or loading
+@@ -482,6 +511,10 @@ struct llama_moe_stream {
+         int64_t n_miss_cold = 0; // first-ever touch of an expert
+         int64_t n_spec_queued = 0; // experts guessed ahead (A4)
+         int64_t n_spec_filled = 0; // of those, actually read into the host tier
++        int64_t n_stage       = 0; // experts staged into VRAM slots ahead of their call (A4b)
++        int64_t n_stage_ready = 0; // of those, RESIDENT when their call came
++        int64_t n_stage_late  = 0; // of those, still LOADING when their call came
++        int64_t n_stage_skip  = 0; // not staged: no evictable slot in the target layer
+         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
+ 
+         // wait for a free slot, which t_stall_us cannot see: it starts only once all demand loads
+@@ -508,8 +541,11 @@ struct llama_moe_stream {
+     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
+     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+     // queues one read per weight tensor and wakes the pool; see the .cpp for why
+-    // the split is what raises queue depth on a single stream
+-    void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
++    // the split is what raises queue depth on a single stream. stage = onto q_stage instead of q_demand
++    void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage = false);
++
++    // A4b: reserve slots and queue loads for the experts of calls idx+1..idx+vram_ahead
++    void stage_ahead_locked(int64_t idx, int32_t il_now);
+ 
+     // queue a host-tier-only fill for an expert not yet asked for
+     void speculate_locked(llama_moe_stream_layer & sl, int32_t expert);

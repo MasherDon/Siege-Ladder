@@ -1,0 +1,90 @@
+From ffd56ea93e498bd9f01a740d28c7a388ab9f4b5e Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 17:58:57 +0000
+Subject: [PATCH 13/91] moe-stream : waves of half the cache when the pairs of
+ other waves are skipped
+
+With skipping no slot is held back to park the pairs of other waves, so a wave now takes half the cache and
+the preload of the next wave the other half: 9 experts per wave instead of 6 at 18 slots and K = 6, a third
+fewer passes. Every pass runs the clamp, the swiglu and the sum of the wave outputs over the whole ubatch
+(a prefill profile at -ub 1024 put that at ~22% of the wave window, SiegeLadder runs.md 4.25), so fewer
+passes are faster even though each expert GEMM does the same work.
+
+DeepSeek V4.1-Flash Q2mix, prompts of 2159 / 8897 tokens, tok/s, 6 -> 9 experts per wave: -ub 2048
+116 / 146 -> 124 / 156, -ub 1024 83 / 100 -> 85 / 103, -ub 512 55 / 64 -> 57 / 66. KL against the -ub 512
+io-1 reference unchanged: mean 0, max 5.8e-5, same top-1 100%.
+
+The wave cap is planned before the first wave is built, so build_moe_ffn now makes the skip test up front
+(no bias, scale or LoRA after the down GEMM) and asserts that the built graph agrees. The node budget keeps
+the old, smaller cap: more waves, still an upper bound.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp    | 13 ++++++++++++-
+ src/llama-moe-stream.h | 11 +++++++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4f3f4f1..9efa43d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2288,10 +2288,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //   numbers to size its node budget and the two used to compute them separately
+     uint32_t n_stream_waves  = 1;
+     uint32_t stream_wave_cap = 0;
++    // the waves will skip the pairs of other waves: the same test as llama_moe_stream_wave_skip, made before the
++    //   first wave is built - its down GEMM must end the pipeline (no bias, scale or LoRA after it). Checked
++    //   against the built graph below, because a wave cap planned for skipping leaves no parking slots.
++    bool skip_planned = false;
+     if (msl) {
++        skip_planned = msl->mgr->wave_skip && (int64_t) n_tokens >= LLAMA_MOE_STREAM_SKIP_MIN_TOKENS &&
++                       down_exps_b == nullptr && down_exps_s == nullptr;
++        for (const auto & lora : *loras) {
++            skip_planned = skip_planned && lora.first->get_weight(down_exps) == nullptr;
++        }
+         // JigSaw: slots pinados nao sao reclamaveis pela vaga - o plano ve so os dinamicos
+         const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
+-                msl->n_slots - msl->mgr->pin_budget, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens);
++                msl->n_slots - msl->mgr->pin_budget, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens,
++                skip_planned);
+         n_stream_waves  = wb.n_waves;
+         stream_wave_cap = wb.cap;
+     }
+@@ -2484,6 +2494,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 // LoRA term applied after it would land on the zeroed rows of the skipped pairs
+                 msl->wave_skip_ok = e_w->op == GGML_OP_MUL_MAT_ID;
+                 wave_skip = llama_moe_stream_wave_skip(*msl, n_tokens);
++                GGML_ASSERT((wave_skip || !skip_planned) && "wave cap was planned for skipping, but the pairs cannot be skipped");
+             }
+ 
+             if (wave_skip) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index e96582c..b6a8790 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -205,8 +205,15 @@ struct llama_moe_stream_wave_budget {
+ //
+ // UNIT: experts. PRECONDITION: n_slots >= llama_moe_stream_min_slots(n_expert_used), enforced at
+ // resolve time. The assert below is an invariant, not the error path for a user's value.
++//
++// skip: the waves will skip the pairs of other waves (llama_moe_stream_wave_skip) instead of parking them.
++// Then no slot is held back for parking, and a wave takes half the cache while the preload of the next wave
++// takes the other half: cap n_slots/2 instead of (n_slots - n_expert_used)/2, 9 experts instead of 6 at 18
++// slots and K = 6, so a third fewer passes. Measured 2026-10-15 (SiegeLadder runs.md 4.25): every pass runs
++// the clamp, swiglu and the sum of the wave outputs over the whole ubatch, ~22% of a prefill at -ub 1024.
++// The node budget (graph_max_nodes) keeps calling this without skip: more waves, so still an upper bound.
+ static inline llama_moe_stream_wave_budget llama_moe_stream_wave_plan(
+-        uint32_t n_slots, uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens) {
++        uint32_t n_slots, uint32_t n_expert, uint32_t n_expert_used, uint32_t n_tokens, bool skip = false) {
+     llama_moe_stream_wave_budget b;
+ 
+     // worst-case distinct experts: n_expert_used per token, but never more than n_expert total.
+@@ -219,7 +226,7 @@ static inline llama_moe_stream_wave_budget llama_moe_stream_wave_plan(
+     GGML_ASSERT(n_slots >= llama_moe_stream_min_slots(n_expert_used));
+ 
+     b.split   = true;
+-    b.cap     = (n_slots - n_expert_used)/2;
++    b.cap     = skip ? n_slots/2 : (n_slots - n_expert_used)/2;
+     b.n_waves = (uint32_t) ((n_touch_max + b.cap - 1)/b.cap); // ceil(n_touch_max/cap)
+     return b;
+ }

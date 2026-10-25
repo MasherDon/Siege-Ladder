@@ -1,0 +1,58 @@
+From a0b230dfe65f948fe0100a038f9107a8bcf5f680 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:09:26 +0000
+Subject: [PATCH 38/91] llama-logits : --swa-window - with --score-file, the
+ sliding-window cache sized to its window as the server keeps it (swa_full
+ off; the context default is full-size, and at -c 32768 its 1.25 GiB of raw K
+ on V4.1 does not fit next to the experts under "Prefer No Sysmem Fallback").
+ SiegeLadder runs.md 4.61: ds4's router-112 (prompts up to 23 454 tokens) at
+ 32K, prompts in ubatches of 1536, one case scored at a time from a cleared
+ cache, so nothing rolls back past the window
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/logits/logits.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/tools/logits/logits.cpp b/tools/logits/logits.cpp
+index 9c13d34..a674121 100644
+--- a/tools/logits/logits.cpp
++++ b/tools/logits/logits.cpp
+@@ -504,6 +504,8 @@ static void uso(const char * exe) {
+     printf("  --tokenize-file F tokenize the lines of F with the vocabulary only (see the header comment)\n");
+     printf("  --score-file F    teacher-forced log-probabilities of many sequences, one model load\n");
+     printf("  --score-batch     with --score-file: the prompt and the target in one decode call\n");
++    printf("  --swa-window      with --score-file: the sliding-window cache sized to its window, as the server keeps it\n");
++    printf("                    (swa_full off; the context default is full-size, 1.25 GiB of raw K at 32K on V4.1)\n");
+     printf("  --top N           with --score-file: the N most likely ids per position (default 64)\n");
+     printf("  --override-kv K=int:N|float:X|bool:true   model metadata override, e.g. deepseek41.expert_used_count=int:5\n");
+     printf("  -ctk T, -ctv T    KV cache types (f16, bf16, q8_0, q4_0, q4_1, q5_0, q5_1, iq4_nl)\n");
+@@ -550,7 +552,7 @@ int main(int argc, char ** argv) {
+     std::string modelo, prompt, saida, lista_tokens, lista_camadas, lista_nos, arq_tokenize, arq_score;
+     int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0, moe_io_threads = 0;
+     int   moe_slots = 0, n_threads = 0, n_top = 64;
+-    bool  moe_stream = false, add_bos = true, moe_direct = false, score_batch = false;
++    bool  moe_stream = false, add_bos = true, moe_direct = false, score_batch = false, swa_window = false;
+     std::vector<llama_model_kv_override> kv_over;
+     ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
+ 
+@@ -581,6 +583,7 @@ int main(int argc, char ** argv) {
+         else if (a == "--tokenize-file")       arq_tokenize  = proximo("--tokenize-file");
+         else if (a == "--score-file")          arq_score     = proximo("--score-file");
+         else if (a == "--score-batch")         score_batch   = true;
++        else if (a == "--swa-window")          swa_window    = true;
+         else if (a == "--top")                 n_top         = std::max(1, std::min(256, atoi(proximo("--top").c_str())));
+         else if (a == "--layers")              lista_camadas = proximo("--layers");
+         else if (a == "--dump")                lista_nos     = proximo("--dump");
+@@ -666,6 +669,11 @@ int main(int argc, char ** argv) {
+         sp.n_batch  = (uint32_t) n_call;
+         sp.n_ubatch = (uint32_t) std::min(n_ubatch > 0 ? n_ubatch : 1, n_call);
+         sp.n_seq_max = 1;
++        // SiegeLadder 17.10 (router-112, prompts up to 23 454 tokens): a full-size sliding-window cache at -c 32768 does
++        // not fit next to the experts under "Prefer No Sysmem Fallback"; the server sizes it to the window (common's
++        // swa_full = false), and so does --swa-window. The cases are scored one at a time from a cleared cache, so
++        // nothing rolls back past the window
++        sp.swa_full  = !swa_window;
+         sp.type_k    = type_k;
+         sp.type_v    = type_v;
+         if (n_threads > 0) {

@@ -1,0 +1,401 @@
+From 0e05d7b64565be62767cbad1b40a6f12e7abe4e7 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 02:48:05 +0000
+Subject: [PATCH 15/91] moe-stream : stage the next layer's experts from the
+ model's own prediction (A'), opt-in
+
+DeepSeek V4.1: the graph of layer L computes A' for layer L+1 - the hyper-connection streams carried
+past FFN L and attention L+1 as if both returned zero, collapsed with the mix attention L+1 computes
+from them, then the router of L+1 (hash-routed layers route by token, exactly) - and hands it to the
+remap of layer L as a second input, so it reaches the host with the same sync. The remap stages the
+first LLAMA_MOE_STREAM_PRED_VRAM distinct predicted experts into VRAM slots of L+1, as the oracle's
+staging does, and reads the first LLAMA_MOE_STREAM_PRED_RAM into the host tier. Both are 0 by
+default, and then the graph is unchanged.
+
+A wasted stage is now also counted when its slot is taken back before its call: a wrong guess has the
+lowest route hotness of its layer, so the call's own misses usually evicted it before the count at the
+end of remap saw it (~9k of ~26k wasted stages per run were missed).
+
+DeepSeek V4.1-Flash Q2mix, 512 tokens, -ub 1, 17 I/O threads, tok/s (SiegeLadder runs.md 4.26): no
+staging 9.76 / 9.86; A' top 6 into VRAM 9.77 / 9.84 (60% of the misses staged, 42% of the staged not
+asked for); top 3 10.34; top 12 into the host tier 8.07. The oracle staging one call ahead without
+host-tier anticipation - the ceiling of any one-layer predictor - 14.25 / 14.40. Every answer equals
+the trace.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |  14 +++-
+ src/llama-moe-stream.cpp | 138 ++++++++++++++++++++++++++++++++-------
+ src/llama-moe-stream.h   |  24 +++++++
+ src/models/deepseek4.cpp |  39 +++++++++++
+ 4 files changed, 191 insertions(+), 24 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5c1c8d2..656a2a3 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2276,6 +2276,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // MoE expert streaming: make the selected experts cache-resident and remap the ids fed to the
+     //   expert GEMMs to cache slots; the routing itself (weights, scales, biases) keeps the original ids
+     llama_moe_stream_layer * msl = mstream ? mstream->layer(il) : nullptr;
++    // 3a: the model graph may have left a prediction of the next layer's experts for this layer's remap;
++    //   taken (and cleared) here whatever happens to it, so it cannot leak into another build
++    ggml_tensor * pred_next = nullptr;
++    if (msl) {
++        pred_next = msl->graph_pred_next;
++        msl->graph_pred_next = nullptr;
++    }
+     if (msl && !msl->matches(gate_exps, up_exps, down_exps, gate_up_exps)) {
+         msl = nullptr; // a different expert group of the same layer (e.g. grovemoe chexps), not streamed
+     }
+@@ -2309,7 +2316,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_tensor * ids_gemm = selected_experts;
+     if (msl && n_stream_waves == 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+-        ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
++        if (pred_next != nullptr) {
++            // the prediction rides to the host with this layer's ids: same op, same sync
++            ids_gemm = ggml_map_custom2(ctx0, ids_cont, ggml_cont(ctx0, pred_next), llama_moe_stream_remap_pred, 1, msl);
++        } else {
++            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
++        }
+         cb(ids_gemm, "ffn_moe_topk_stream", il);
+     }
+ 
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 4be9ea9..63f7246 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -496,6 +496,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                        "staging stays off\n", __func__);
+         vram_ahead = 0;
+     }
++    // 3a with the model's own prediction of the next layer (no oracle needed); see predict_locked
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_PRED_VRAM")) {
++        pred_vram = (uint32_t) std::max(0, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_PRED_RAM")) {
++        pred_ram = (uint32_t) std::max(0, atoi(p));
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_VRAM")) {
+         spec_vram = std::strtol(p, nullptr, 10) != 0;
+     }
+@@ -1053,6 +1060,12 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+     // worker finishing afterwards must not decrement this generation's counter.
+     sl.slot_parts_left[slot] = (uint16_t) sl.weights.size();
+     sl.slot_claimed[slot]    = 0;
++    // a staged slot taken back before its call asked for it was a wasted load too: a wrong guess has the
++    // lowest route hotness of its layer, so the call's own misses usually evict it before the count at the
++    // end of remap sees it (3a, 2026-10-15: ~9k of ~26k wasted stages went this way and were not counted)
++    if (sl.slot_staged[slot]) {
++        stats.n_stage_waste++;
++    }
+     sl.slot_staged[slot]     = 0; // stage_ahead_locked sets it again for its own reservations
+ }
+ 
+@@ -1182,35 +1195,79 @@ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+         if (il_f == il_now || il_f < 0 || (size_t) il_f >= layers.size() || !layers[il_f]) {
+             continue; // never the running layer: its slots are about to be read
+         }
+-        auto & sf = *layers[il_f];
+         const auto & experts = spec_oracle[(size_t) j0].second;
++        stage_experts_locked(*layers[il_f], experts.data(), experts.size());
++    }
++}
+ 
+-        std::fill(sf.keep.begin(), sf.keep.end(), 0);
+-        for (const int32_t e : experts) {
+-            const auto it = sf.expert_slot.find(e);
+-            if (it != sf.expert_slot.end()) {
+-                sf.keep[it->second] = 1;
+-            }
++void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n) {
++    std::fill(sf.keep.begin(), sf.keep.end(), 0);
++    for (size_t i = 0; i < n; i++) {
++        const auto it = sf.expert_slot.find(experts[i]);
++        if (it != sf.expert_slot.end()) {
++            sf.keep[it->second] = 1;
+         }
+-        for (const int32_t e : experts) {
+-            if (e < 0 || (uint32_t) e >= sf.n_expert || sf.expert_slot.count(e)) {
+-                continue;
+-            }
+-            const int32_t v = pick_victim_locked(sf, sf.keep.data());
+-            if (v < 0) {
+-                stats.n_stage_skip++;
+-                continue;
+-            }
+-            if (!sf.seen[e]) {
+-                stats.n_miss_cold++; // counted here, since the call will find the slot already reserved
++    }
++    for (size_t i = 0; i < n; i++) {
++        const int32_t e = experts[i];
++        if (e < 0 || (uint32_t) e >= sf.n_expert || sf.expert_slot.count(e)) {
++            continue;
++        }
++        const int32_t v = pick_victim_locked(sf, sf.keep.data());
++        if (v < 0) {
++            stats.n_stage_skip++;
++            continue;
++        }
++        if (!sf.seen[e]) {
++            stats.n_miss_cold++; // counted here, since the call will find the slot already reserved
++        }
++        reserve_slot_locked(sf, e, v);
++        sf.slot_staged[v] = 1;
++        sf.keep[v]        = 1;
++        enqueue_slot_locked(sf, e, v, /*stage =*/ true);
++        stats.n_stage++;
++    }
++}
++
++// 3a with a real predictor. pred is the model's guess of the next streamed layer's experts, [k, n_tok],
++// best first per token (DeepSeek V4.1: A' - the hyper-connection streams of layer L carried past FFN L
++// and attention L+1 as if both returned zero, then the router of L+1; 68-69% of the true six in its
++// top-6, 83-84% in its top-12; SiegeLadder runs.md 4.12). Distinct experts are taken in rank order over
++// the tokens; the first pred_vram per token are staged into VRAM slots of that layer exactly as the
++// oracle's staging does, the first pred_ram read ahead into the host tier. A wrong guess costs a load
++// and may evict an expert the call then misses; the math is untouched either way.
++void llama_moe_stream::predict_locked(const llama_moe_stream_layer & sl_now, const int32_t * pred, int64_t k, int64_t n_tok) {
++    llama_moe_stream_layer * sf = nullptr;
++    for (size_t il = (size_t) sl_now.il + 1; il < layers.size() && sf == nullptr; il++) {
++        sf = layers[il].get();
++    }
++    if (sf == nullptr || k <= 0 || n_tok <= 0) {
++        return;
++    }
++    stats.n_pred_calls++;
++
++    pred_seen.assign(sf->n_expert, 0);
++    pred_order.clear();
++    for (int64_t r = 0; r < k; r++) {
++        for (int64_t t = 0; t < n_tok; t++) {
++            const int32_t e = pred[t*k + r];
++            if (e >= 0 && (uint32_t) e < sf->n_expert && !pred_seen[e]) {
++                pred_seen[e] = 1;
++                pred_order.push_back(e);
+             }
+-            reserve_slot_locked(sf, e, v);
+-            sf.slot_staged[v] = 1;
+-            sf.keep[v]        = 1;
+-            enqueue_slot_locked(sf, e, v, /*stage =*/ true);
+-            stats.n_stage++;
+         }
+     }
++
++    const size_t n_vram = std::min(pred_order.size(), (size_t) pred_vram*(size_t) n_tok);
++    const size_t n_ram  = std::min(pred_order.size(), (size_t) pred_ram *(size_t) n_tok);
++    if (n_vram > 0) {
++        stage_experts_locked(*sf, pred_order.data(), n_vram);
++    }
++    // after staging: speculate_locked skips what now has a VRAM slot, so only the wider ranks are read ahead
++    for (size_t i = 0; i < n_ram; i++) {
++        speculate_locked(*sf, pred_order[i]);
++        stats.n_pred_spec++;
++    }
+ }
+ 
+ // Queue a host-tier fill for an expert this layer has NOT been asked for yet. Bounded, because
+@@ -1342,6 +1399,13 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_stage, vram_ahead, stats.n_stage_ready, stats.n_stage_late, stats.n_stage_skip,
+                 spec_vram ? "; speculating VRAM-resident experts too" : "");
+     }
++    if (stats.n_pred_calls > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: predicted the next layer on %" PRId64 " calls (top %u into VRAM, top %u read ahead): "
++                "staged %" PRId64 " experts - %" PRId64 " ready on arrival, %" PRId64 " still loading, %" PRId64 " not asked for, "
++                "%" PRId64 " left to demand (no free slot); %" PRId64 " offered to read ahead\n",
++                __func__, pfx, stats.n_pred_calls, pred_vram, pred_ram, stats.n_stage, stats.n_stage_ready,
++                stats.n_stage_late, stats.n_stage_waste, stats.n_stage_skip, stats.n_pred_spec);
++    }
+     if (n_shift > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: miss-only shift swapped %" PRId64 " experts (%" PRId64 " from the host tier)\n",
+                 __func__, pfx, n_shift, n_shift_l2);
+@@ -1641,12 +1705,25 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+     }
+ }
+ 
++static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred, void * userdata);
++
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith != 0) {
+         return;
+     }
++    moe_stream_remap_impl(dst, a, nullptr, userdata);
++}
++
++void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    moe_stream_remap_impl(dst, a, b, userdata);
++}
+ 
++static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred, void * userdata) {
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
+@@ -1655,6 +1732,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+     GGML_ASSERT(a->type == GGML_TYPE_I32);
+     GGML_ASSERT(ggml_is_contiguous(a));
+     GGML_ASSERT(ggml_are_same_shape(a, dst));
++    GGML_ASSERT(pred == nullptr || (pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred) && pred->ne[1] == a->ne[1]));
+ 
+     const int64_t n = ggml_nelements(a);
+ 
+@@ -1775,6 +1853,15 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+         }
+     }
+ 
++    // whatever was staged for this call and is still marked was not asked for: a wasted load (3a counts
++    // its misses here; the oracle never has any). Cleared so it cannot be counted again.
++    for (uint32_t s = 0; s < sl->n_slots; s++) {
++        if (sl->slot_staged[s]) {
++            sl->slot_staged[s] = 0;
++            mgr->stats.n_stage_waste++;
++        }
++    }
++
+     // Only now, with every demand load queued, is it safe to spend time on guesses: this
+     // runs under the lock the workers take to pick work up, so anything done here before
+     // the demand is enqueued delays the very loads the graph is about to wait on.
+@@ -1788,6 +1875,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+         moe_nvtx_range r_stage("stage", sl->il);
+         mgr->stage_ahead_locked(mgr->spec_calls - 1, sl->il);
+     }
++    // 3a with the model's own prediction of the next layer: same place, same reasons
++    if (pred != nullptr && mgr->pred_k() > 0) {
++        moe_nvtx_range r_pred("predict", sl->il);
++        mgr->predict_locked(*sl, (const int32_t *) pred->data, pred->ne[0], pred->ne[1]);
++    }
+ 
+     if (waited) {
+         moe_nvtx_range r_stall("stall", sl->il);
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index b6a8790..e9caa7e 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -68,6 +68,11 @@ struct llama_moe_stream_layer {
+ 
+     std::vector<llama_moe_stream_weight> weights; // 2 (fused gate_up + down) or 3 entries
+ 
++    // graph build only: the model's prediction of the NEXT layer's experts ([k, n_tokens] I32), set by the
++    // model graph right before build_moe_ffn of this layer and consumed (reset) there - see 3a in
++    // llama_moe_stream_remap_pred. Not runtime state; no lock.
++    ggml_tensor * graph_pred_next = nullptr;
++
+     // residency state, guarded by mgr->mtx
+     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
+     std::vector<uint8_t>                 slot_state;    // [n_slots] llama_moe_stream_slot_state
+@@ -444,6 +449,16 @@ struct llama_moe_stream {
+     // reserves cache slots for the experts of calls c+1..c+vram_ahead and queues their loads, so the
+     // uploads run while the GPU computes instead of after the next router. 0 = off, the default.
+     int32_t vram_ahead     = 0;
++    // 3a with a real predictor: the remap of layer L gets the model's prediction of layer L+1's experts
++    // (DeepSeek V4.1: A' - the hyper-connection streams carried past FFN L and attention L+1, then the
++    // router of L+1; SiegeLadder runs.md 4.12) and acts on it like staging: the first pred_vram distinct
++    // experts are staged into VRAM slots of L+1, the first pred_ram read from the drive into the host tier.
++    // LLAMA_MOE_STREAM_PRED_VRAM / LLAMA_MOE_STREAM_PRED_RAM; 0 = off, the default.
++    uint32_t pred_vram = 0;
++    uint32_t pred_ram  = 0;
++    uint32_t pred_k() const { return pred_vram > pred_ram ? pred_vram : pred_ram; }
++    std::vector<uint8_t> pred_seen;  // scratch of predict_locked, under mtx
++    std::vector<int32_t> pred_order;
+     // speculate experts that are in the VRAM cache too (LLAMA_MOE_STREAM_SPEC_VRAM=1); see speculate_locked
+     bool    spec_vram      = false;
+     // the remap protects every slot its call reads before picking a victim (LLAMA_MOE_STREAM_KEEP_FIRST=0: off)
+@@ -522,6 +537,9 @@ struct llama_moe_stream {
+         int64_t n_stage_ready = 0; // of those, RESIDENT when their call came
+         int64_t n_stage_late  = 0; // of those, still LOADING when their call came
+         int64_t n_stage_skip  = 0; // not staged: no evictable slot in the target layer
++        int64_t n_stage_waste = 0; // staged for a call that did not ask for the expert after all
++        int64_t n_pred_calls  = 0; // remap calls that acted on a prediction of the next layer (3a)
++        int64_t n_pred_spec   = 0; // predicted experts queued to read ahead into the host tier
+         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
+ 
+         // wait for a free slot, which t_stall_us cannot see: it starts only once all demand loads
+@@ -553,6 +571,10 @@ struct llama_moe_stream {
+ 
+     // A4b: reserve slots and queue loads for the experts of calls idx+1..idx+vram_ahead
+     void stage_ahead_locked(int64_t idx, int32_t il_now);
++    // reserve slots of layer sf and queue staged loads for these experts (the body of both staging paths)
++    void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n);
++    // 3a: act on the prediction of the next streamed layer after sl_now; pred is [k, n_tok] I32
++    void predict_locked(const llama_moe_stream_layer & sl_now, const int32_t * pred, int64_t k, int64_t n_tok);
+ 
+     // queue a host-tier-only fill for an expert not yet asked for
+     void speculate_locked(llama_moe_stream_layer & sl, int32_t expert);
+@@ -594,6 +616,8 @@ static inline bool llama_moe_stream_wave_skip(const llama_moe_stream_layer & sl,
+ 
+ // callback of the id-remapping custom op inserted by build_moe_ffn
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
++// the same, with b = the model's prediction of the next layer's experts ([k, n_tokens] I32; 3a)
++void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+ 
+ // Adds mgr->route_bias to the selection logits of every expert this layer currently holds
+ // (resident or loading), leaving masked-out entries at -inf untouched. Runs before top-k, so it
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 84a8f0b..f24eb2a 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1,6 +1,7 @@
+ #include "models.h"
+ 
+ #include "llama-kv-cache-dsv4.h"
++#include "llama-moe-stream.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -1704,6 +1705,39 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor *  hc_carry_v = nullptr;
+     ggml_tensor ** hc_carry   = hparams.dsv4_v41 ? &hc_carry_v : nullptr;
+ 
++    // 3a (SiegeLadder): the expert stream can act on a prediction of the next layer's experts, made where
++    //   this layer's remap already syncs with the host (LLAMA_MOE_STREAM_PRED_VRAM / _RAM). A' (SiegeLadder
++    //   runs.md 4.12; V4.1 only, it rests on the mix being carried one sublayer ahead): the streams after
++    //   attention L carried past FFN L and attention L+1 as if both returned zero, collapsed with the mix
++    //   attention L+1 computes from them, then the router of L+1. Hash-routed layers route by token: exact.
++    //   Only the remap reads it, so a graph whose remap does not (prefill waves) never computes it.
++    const uint32_t pred_k = (mstream != nullptr && hparams.dsv4_v41) ? mstream->pred_k() : 0;
++    auto build_pred_next = [&](ggml_tensor * residual, ggml_tensor * post, ggml_tensor * comb, int il) -> ggml_tensor * {
++        const int    iln = il + 1;
++        const auto & ln  = model.layers[iln];
++        if ((uint32_t) iln < hparams.dsv4_hash_layer_count) {
++            return ggml_get_rows(ctx0, ln.ffn_gate_tid2eid, res->t_inp_tokens);
++        }
++        ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f);
++        ggml_tensor * h1   = build_hc_post(zero, residual, post, comb, il); // past FFN L
++        ggml_tensor * post_a = nullptr;
++        ggml_tensor * comb_a = nullptr;
++        ggml_tensor * pre_a  = nullptr;
++        build_hc_pre(h1, ln.hc_attn_fn, ln.hc_attn_scale, ln.hc_attn_base, &post_a, &comb_a, iln, &pre_a);
++        ggml_tensor * h1m = build_hc_post(zero, h1, post_a, comb_a, iln);  // past attention L+1
++        ggml_tensor * u   = build_hc_pre(h1m, pre_a, iln);                 // FFN input of L+1, as the carry collapses it
++        u = build_norm(u, ln.ffn_norm, nullptr, LLM_NORM_RMS, iln);
++        ggml_tensor * logits = ggml_mul_mat(ctx0, ln.ffn_gate_inp, u);
++        ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
++        ggml_tensor * probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits));
++        if (ln.ffn_exp_probs_b) {
++            probs = ggml_add(ctx0, probs, ln.ffn_exp_probs_b);
++        }
++        ggml_tensor * pred = ggml_argsort_top_k(ctx0, probs, (int) pred_k);
++        cb(pred, "moe_pred_next", il);
++        return pred;
++    };
++
+     // the compressed positions the last index source picked, reused by the layers after it
+     ggml_tensor * topk_carry_v = nullptr;
+ 
+@@ -1770,6 +1804,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "ffn_norm", il);
+ 
++        // 3a: leave the prediction of layer il+1 for this layer's remap; build_moe_ffn takes it
++        if (pred_k > 0 && il + 1 < n_layer && mstream->layer(il) != nullptr && mstream->layer(il + 1) != nullptr) {
++            mstream->layer(il)->graph_pred_next = build_pred_next(residual, post, comb, il);
++        }
++
+         const auto & layer = model.layers[il];
+         ggml_tensor * selected_experts = nullptr;
+         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;

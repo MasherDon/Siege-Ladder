@@ -1,0 +1,226 @@
+From 188bd54341dd352b09bd0c74a0e3b64999ac40a1 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:22:57 +0000
+Subject: [PATCH 89/91] moe-stream : SiegeLadder G40c / G40d measurement knobs,
+ G40 quieter - LLAMA_MOE_STREAM_G40_TIER=1 (G40c): a G40 staging takes its
+ victim only among slots whose expert the host tier holds whole
+ (pick_victim_tier_locked; changes nothing in practice - the residents are
+ tier-backed already, runs.md 4.226); LLAMA_MOE_STREAM_G40_SRC=1 (G40d): stage
+ only experts the host tier holds whole - no staging from the drive (G40's
+ extra drops vanish, but so does half its gain, 4.227). G40 stays off by
+ default (k 0) with h 0.18 as the default threshold when enabled (k 2 h 0.18
+ measured best: +4.2...+5.2% decode; general-100 +0.0040 - the default is the
+ user's decision); the start-up line and the stats line say "G40:" (no longer
+ "measurement"), and with no lens (G35 off, or runahead in the exact preset)
+ an unasked G40 stays quiet
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 77 ++++++++++++++++++++++++++++++++--------
+ src/llama-moe-stream.h   | 26 ++++++++++----
+ 2 files changed, 82 insertions(+), 21 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index b011418..d2d655d 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1060,9 +1060,11 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
+         g35_lazy = std::max(0, std::min(2, atoi(p)));
+     }
+-    // SiegeLadder G40; see g40_k in the header (off by default, a measurement)
++    // SiegeLadder G40; see g40_k in the header (off by default until the user's decision; k 2, h 0.18 measured best)
++    bool g40_asked = false;
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40")) {
+-        g40_k = std::max(0, std::min(64, atoi(p)));
++        g40_k     = std::max(0, std::min(64, atoi(p)));
++        g40_asked = g40_k > 0;
+     }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_H")) {
+         g40_h = (float) std::strtod(p, nullptr);
+@@ -1070,14 +1072,25 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_LOW")) {
+         g40_low = atoi(p) != 0;
+     }
+-    if (g40_k > 0 && g35_depth <= 0) {
+-        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G40 needs G35's lens (LLAMA_MOE_STREAM_G35 > 0); ignored\n", __func__);
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_TIER")) {
++        g40_tier = atoi(p) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_SRC")) {
++        g40_src_tier = atoi(p) != 0;
++    }
++    if (g40_k > 0 && (g35_depth <= 0 || runahead_k > 0)) {
++        // no lens to stage from: quiet unless it was asked for
++        if (g40_asked) {
++            LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G40 needs G35's lens (G35 on, no runahead); ignored\n", __func__);
++        }
+         g40_k = 0;
+     }
+     if (g40_k > 0) {
+-        LLAMA_LOG_WARN("%s: moe stream: G40 (measurement): up to %d of the lens's best with a share of %.3f or more staged "
+-                "into VRAM %d calls ahead%s\n", __func__, g40_k, g40_h >= 0.0f ? g40_h : g35_h, g35_depth,
+-                g40_low ? ", onto q_stage_low (the bus's windows)" : "");
++        LLAMA_LOG_WARN("%s: moe stream: G40: up to %d of the lens's best with a share of %.3f or more staged into VRAM %d "
++                "calls ahead%s%s%s\n", __func__, g40_k, g40_h >= 0.0f ? g40_h : g35_h, g35_depth,
++                g40_low ? ", onto q_stage_low (the bus's windows)" : "",
++                g40_tier ? ", victims only among slots the host tier backs (G40c)" : "",
++                g40_src_tier ? ", only experts the host tier holds whole (G40d)" : "");
+     }
+     if (g35_depth > 0 && runahead_k > 0) {
+         LLAMA_LOG_INFO("%s: moe stream: G35 gives way to runahead (the graph builds no lens next to it)\n", __func__);
+@@ -2850,6 +2863,37 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const
+     return v;
+ }
+ 
++// SiegeLadder G40c: a staging's victim as pick_victim_locked picks it, but only among slots whose expert the host tier
++// holds whole - a miss on the evicted one later is a copy from RAM, never a drive read, so the drop rule (held in
++// neither tier) never drops it. The tier is asked only for a slot that would beat the best so far
++int32_t llama_moe_stream::pick_victim_tier_locked(llama_moe_stream_layer & sl, const uint8_t * keep) {
++    int32_t v = -1;
++
++    for (uint32_t s = 0; s < sl.n_slots; s++) {
++        if ((keep && keep[s]) || sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
++            continue;
++        }
++        if (!sl.slot_pinned.empty() && sl.slot_pinned[s]) {
++            continue;
++        }
++        if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_EMPTY) {
++            return s;
++        }
++        if (v >= 0) {
++            const uint32_t hs = sl.route_hotness[sl.slot_expert[s]];
++            const uint32_t hv = sl.route_hotness[sl.slot_expert[v]];
++            if (!(hs < hv || (hs == hv && sl.slot_last_use[s] < sl.slot_last_use[v]))) {
++                continue;
++            }
++        }
++        if (!on_drive_locked(sl, sl.slot_expert[s])) {
++            v = s;
++        }
++    }
++
++    return v;
++}
++
+ // bind expert -> slot and mark it LOADING: evict the slot's prior occupant, bump slot_gen (so any
+ // in-flight load for the old occupant is recognized as stale), and update the expert_slot index
+ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
+@@ -3256,7 +3300,7 @@ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+ }
+ 
+ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep,
+-        bool wrong, bool low) {
++        bool wrong, bool low, bool tier_victim) {
+     if (!add_keep) {
+         std::fill(sf.keep.begin(), sf.keep.end(), 0);
+     }
+@@ -3271,9 +3315,10 @@ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const i
+         if (e < 0 || (uint32_t) e >= sf.n_expert || sf.expert_slot.count(e)) {
+             continue;
+         }
+-        const int32_t v = pick_victim_locked(sf, sf.keep.data());
++        const int32_t v = tier_victim ? pick_victim_tier_locked(sf, sf.keep.data()) : pick_victim_locked(sf, sf.keep.data());
+         if (v < 0) {
+             stats.n_stage_skip++;
++            stats.n_g40_no_victim += tier_victim;
+             continue;
+         }
+         if (!sf.seen[e]) {
+@@ -3423,14 +3468,17 @@ void llama_moe_stream::g35_speculate(llama_moe_stream_layer & sl, const ggml_ten
+         g40_pick.clear();
+         for (int64_t k = 0; k < n_top && (int32_t) g40_pick.size() < g40_k; k++) {
+             const int32_t e = top[k];
+-            if ((double) sc[e] >= h*sum && st.expert_slot.find(e) == st.expert_slot.end()) {
++            // G40d (G40_SRC=1): only experts the host tier holds whole - no staging from the drive
++            if ((double) sc[e] >= h*sum && st.expert_slot.find(e) == st.expert_slot.end() &&
++                    (!g40_src_tier || !on_drive_locked(st, e))) {
+                 g40_pick.push_back(e);
+             }
+         }
+         if (!g40_pick.empty()) {
+             const int64_t s0 = stats.n_stage;
+             const int64_t d0 = stats.n_stage_drive;
+-            stage_experts_locked(st, g40_pick.data(), g40_pick.size(), /*add_keep =*/ false, /*wrong =*/ false, g40_low);
++            stage_experts_locked(st, g40_pick.data(), g40_pick.size(), /*add_keep =*/ false, /*wrong =*/ false, g40_low,
++                    /*tier_victim =*/ g40_tier);
+             stats.n_g40_staged += stats.n_stage - s0;
+             stats.n_g40_drive  += stats.n_stage_drive - d0;
+         }
+@@ -3728,10 +3776,11 @@ void llama_moe_stream::print_stats(const char * role) const {
+     }
+     if (g40_k > 0 || stats.n_low_served > 0) {
+         // SiegeLadder G40 / G39b: their ready / still loading / not asked for are in the "staged from the drive" line
+-        LLAMA_LOG_WARN("%s: %smoe stream: G40 (measurement): %" PRId64 " experts staged from the lens (%.2f a lens), %" PRId64
+-                " of them from the drive; %" PRId64 " slabs served from q_stage_low\n", __func__, pfx, stats.n_g40_staged,
++        LLAMA_LOG_WARN("%s: %smoe stream: G40: %" PRId64 " experts staged from the lens (%.2f a lens), %" PRId64
++                " of them from the drive; %" PRId64 " slabs served from q_stage_low; %" PRId64 " skipped for want of a "
++                "victim the host tier backs (G40c)\n", __func__, pfx, stats.n_g40_staged,
+                 stats.n_g35_posts > 0 ? (double) stats.n_g40_staged/stats.n_g35_posts : 0.0, stats.n_g40_drive,
+-                stats.n_low_served);
++                stats.n_low_served, stats.n_g40_no_victim);
+     }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 91f534f..67e8e9e 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -855,13 +855,22 @@ struct llama_moe_stream {
+     int32_t  g35_depth       = 2;
+     int32_t  g35_m           = 8;
+     float    g35_h           = 0.14f;
+-    // SiegeLadder G40 (LLAMA_MOE_STREAM_G40=k, a measurement, off by default; theories G40): G35's lens put to staging -
+-    // of the lens's G35_M best, up to k whose share of its top n_used is at least G40_H (default G35_H) and that hold no
+-    // VRAM slot are staged into the target layer's slots now, d = G35's depth calls before their call (as the oracle's
+-    // VRAM_AHEAD = d does with a perfect guess); G40_LOW=1 - onto q_stage_low (the bus's windows). The math is untouched
++    // SiegeLadder G40 (LLAMA_MOE_STREAM_G40=k, _H; theories G40): G35's lens put to staging - of the lens's G35_M best,
++    // up to k whose share of its top n_used is at least G40_H and that hold no VRAM slot are staged into the target
++    // layer's slots now, d = G35's depth calls before their call (as the oracle's VRAM_AHEAD = d does with a perfect
++    // guess); G40_LOW=1 - onto q_stage_low (the bus's windows: no gain, runs.md 4.221). The math is untouched, but in a
++    // preset with the drop rule its stagings evict hot residents the rule then drops (runs.md 4.225: +5% drops, general-100
++    // +0.0048) - G40_TIER=1 (G40c) takes a staging's victim only among slots whose expert the host tier holds whole, so a
++    // miss on it is a copy from RAM, never dropped. Off by default (k 0) until the user's decision; k 2, h 0.18 measured
++    // best (SiegeLadder runs.md 4.224: +5.2% cd default, +4.7% qd fast); with G35 off or giving way to runahead (the exact
++    // preset) there is no lens, and G40 stays off
+     int32_t  g40_k           = 0;
+-    float    g40_h           = -1.0f; // < 0: G35_H
++    float    g40_h           = 0.18f; // < 0: G35_H
+     bool     g40_low         = false;
++    bool     g40_tier        = false;
++    // G40d (LLAMA_MOE_STREAM_G40_SRC=1): stage only experts the host tier holds whole - no staging from the drive, whose
++    // reads fill the tier and compete with G35's reads ahead (runs.md 4.226: the extra drops of G40 are not its victims)
++    bool     g40_src_tier    = false;
+     std::vector<int32_t> g40_pick; // scratch of g35_speculate, under mtx
+     // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer
+     // before, it never makes the host wait (a lens exists only for L + d < the last layer + 1, so L + 1 always exists);
+@@ -1190,6 +1199,7 @@ struct llama_moe_stream {
+         // q_stage_low (G39b / G40)
+         int64_t n_g40_staged        = 0;
+         int64_t n_g40_drive         = 0;
++        int64_t n_g40_no_victim     = 0; // G40c: stagings skipped - no slot the host tier backs
+         int64_t n_low_served        = 0;
+         // M15: VRAM evictions by who took the slot (bind_why), and decode misses on an expert evicted <= 1 / 2-4 /
+         // 5-16 / > 16 tokens before, by who evicted it
+@@ -1305,6 +1315,8 @@ struct llama_moe_stream {
+     // makes the pool parallel rather than merely correct
+     void worker_loop(int worker_id);
+     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
++    // SiegeLadder G40c: the same order, only among slots whose expert the host tier holds whole; -1 - none such
++    int32_t pick_victim_tier_locked(llama_moe_stream_layer & sl, const uint8_t * keep);
+     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+     void note_regret_locked(const llama_moe_stream_layer & sl, int32_t expert);
+     // M12: is some slab of this expert missing from the host tier, so that its load reads the drive? Counts and marks
+@@ -1322,9 +1334,9 @@ struct llama_moe_stream {
+     void stage_ahead_locked(int64_t idx, int32_t il_now);
+     // reserve slots of layer sf and queue staged loads for these experts (the body of both staging paths);
+     // add_keep: protect them on top of the experts a previous staging of the same call protected; wrong: G39's wrong ones;
+-    // low: their loads onto q_stage_low (G39b / G40)
++    // low: their loads onto q_stage_low (G39b / G40); tier_victim: victims only among slots the host tier backs (G40c)
+     void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep = false,
+-            bool wrong = false, bool low = false);
++            bool wrong = false, bool low = false, bool tier_victim = false);
+     // 3a: act on the prediction of the next streamed layer after sl_now; pred is [k, n_tok] I32
+     void predict_locked(const llama_moe_stream_layer & sl_now, const int32_t * pred, int64_t k, int64_t n_tok);
+ 

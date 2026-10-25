@@ -1,0 +1,32 @@
+From 8837abf39c7cceb4b80a08fe45b902f978d2d8fb Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:02:00 +0000
+Subject: [PATCH 91/91] moe-stream : SiegeLadder - 17 I/O threads by default
+ (was 9): with the E: copy the agent's turns read +2.8% (A B B A on ade77bb:
+ turns 2-8 read in 62.4 / 62.8 s at 17 against 63.8 / 64.9 s at 9; wave stalls
+ -9%, 6.2 reads in flight against 3.7; answers the same - SiegeLadder runs.md
+ 4.230); every decode series has run at 17 since 15.10, so the server now
+ matches the published numbers. 9 against 17 before the copy was within noise
+ (4.100)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index be11781..c46cb1d 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -77,7 +77,10 @@ void llama_moe_stream_nvtx_pop() {
+     moe_nvtx_pop();
+ }
+ 
+-static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 9;
++// SiegeLadder 25.10 (twenty-sixth session): 17 by default, was 9 - with the E: copy the agent's turns read +2.8% at 17
++// (A B B A: wave stalls -9%, 6.2 reads in flight against 3.7; answers the same - runs.md 4.230); every decode series
++// has run at 17 since 15.10, so the server now matches the numbers. 9 against 17 before the copy was within noise (4.100)
++static const uint32_t MOE_STREAM_IO_THREADS_DEFAULT = 17;
+ static const uint32_t MOE_STREAM_IO_THREADS_MAX     = 18;
+ static const int64_t  MOE_STREAM_HOT_DECAY_TOKENS   = 64;
+ 

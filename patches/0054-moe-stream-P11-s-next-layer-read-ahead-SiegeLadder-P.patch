@@ -1,0 +1,122 @@
+From 568a978381f39042f5df9467f808f5c238e82852 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:48:32 +0000
+Subject: [PATCH 54/91] moe-stream : P11's next layer read ahead (SiegeLadder
+ P12, LLAMA_MOE_STREAM_P11_AHEAD=N, off by default) - in P11's profile at -ub
+ 6144 the drive stood idle in long gaps (median 188 ms) while the card did
+ attention, and the graph waited for loads 16-27% of the window (SiegeLadder
+ runs.md 4.85). At a layer's first wave the drive now starts on the next
+ layer's experts its previous ubatch touched, in their order, into the host
+ tier through the speculative queue (the reserved half of the workers, never
+ ahead of demand, bounded by spec_queue_max); unlike speculate_locked nothing
+ is skipped as resident in VRAM (the next layer's table is stale while the
+ pool is shared). The queue is dropped when the prompt ends. SiegeLadder
+ runs.md 4.86, consultant 30K with P11 (pool 64), N = 128: -ub 6144 / tier 44
+ 275.9 vs 276.9 tok/s (wave stall 19.1 vs 19.3 s, +48 GB of drive reads), -ub
+ 4608 / tier 45 273.4 vs 263.7 (+3.7%, wave stall 20.8 vs 27.6 s, +77 GB) -
+ single runs; so it stays off
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 42 +++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   |  7 +++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 720701f..1cb3a2e 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -946,6 +946,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_P11")) {
+         p11_slots = (uint32_t) std::max(0, atoi(s));
+     }
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_P11_AHEAD")) {
++        p11_ahead = (uint32_t) std::max(0, atoi(s));
++    }
+ 
+     // Router bias toward resident experts. Read once here rather than per call so a run cannot
+     // change policy halfway through and leave counters that describe two different experiments.
+@@ -1904,12 +1907,45 @@ bool llama_moe_stream::p11_enter() {
+     return true;
+ }
+ 
++void llama_moe_stream::p11_read_ahead_locked(const llama_moe_stream_layer & sl) {
++    if (!l2 || p11_ahead == 0) {
++        return;
++    }
++    llama_moe_stream_layer * next = nullptr;
++    for (size_t i = (size_t) sl.il + 1; i < layers.size() && next == nullptr; i++) {
++        next = layers[i].get();
++    }
++    if (next == nullptr) {
++        return; // the last streamed layer: the next ubatch's first layer is left to its own waves
++    }
++    // its slot table is stale (the pool has moved on), so unlike speculate_locked nothing is skipped as resident in VRAM;
++    // a slab already in the host tier the worker skips
++    const size_t n_w = next->weights.size();
++    const size_t n   = std::min<size_t>(p11_ahead, next->uniq.size());
++    for (size_t i = 0; i < n && q_spec.size() + n_w <= spec_queue_max; i++) {
++        for (size_t w = 0; w < n_w; w++) {
++            llama_moe_stream_work it;
++            it.sl     = next;
++            it.expert = next->uniq[i];
++            it.weight = (int32_t) w;
++            it.spec   = true;
++            q_spec.push_back(it);
++        }
++        stats.n_spec_queued += (int64_t) n_w;
++        p11_n_ahead++;
++    }
++    if (n > 0) {
++        cv_work.notify_all();
++    }
++}
++
+ void llama_moe_stream::p11_leave() {
+     if (!p11_active) {
+         return;
+     }
+     const int64_t t0 = ggml_time_us();
+     std::unique_lock<std::mutex> lk(mtx);
++    q_spec.clear(); // the prompt is over: what its read-ahead still had queued is a guess about the past
+     moe_p11_quiesce_locked(*this, lk);
+ 
+     const uint32_t n = p11_saved_slots;
+@@ -3049,7 +3085,8 @@ void llama_moe_stream::print_stats(const char * role) const {
+     }
+     if (p11_n_enter > 0) {
+         LLAMA_LOG_INFO("%s: %smoe stream: P11: %" PRId64 " prompts ran with the cache released and a shared pool of %u slots; "
+-                "release and re-allocation %.1f ms in all\n", __func__, pfx, p11_n_enter, p11_slots, p11_t_us/1000.0);
++                "release and re-allocation %.1f ms in all; %" PRId64 " experts of the next layer queued ahead (up to %u)\n",
++                __func__, pfx, p11_n_enter, p11_slots, p11_t_us/1000.0, p11_n_ahead, p11_ahead);
+     }
+ 
+     print_locality(pfx);
+@@ -4805,6 +4842,9 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+             mgr->p11_reset_layer_locked(*sl, sl->n_slots);
+         }
+         mgr->plan_waves_locked(*sl, ids, n);
++        if (mgr->p11_active) {
++            mgr->p11_read_ahead_locked(*sl); // the next layer's experts into the host tier while this one runs
++        }
+     }
+     GGML_ASSERT(sl->plan_next_wave == w); // waves must run in order (enforced by the graph ordering token)
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 2dc575d..d9137ca 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -578,6 +578,13 @@ struct llama_moe_stream {
+     uint32_t                p11_saved_slots = 0;
+     int64_t                 p11_n_enter = 0;  // prompts that ran with the pool
+     int64_t                 p11_t_us    = 0;  // time spent releasing and re-allocating the cache
++    // ... and the next layer read ahead while it runs (LLAMA_MOE_STREAM_P11_AHEAD=N experts, 0 - off): at a layer's first
++    // wave the drive starts on the next layer's experts its previous ubatch touched, into the host tier (speculative
++    // queue: the reserved half of the workers, never ahead of demand). A long prompt's ubatches touch most of a layer and
++    // mostly the same experts, and between a layer's waves the drive stands idle while the card does attention
++    uint32_t                p11_ahead   = 0;
++    int64_t                 p11_n_ahead = 0;  // experts queued ahead
++    void p11_read_ahead_locked(const llama_moe_stream_layer & sl);
+ 
+     size_t size_bufs() const;
+ 

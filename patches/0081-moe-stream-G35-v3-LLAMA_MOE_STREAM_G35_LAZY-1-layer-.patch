@@ -1,0 +1,74 @@
+From 4281949f7072976beb046ee99fed4a252071dd56 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 08:04:05 +0000
+Subject: [PATCH 81/91] moe-stream : G35 v3 - LLAMA_MOE_STREAM_G35_LAZY=1:
+ layer L's lens is read by layer L + 1's first half (posted a layer before,
+ the host never waits for record [1]; v2 still waited ~1.3 ms per token), so
+ G35=3 with it reads ahead as early as G35=2 without it. v2 measured: default
+ +4.1% (drive wait -3.9 ms per token = the oracle's ceiling, outside +1.8),
+ fast +3.4% (SiegeLadder twentieth session)
+
+---
+ src/llama-moe-stream.cpp | 24 +++++++++++++++++-------
+ src/llama-moe-stream.h   |  4 ++++
+ 2 files changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 97f3f1f..91c3b0d 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1044,10 +1044,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_H")) {
+         g35_h = std::max(0.0f, (float) std::strtod(p, nullptr));
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
++        g35_lazy = atoi(p) != 0;
++    }
+     if (g35_depth > 0) {
+         LLAMA_LOG_WARN("%s: moe stream: G35 (heavy-ahead, a measurement): the router lens %d calls ahead, its %d best, "
+-                "read ahead into the host tier from a share of %.3f (on G31's split at decode)\n", __func__, g35_depth,
+-                g35_m, g35_h);
++                "read ahead into the host tier from a share of %.3f (on G31's split at decode)%s\n", __func__, g35_depth,
++                g35_m, g35_h, g35_lazy ? "; lazy: each lens read by the next layer" : "");
+     }
+     // SiegeLadder C14, probe E1; see c14_q in the header. C14 proper (c14_real) takes the same keys but C14 for C14_Q
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_Q")) {
+@@ -5981,11 +5984,18 @@ void llama_moe_stream_remap_issue_g31_mb(ggml_tensor * dst, int ith, int nth, vo
+     d2.src[0] = &in0;
+     moe_stream_remap_issue_half(&d2, userdata, /*half =*/ 2);
+     // SiegeLadder G35: the lens of layer g35_target rides in record [1], posted after record [0] and the shared expert (the
+-    // card computed it while this half ran) - after this call's own loads are queued, its heavy experts are read ahead
+-    if (sl->g35_on && sl->mb_ne[1][0] > 0) {
+-        moe_mb_wait(*sl->mgr, *sl, 1);
+-        const ggml_tensor lens = moe_mb_tensor(*sl, 1);
+-        sl->mgr->g35_speculate(*sl, lens);
++    // card computed it while this half ran) - after this call's own loads are queued, its heavy experts are read ahead.
++    // G35_LAZY (v3): the lens of the layer before is read here instead - posted a whole layer ago, so nobody waits for
++    // it (one layer of lead is lost: G35=3 then reads ahead as early as G35=2 does without it)
++    llama_moe_stream & mgr = *sl->mgr;
++    llama_moe_stream_layer * owner = sl;
++    if (mgr.g35_lazy) {
++        owner = sl->il > 0 && (size_t) sl->il <= mgr.layers.size() ? mgr.layers[(size_t) sl->il - 1].get() : nullptr;
++    }
++    if (owner != nullptr && owner->g35_on && owner->mb_ne[1][0] > 0) {
++        moe_mb_wait(mgr, *owner, 1);
++        const ggml_tensor lens = moe_mb_tensor(*owner, 1);
++        mgr.g35_speculate(*owner, lens);
+     }
+ }
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index bad1070..e1c9223 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -835,6 +835,10 @@ struct llama_moe_stream {
+     int32_t  g35_depth       = 0;
+     int32_t  g35_m           = 8;
+     float    g35_h           = 0.14f;
++    // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer
++    // before, it never makes the host wait (a lens exists only for L + d < the last layer + 1, so L + 1 always exists);
++    // the read-ahead starts a layer later, so G35=3 with it leads as G35=2 without it
++    bool     g35_lazy        = false;
+     // the first half of G31 with a lens in record [1]: the shares and the read-ahead (takes mtx)
+     void g35_speculate(llama_moe_stream_layer & sl, const ggml_tensor & lens);
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it

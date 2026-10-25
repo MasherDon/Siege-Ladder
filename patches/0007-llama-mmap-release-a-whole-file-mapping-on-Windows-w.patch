@@ -1,0 +1,79 @@
+From 3aa63fac78ff138f50f4ec5eeccd54e94b884b84 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 19:30:22 +0000
+Subject: [PATCH 07/91] llama-mmap : release a whole file mapping on Windows
+ when no host tensor is left in it
+
+The loader already asks to unmap the parts of each file that no host-resident tensor uses; on Windows
+unmap_fragment was a no-op. When the request covers the whole file (every tensor went to a device or is
+streamed), the view and the section handle are now released, and the loader says how many files it let go.
+
+It is a speed fix, not tidiness: while a file is mapped, NTFS checks every unbuffered read of it against
+the section and readers of one file queue behind each other. Measured on DeepSeek V4.1-Flash Q2mix with
+expert streaming (SiegeLadder runs.md 4.21): 11 readers on one expert file, 13.5 GB/s unmapped vs 4.5
+mapped. With the fix the streaming workers read 8.1 GB/s instead of 6.7 (3.5 ms per 3 MB read instead
+of 5.5), and decode with the oracle went 10.2 -> 12.3 tok/s (13.3 -> 15.5 with staging into VRAM).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-mmap.cpp         | 21 +++++++++++++++++++--
+ src/llama-model-loader.cpp |  6 ++++++
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 20f54b3..e9ef241 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -1005,9 +1005,26 @@ struct llama_mmap::impl {
+         }
+     }
+ 
++    // Windows cannot release part of a view, only the whole one - and the loader asks for exactly that
++    // when no tensor kept in host memory lives in this file (all of them went to a device or are streamed):
++    // first == 0, last == size. Releasing it is not just tidiness. While a file is mapped, NTFS checks every
++    // unbuffered read of it against the mapped section, and readers of one file queue behind each other:
++    // measured 2026-10-14 (SiegeLadder runs.md 4.21), 11 readers on one expert file got 13.5 GB/s unmapped
++    // and 4.5 GB/s mapped, and the expert streaming workers sat ~5.5 ms in each 3 MB read while the drive
++    // itself answered in ~1 ms.
+     void unmap_fragment(size_t first, size_t last) {
+-        GGML_UNUSED(first);
+-        GGML_UNUSED(last);
++        if (first != 0 || last < size || addr == nullptr) {
++            return;
++        }
++        if (!UnmapViewOfFile(addr)) {
++            LLAMA_LOG_WARN("warning: UnmapViewOfFile failed: %s\n", llama_format_win_err(GetLastError()).c_str());
++            return;
++        }
++        addr = nullptr;
++        if (hMapping && !CloseHandle(hMapping)) {
++            LLAMA_LOG_WARN("warning: CloseHandle failed: %s\n", llama_format_win_err(GetLastError()).c_str());
++        }
++        hMapping = nullptr;
+     }
+ 
+     ~impl() {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 551325b..560e83b 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1703,6 +1703,7 @@ bool llama_model_loader::load_all_data(
+     if (size_done >= size_data) {
+         // unmap offloaded tensors and metadata
+         if (use_mmap) {
++            uint32_t n_released = 0;
+             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
+                 const auto & mmap_used = mmaps_used.at(idx);
+                 auto & mapping = mappings.at(idx);
+@@ -1710,6 +1711,11 @@ bool llama_model_loader::load_all_data(
+                 if (mmap_used.second != 0) {
+                     mapping->unmap_fragment(mmap_used.second, mapping->size());
+                 }
++                n_released += mapping->addr() == nullptr; // nothing of this file stays in host memory
++            }
++            if (n_released > 0) {
++                LLAMA_LOG_WARN("%s: released the whole mapping of %u of %zu files (no host-resident tensor in them)\n",
++                        __func__, n_released, mappings.size());
+             }
+         }
+         if (progress_callback) {

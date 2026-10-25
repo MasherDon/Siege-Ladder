@@ -1,0 +1,1350 @@
+From e7229d701bf575522493875814cc6c9110a810b6 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 05:15:57 +0000
+Subject: [PATCH 76/91] moe-stream, llama-graph, deepseek4 : G31 - the remap
+ split in two without runahead's pass (LLAMA_MOE_STREAM_G31=1; bit for bit,
+ runs.md 4.145), G34 keys (LLAMA_MOE_STREAM_SPEC_WORKERS / SPEC_IDLE /
+ DROP_SPEC), C14 probe E1 (LLAMA_MOE_STREAM_C14_Q / _N / _SEL / _SKIP / _DROP
+ / _DEPTH) and C14 proper (LLAMA_MOE_STREAM_C14: deferred pairs not waited
+ for, their GEMMs after the next layer's attention through c14_wait and reply
+ record [2]), D14 counters (the E: copy's read latency,
+ LLAMA_MOE_STREAM_SLOW_READ_MS) - all off by default (SiegeLadder seventeenth
+ session)
+
+---
+ src/llama-graph.cpp      | 129 +++++++++-
+ src/llama-moe-stream.cpp | 526 ++++++++++++++++++++++++++++++++++++---
+ src/llama-moe-stream.h   | 110 +++++++-
+ src/models/deepseek4.cpp |  51 ++++
+ 4 files changed, 773 insertions(+), 43 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5a87858..c4142f3 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3099,26 +3099,32 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // ... and the card's copies of them: the same tensors, or the reply's (G22)
+     ggml_tensor * ra_ids_dev  = nullptr;
+     ggml_tensor * ra_mask_dev = nullptr;
++    // SiegeLadder G31 (LLAMA_MOE_STREAM_G31=1): this call's remap is split in two without runahead's pass - ra_ids is the
++    // first half's output then, and the expert GEMMs below run in two launches (decided with the remap's path below)
++    bool g31_split = false;
+     // SiegeLadder G22 (on by default; LLAMA_MOE_STREAM_MBOX_REPLY=0 - off): the remap's answers - the slot ids and the
+     // multipliers, CPU tensors - go back to the card through the layer's reply record k: an op on the remap's host
+     // split writes them with the number of the post they answer, and ggml_mbox_read at the head of the next card split
+     // gives the card its own copies, so that split has no input from the host (see llama_moe_stream_reply_0). Built
+     // only where msl->rp_on is set
+     auto rp_read = [&](int k, ggml_tensor * a, ggml_tensor * b, ggml_tensor ** a_dev, ggml_tensor ** b_dev) {
++        // SiegeLadder G31: its second half answers through record [1] the only post of the call, [0]
++        const int k_post = g31_split ? 0 : k;
+         ggml_tensor * args[2] = { a, b };
+         ggml_tensor * w = ggml_custom_4d(ctx0, GGML_TYPE_I32, 1, 1, 1, 1, args, b != nullptr ? 2 : 1,
+-                k == 0 ? llama_moe_stream_reply_0 : llama_moe_stream_reply_1, 1, msl);
++                k == 0 ? llama_moe_stream_reply_0 : k_post == 0 ? llama_moe_stream_reply_1_g31 : llama_moe_stream_reply_1,
++                1, msl);
+         ggml_build_forward_expand(gf, w);
+         const int32_t off_b = (int32_t) (64 + GGML_PAD(ggml_nbytes(a), 64));
+         GGML_ASSERT(off_b + (b != nullptr ? ggml_nbytes(b) : 0) <= LLAMA_MOE_STREAM_RP_REC_BYTES &&
+                 "G22: the reply outgrows its record");
+         void * err = (void *) msl->mgr->rp_err;
+         *a_dev = ggml_mbox_read(ctx0, a->type, a->ne[0], a->ne[1], a->ne[2], a->ne[3], msl->rp_rec[k], 64,
+-                msl->mb_rec[k], err, a->type == GGML_TYPE_I32 ? INT32_MAX : 0, msl->il*4 + k*2 + 1);
++                msl->mb_rec[k_post], err, a->type == GGML_TYPE_I32 ? INT32_MAX : 0, msl->il*4 + k*2 + 1);
+         ggml_build_forward_expand(gf, *a_dev);
+         if (b != nullptr) {
+             *b_dev = ggml_mbox_read(ctx0, b->type, b->ne[0], b->ne[1], b->ne[2], b->ne[3], msl->rp_rec[k], off_b,
+-                    msl->mb_rec[k], err, b->type == GGML_TYPE_I32 ? INT32_MAX : 0, msl->il*4 + k*2 + 2);
++                    msl->mb_rec[k_post], err, b->type == GGML_TYPE_I32 ? INT32_MAX : 0, msl->il*4 + k*2 + 2);
+             ggml_build_forward_expand(gf, *b_dev);
+         }
+     };
+@@ -3198,6 +3204,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 ggml_build_forward_expand(gf, msl->graph_shexp);
+             }
+         };
++        // SiegeLadder G31 (LLAMA_MOE_STREAM_G31=1, off by default; see g31 in llama_moe_stream): where the single remap
++        // would run at decode with the mailbox and its reply (G16 / G22), without C13 or a prediction to carry, and the
++        // expert pipeline ends in the down GEMM (skipped pairs, as the waves and G30) - the ctor leaves g31 off next to
++        // runahead, C13, the G4 probe and VRAM_ONLY=2
++        {
++            bool lora_down = false;
++            for (const auto & lora : *loras) {
++                lora_down = lora_down || lora.first->get_weight(down_exps) != nullptr;
++            }
++            g31_split = msl->mgr->g31 > 0 && !moe_runahead && msl->rp_on && n_tokens == 1 && !weight_before_ffn &&
++                    pred_next == nullptr && !c13 && n_expert_used == (int64_t) hparams.n_expert_used &&
++                    msl->mgr->skip_capable && down_exps_b == nullptr && down_exps_s == nullptr && !lora_down;
++        }
+         if (moe_runahead && msl->mgr->runahead_k > 0 && n_tokens == 1 && !weight_before_ffn && pred_next == nullptr &&
+                 n_expert_used == (int64_t) hparams.n_expert_used) {
+             // the remap in two halves: the first queues the call's loads and returns at once with the slots of its
+@@ -3227,6 +3246,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     llama_moe_stream_drop_mask, 1, msl);
+             cb(ra_mask, "ffn_moe_runahead_mask", il);
+             ggml_build_forward_expand(gf, ra_mask);
++        } else if (g31_split) {
++            // SiegeLadder G31, the first half: the remap up to its wait - the call's loads queued, the drop rule decided
++            // (its multipliers kept for the second half) - and at once the slots of the pairs resident now, the skip id
++            // for the others. No multipliers here: nothing is weighted before the second half
++            ggml_tensor * iargs[2] = { nullptr, nullptr };
++            int n_iargs = 0;
++            if (drop_path) {
++                add_ids_weights(iargs, n_iargs); // packed: rp_on needs the mailbox, and the mailbox the packing
++            } else {
++                iargs[n_iargs++] = ids_cont;
++            }
++            mb_post(0, iargs[0]);
++            mb_shexp();
++            ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, nullptr, 0,
++                    llama_moe_stream_remap_issue_g31_mb, 1, msl);
++            cb(ra_ids, "ffn_moe_topk_g31", il);
++            ggml_build_forward_expand(gf, ra_ids);
+         } else if (drop_path && !weight_before_ffn) {
+             // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, on by default since 18.10: 0.14 with DROP_ALL; DROP_W=0 is the
+             // exact path): the remap also needs this call's
+@@ -3536,7 +3572,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+     } else {
+         ggml_tensor * e_rows = nullptr; // G30: the approximate pass's down output, which the exact GEMMs complete
+-        if (ra_ids != nullptr) {
++        if (g31_split) {
++            // SiegeLadder G31: the expert GEMMs in two launches, without runahead's pass. The first runs on the first half's
++            // slots - the pairs resident when it ended; the others carry the skip id and their rows stay unwritten
++            // (op_params[2] stays 0: nothing reads them before the second launch writes them) - on a card split of its own,
++            // which the host launches before the second half sleeps on the call's loads: these GEMMs run while the copies
++            // fly. The second half gives those pairs the skip id and every other pair its slot - a pair the drop rule took
++            // out a kept slot of its token, as the single remap does - and its GEMMs write their rows into this output
++            // (ggml_mul_mat_id_into, G30). A row is the one the single launch computes: the same slot, input and kernel
++            // (MMVQ computes each pair in blocks of its own, the quantized input per row); the multipliers - the single
++            // remap's, moved to exact_mask - and the weighted sum below are unchanged
++            e_rows = build_expert_gemms(cur, ra_ids_dev, nullptr);
++            GGML_ASSERT(e_rows->op == GGML_OP_MUL_MAT_ID && "G31: the expert pipeline must end in the down GEMM");
++            cb(e_rows, "ffn_moe_down_first", il);
++            ggml_build_forward_expand(gf, e_rows); // before the second half in node order, so on a card split before it
++            ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, &ra_ids, 1,
++                    llama_moe_stream_remap_wait_g31, 1, msl);
++            cb(ids_gemm, "ffn_moe_topk_stream", il);
++            ggml_build_forward_expand(gf, ids_gemm);
++            if (drop_path) {
++                // the drop rule's multipliers, on the second half's host split
++                drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ra_ids->ne[0], ra_ids->ne[1], 1, &ids_gemm, 1,
++                        llama_moe_stream_exact_mask, 1, msl);
++                cb(drop_mask, "ffn_moe_drop_mask", il);
++                ggml_build_forward_expand(gf, drop_mask);
++            }
++            rp_read(1, ids_gemm, drop_mask, &ids_gemm, &drop_mask);
++            cb(ids_gemm, "ffn_moe_topk_stream_reply", il);
++        } else if (ra_ids != nullptr) {
+             // G2 runahead: the approximate routed output - the experts resident when the call came, the others at
+             // weight 0 - summed like the exact one below; the model graph turns it into a prediction of the next
+             // layer's experts, and the second half stages that, waits for this call's loads and gives the exact
+@@ -3626,6 +3689,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // G30: with the pass's rows reused, the exact GEMMs run the other pairs only (the reused ones carry the skip id;
+         // gate / up leave their rows unwritten, the down GEMM in place into e_rows leaves the pass's)
+         experts = build_expert_gemms(cur, ids_gemm, e_rows);
++
++        // SiegeLadder C14 (c14_q in llama_moe_stream): the model graph marked this layer c14_ok; a graph that cannot serve
++        // the pairs the remap would defer takes the mark back, and the remap (which reads it) defers none
++        if (msl != nullptr && msl->c14_ok) {
++            const bool c14_here = n_tokens == 1 && drop_mask != nullptr && !weight_before_ffn && ra_ids == nullptr &&
++                    !g31_split && (!msl->mgr->c14_real || (msl->rp_on && msl->mgr->skip_capable));
++            msl->c14_ok = c14_here;
++        }
++        if (msl != nullptr && msl->c14_ok && msl->mgr->c14_real) {
++            // C14 proper, the tail: built here, expanded by the model graph right after the next layer's attention. The host
++            // op c14_wait waits there for the deferred pairs' copies and writes their slots (the skip id for the other
++            // pairs) and multipliers into reply record [2]; the GEMMs read them, the rows of the pairs not deferred are
++            // zeroed (op_params[2] = 1, as runahead's pass), and the weighted sum delta joins that attention's residual.
++            // Nothing here is expanded: the record is read only after the op wrote it, so the expansion orders them
++            const int64_t k_used = ids_gemm->ne[0];
++            ggml_tensor * c14w = ggml_custom_4d(ctx0, GGML_TYPE_I32, k_used, n_tokens, 1, 1, nullptr, 0,
++                    llama_moe_stream_c14_wait, 1, msl);
++            cb(c14w, "ffn_moe_c14_wait", il);
++            const int32_t off_b = (int32_t) (64 + GGML_PAD(k_used*n_tokens*(int64_t) sizeof(int32_t), 64));
++            GGML_ASSERT(off_b + k_used*n_tokens*(int64_t) sizeof(float) <= LLAMA_MOE_STREAM_RP_REC_BYTES);
++            void * err = (void *) msl->mgr->rp_err;
++            ggml_tensor * ids_def = ggml_mbox_read(ctx0, GGML_TYPE_I32, k_used, n_tokens, 1, 1, msl->rp_rec[2], 64,
++                    msl->mb_rec[0], err, INT32_MAX, 1000000 + msl->il*4 + 1);
++            ggml_tensor * m_def = ggml_mbox_read(ctx0, GGML_TYPE_F32, 1, k_used, n_tokens, 1, msl->rp_rec[2], off_b,
++                    msl->mb_rec[0], err, 0, 1000000 + msl->il*4 + 2);
++            ggml_tensor * e_def = build_expert_gemms(cur, ids_def, nullptr);
++            GGML_ASSERT(e_def->op == GGML_OP_MUL_MAT_ID && "C14: the expert pipeline must end in the down GEMM");
++            e_def->op_params[2] = 1;
++            e_def = ggml_mul(ctx0, e_def, ggml_mul(ctx0, weights, m_def));
++            cb(e_def, "ffn_moe_weighted_c14", il);
++            ggml_tensor * delta = ggml_view_2d(ctx0, e_def, n_embd, n_tokens, e_def->nb[2], 0);
++            for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
++                delta = ggml_add(ctx0, delta, ggml_view_2d(ctx0, e_def, n_embd, n_tokens, e_def->nb[2], i*e_def->nb[1]));
++            }
++            msl->graph_c14_wait  = c14w;
++            msl->graph_c14_delta = ggml_cont(ctx0, delta);
++            cb(msl->graph_c14_delta, "ffn_moe_c14_delta", il);
++        }
+     }
+ 
+     if (!weight_before_ffn) {
+@@ -3637,13 +3738,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         static const bool weight_inplace = getenv("LLAMA_MOE_WEIGHT_INPLACE") == nullptr ||
+                 atoi(getenv("LLAMA_MOE_WEIGHT_INPLACE")) != 0;
+         ggml_tensor * w = drop_mask != nullptr ? ggml_mul(ctx0, weights, drop_mask) : weights;
++        // SiegeLadder C14, probe E1 (c14_q in llama_moe_stream): the remap negated the multipliers of the pairs it deferred -
++        // the kept sum takes relu(m), the deferred one relu(-m), from the same rows; the model graph adds the deferred sum
++        // after the next layer's attention (graph_c14_delta)
++        ggml_tensor * e_c14 = nullptr;
++        if (msl != nullptr && msl->c14_ok && !msl->mgr->c14_real && drop_mask != nullptr && n_tokens == 1) {
++            w     = ggml_mul(ctx0, weights, ggml_relu(ctx0, drop_mask));
++            e_c14 = ggml_mul(ctx0, experts, ggml_mul(ctx0, weights, ggml_relu(ctx0, ggml_neg(ctx0, drop_mask))));
++            cb(e_c14, "ffn_moe_weighted_c14", il);
++        }
+         // in place only into an op's output (the waves' in-place GEMMs make it a view of the first wave's), never a leaf
+         const ggml_tensor * own = experts;
+         while (own->view_src != nullptr) {
+             own = own->view_src;
+         }
+-        experts = weight_inplace && own->op != GGML_OP_NONE ? ggml_mul_inplace(ctx0, experts, w) : ggml_mul(ctx0, experts, w);
++        experts = weight_inplace && e_c14 == nullptr && own->op != GGML_OP_NONE ? ggml_mul_inplace(ctx0, experts, w) :
++                ggml_mul(ctx0, experts, w);
+         cb(experts, "ffn_moe_weighted", il);
++        if (e_c14 != nullptr) {
++            ggml_tensor * delta = ggml_view_2d(ctx0, e_c14, n_embd, n_tokens, e_c14->nb[2], 0);
++            for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
++                delta = ggml_add(ctx0, delta, ggml_view_2d(ctx0, e_c14, n_embd, n_tokens, e_c14->nb[2], i*e_c14->nb[1]));
++            }
++            msl->graph_c14_delta = ggml_cont(ctx0, delta);
++            cb(msl->graph_c14_delta, "ffn_moe_c14_delta", il);
++        }
+     }
+ 
+     ggml_build_forward_expand(gf, experts);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 9e4caed..3eb6f90 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -775,6 +775,20 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_QUEUE")) {
+         spec_queue_max = (size_t) std::max(1, atoi(p));
+     }
++    // SiegeLadder G34; see spec_workers in the header
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_WORKERS")) {
++        spec_workers = std::max(1, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_IDLE")) {
++        spec_idle = atoi(p) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_SPEC")) {
++        drop_spec = atoi(p) != 0;
++    }
++    // SiegeLadder D14; see slow_read_us in the header
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SLOW_READ_MS")) {
++        slow_read_us = (int64_t) (std::max(0.0, std::strtod(p, nullptr))*1000.0);
++    }
+     // A4b. Staging into VRAM slots ahead of the call; for now it takes the future from the oracle only.
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_VRAM_AHEAD")) {
+         vram_ahead = atoi(p);
+@@ -960,6 +974,85 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                 drop_all ? "; DROP_ALL: a call in which a heavy expert still waits for the drive gives its drops and "
+                            "substitutions back" : "");
+     }
++    // SiegeLadder G31; see g31 in the header. Lossless: the same rows, multipliers and sum as the single remap
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G31")) {
++        g31 = atoi(p) != 0 ? 1 : 0;
++    }
++    if (g31 > 0 && (runahead_k > 0 || subst > 0 || g4_probe > 0 || drop_vram_only == 2)) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G31 is ignored next to %s\n", __func__,
++                runahead_k > 0 ? "runahead (its remap is split already)" : subst > 0 ? "C13 (LLAMA_MOE_STREAM_SUBST)" :
++                g4_probe > 0 ? "the G4 probe" : "the drop rule's VRAM_ONLY=2");
++        g31 = 0;
++    }
++    if (g31 > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: G31 on: at decode each streamed layer's remap is split in two without runahead's "
++                "pass - the expert GEMMs of the pairs resident at the first half run while the call's other copies fly, "
++                "the second half's GEMMs write the other rows into the same output\n", __func__);
++    }
++    // SiegeLadder C14, probe E1; see c14_q in the header. C14 proper (c14_real) takes the same keys but C14 for C14_Q
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_Q")) {
++        c14_q = std::max(0.0f, (float) std::strtod(p, nullptr));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14")) {
++        c14_q    = std::max(0.0f, (float) std::strtod(p, nullptr));
++        c14_real = c14_q > 0.0f;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_N")) {
++        c14_n = std::max(1, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_SEL")) {
++        c14_sel = std::strcmp(p, "light") == 0 ? 1 : std::strcmp(p, "tier") == 0 ? 2 : 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_SKIP")) {
++        c14_skip.clear();
++        for (const char * q = p; *q != '\0';) {
++            char * end = nullptr;
++            const long v = std::strtol(q, &end, 10);
++            if (end == q) {
++                break;
++            }
++            c14_skip.push_back((int32_t) v);
++            q = *end == ',' ? end + 1 : end;
++        }
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_DROP")) {
++        c14_drop = atoi(p) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_DEPTH")) {
++        c14_depth = atoi(p) >= 2 ? 2 : 1;
++    }
++    if (c14_q > 0.0f && (drop_w <= 0.0f || runahead_k > 0 || subst > 0 || g4_probe > 0 || g31 > 0 ||
++                (c14_real && (!mailbox || c14_drop)))) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_%s is ignored %s\n", __func__, c14_real ? "C14" : "C14_Q",
++                drop_w <= 0.0f ? "without the drop rule's path (DROP_W > 0; 1e-6 for the exact one)" :
++                runahead_k > 0 ? "next to runahead" : subst > 0 ? "next to C13" : g4_probe > 0 ? "next to the G4 probe" :
++                g31 > 0 ? "next to G31" : !mailbox ? "without the mailbox (G16)" : "with C14_DROP (that is the probe's)");
++        c14_q    = 0.0f;
++        c14_real = false;
++    }
++    if (c14_real && c14_depth != 1) {
++        LLAMA_LOG_WARN("%s: moe stream: C14 proper defers to the next layer's attention only (DEPTH 1)\n", __func__);
++        c14_depth = 1;
++    }
++    if (c14_q > 0.0f) {
++        std::string skip;
++        for (const int32_t il : c14_skip) {
++            skip += (skip.empty() ? "" : ",") + std::to_string(il);
++        }
++        if (c14_real) {
++            LLAMA_LOG_WARN("%s: moe stream: C14 on (lossy): up to %d of a one-token call's misses with a share under %.3f "
++                    "(%s first) are not waited for by their call - their GEMMs run after the next layer's attention, "
++                    "while its copies fly, and their sum joins its residual; layers %s never defer\n", __func__, c14_n,
++                    c14_q, c14_sel == 0 ? "the drive's" : c14_sel == 1 ? "the lightest" : "the host tier's only",
++                    skip.empty() ? "none" : skip.c_str());
++        } else {
++            LLAMA_LOG_WARN("%s: moe stream: C14 probe E1 (lossy): up to %d of a one-token call's misses with a share under "
++                    "%.3f (%s first) are summed apart and added after the next layer's %s%s; layers %s never defer\n",
++                    __func__, c14_n, c14_q, c14_sel == 0 ? "the drive's" : c14_sel == 1 ? "the lightest" :
++                    "the host tier's only", c14_depth >= 2 ? "FFN (DEPTH 2)" : "attention",
++                    c14_drop ? " - THROWN AWAY (C14_DROP=1)" : "", skip.empty() ? "none" : skip.c_str());
++        }
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_VRAM")) {
+         spec_vram = std::strtol(p, nullptr, 10) != 0;
+     }
+@@ -1248,7 +1341,7 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+         }
+         // G22: the reply records after the mailbox's, behind the 64-byte block of the error word
+         const size_t size_mb = n_layers*2*LLAMA_MOE_STREAM_MB_REC_BYTES;
+-        const size_t size    = size_mb + (reply ? 64 + n_layers*2*LLAMA_MOE_STREAM_RP_REC_BYTES : 0);
++        const size_t size    = size_mb + (reply ? 64 + n_layers*3*LLAMA_MOE_STREAM_RP_REC_BYTES : 0); // [2]: C14
+         if (dev_ptr != nullptr && stream_query != nullptr && hbuft != nullptr && n_layers > 0) {
+             mb_buf = ggml_backend_buft_alloc_buffer(hbuft, size);
+         }
+@@ -1281,6 +1374,7 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+                     if (sl) {
+                         sl->rp_rec[0] = rp + 64 + (j++)*LLAMA_MOE_STREAM_RP_REC_BYTES;
+                         sl->rp_rec[1] = rp + 64 + (j++)*LLAMA_MOE_STREAM_RP_REC_BYTES;
++                        sl->rp_rec[2] = rp + 64 + (j++)*LLAMA_MOE_STREAM_RP_REC_BYTES;
+                     }
+                 }
+             }
+@@ -1804,12 +1898,25 @@ const uint8_t * llama_moe_stream::pread_slab(uint32_t file_idx, uint8_t * stagin
+         mir = true;
+     }
+     std::atomic<int32_t> & n = mir ? io_inflight_mir : io_inflight_pri;
+-    n.fetch_add(1, std::memory_order_relaxed);
++    const int32_t in_flight = n.fetch_add(1, std::memory_order_relaxed) + 1;
++    const int64_t t0 = mir || slow_read_us > 0 ? ggml_time_us() : 0;
+     const uint8_t * data = llama_moe_stream_pread(*f, staging, len, offs, use_direct_io, worker_id);
+     n.fetch_sub(1, std::memory_order_relaxed);
++    const int64_t d = mir || slow_read_us > 0 ? ggml_time_us() - t0 : 0;
+     if (mir) {
+         io_mirror_n.fetch_add(1, std::memory_order_relaxed);
+         io_mirror_bytes.fetch_add((int64_t) len, std::memory_order_relaxed);
++        // SiegeLadder D14: the copy's own latency, apart from the primary drive's (io_record counts both together)
++        io_mir_lat.n  += 1;
++        io_mir_lat.us += d;
++        for (int64_t m = io_mir_lat.us_max.load(); d > m && !io_mir_lat.us_max.compare_exchange_weak(m, d);) {}
++        io_mir_lat.hist[d < 1000 ? 0 : d < 2000 ? 1 : d < 4000 ? 2 : d < 8000 ? 3 : d < 16000 ? 4 : 5] += 1;
++    }
++    if (slow_read_us > 0 && d >= slow_read_us) {
++        // SiegeLadder D14 (LLAMA_MOE_STREAM_SLOW_READ_MS): every slow read on its own line - the log's time stamp says when
++        LLAMA_LOG_WARN("%s: moe stream: D14 slow read %.1f ms - %s, file %u, offset %.1f MiB, %zu KiB, worker %d, %d in "
++                "flight on that drive at its start\n", __func__, d/1000.0, mir ? "the copy" : "the primary", file_idx,
++                offs/1048576.0, len/1024, worker_id, in_flight);
+     }
+     return data;
+ }
+@@ -2157,9 +2264,19 @@ void llama_moe_stream::start_workers_locked() {
+     // drain q_spec at all, so the queue fills to its bound and every later call pays the
+     // enqueue cost for guesses nobody will ever read.
+     n_spec_workers_from = std::min<int32_t>(n_io_threads - 1, std::max<int32_t>(1, n_io_threads / 2));
++    if (spec_workers > 0) {
++        // SiegeLadder G34: the top spec_workers of the pool speculate, at least one worker stays demand-only
++        n_spec_workers_from = std::max<int32_t>(1, n_io_threads - spec_workers);
++    }
+     if (n_spec_workers_from < 0) {
+         n_spec_workers_from = 0;
+     }
++    if (spec_workers > 0 || spec_idle || !drop_spec) {
++        LLAMA_LOG_WARN("%s: moe stream: G34: %d of %d I/O workers may speculate%s%s\n", __func__,
++                std::max<int32_t>(0, n_io_threads - n_spec_workers_from), n_io_threads,
++                spec_idle ? ", only while no demand or staged read is queued or in flight" : "",
++                drop_spec ? "" : "; the drop rule's dropped experts are not read ahead");
++    }
+     workers.reserve(n_io_threads);
+     for (int32_t i = 0; i < n_io_threads; i++) {
+         workers.emplace_back([this, i]() { worker_loop((int) i); });
+@@ -2187,10 +2304,16 @@ void llama_moe_stream::worker_loop(int worker_id) {
+     uint8_t * staging = (uint8_t *) moe_aligned_alloc(max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN);
+     GGML_ASSERT(staging != nullptr);
+ 
++    // speculative work this worker may start now: SiegeLadder G34's spec_idle holds it back while a demand or staged
++    // read is queued or in flight
++    auto spec_open = [&]{
++        return !q_spec.empty() && worker_id >= n_spec_workers_from &&
++                (!spec_idle || (n_io_busy == 0 && q_demand.empty() && q_stage.empty()));
++    };
++
+     std::unique_lock<std::mutex> lk(mtx);
+     while (true) {
+-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_stage.empty() ||
+-                (!q_spec.empty() && worker_id >= n_spec_workers_from); });
++        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_stage.empty() || spec_open(); });
+         if (shutting_down) {
+             break;
+         }
+@@ -2203,18 +2326,20 @@ void llama_moe_stream::worker_loop(int worker_id) {
+         // worker: the speculative queue overflowed (61 of 75 thousand slabs read), so half the staged
+         // experts had to be read from the drive on the way and arrived late. Uploads go one at a time
+         // under upload_mtx anyway, so the demand-only workers are enough to keep the copies flowing.
+-        const bool may_spec = worker_id >= n_spec_workers_from;
++        const bool may_spec = spec_open(); // without G34's keys: q_spec not empty and this worker may speculate
+         llama_moe_stream_work w;
+         if (!q_demand.empty()) {
+             w = q_demand.front();
+             q_demand.pop_front();
+-        } else if (!q_stage.empty() && (!may_spec || q_spec.empty())) {
++        } else if (!q_stage.empty() && !may_spec) {
+             w = q_stage.front();
+             q_stage.pop_front();
+-        } else {
++        } else if (may_spec) {
+             // the wait predicate admits an empty q_demand here only with q_spec open to this worker
+             w = q_spec.front();
+             q_spec.pop_front();
++        } else {
++            continue; // not reached: the wait predicate admitted this worker for one of the three
+         }
+ 
+         auto & sl = *w.sl;
+@@ -2274,6 +2399,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+             continue;
+         }
+         sl.slot_claimed[w.slot] |= bit;
++        n_io_busy++; // G34: given back right after the lock is taken again below
+ 
+         lk.unlock();
+ 
+@@ -2394,6 +2520,10 @@ void llama_moe_stream::worker_loop(int worker_id) {
+         }
+ 
+         lk.lock();
++        n_io_busy--;
++        if (spec_idle && n_io_busy == 0 && !q_spec.empty()) {
++            cv_work.notify_all(); // G34: the speculative reads spec_idle held back may start now
++        }
+ 
+         if (is_deferred) {
+             if (w.gen != sl.slot_gen[w.slot]) {
+@@ -3011,6 +3141,10 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_spec_queued, stats.n_spec_filled,
+                 stats.n_spec_queued > 0 ? 100.0*(stats.n_spec_queued - stats.n_spec_filled)/stats.n_spec_queued : 0.0);
+     }
++    if (stats.n_drop_spec_skipped > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: G34: %" PRId64 " dropped experts not read ahead into the host tier "
++                "(LLAMA_MOE_STREAM_DROP_SPEC=0)\n", __func__, pfx, stats.n_drop_spec_skipped);
++    }
+     if (vram_ahead > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: staged %" PRId64 " experts into VRAM %d call(s) ahead: %" PRId64 " ready on arrival, "
+                 "%" PRId64 " still loading, %" PRId64 " left to demand (no free slot)%s\n",
+@@ -3129,6 +3263,17 @@ void llama_moe_stream::print_stats(const char * role) const {
+                     100.0*stats.n_g32_full/stats.n_g32_calls, stats.n_g32_skip, g32);
+         }
+     }
++    if (stats.n_g31_calls > 0) {
++        // SiegeLadder G31: the expert GEMMs of the pairs resident at the first half ran before the call's wait
++        // (worded apart from runahead's lines: bench/oracle_run.py reads those by their words)
++        LLAMA_LOG_WARN("%s: %smoe stream: G31: %" PRId64 " calls split in two without runahead's pass; %" PRId64 " pairs "
++                "(%.1f%%) computed before the wait, the others after it; %" PRId64 " calls had every pair resident at the "
++                "first half, %" PRId64 " none; first to second half %.3f ms per call, %.3f ms of it for the lock at the "
++                "second; %" PRId64 " stream flushes; %" PRId64 " experts loaded again\n", __func__, pfx, stats.n_g31_calls,
++                stats.n_g31_first, stats.n_g31_pairs > 0 ? 100.0*stats.n_g31_first/stats.n_g31_pairs : 0.0,
++                stats.n_g31_all, stats.n_g31_none, 1e-3*stats.t_g31_gap_us/stats.n_g31_calls,
++                1e-3*stats.t_g31_lock_us/stats.n_g31_calls, stats.n_g31_flush, stats.n_g31_redo);
++    }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+         // critical path, and so does runahead's second half (counted in the gap between the halves above)
+@@ -3163,6 +3308,25 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 stats.n_g4_calls, stats.n_g4_elig[0], stats.n_g4_elig[1], stats.n_g4_elig[2], stats.n_g4_elig[3],
+                 stats.n_g4_elig[4], stats.n_g4_elig[5], stats.n_g4_elig[6], stats.n_g4_elig[7], stats.t_g4_wait_us/1000.0);
+     }
++    if (c14_q > 0.0f && !c14_real) {
++        // SiegeLadder C14, probe E1 (words apart from the drop rule's line: the bench parsers match phrases)
++        LLAMA_LOG_WARN("%s: %smoe stream: C14 probe E1 (lossy): %" PRId64 " pairs summed apart for the next layer's attention "
++                "in %" PRId64 " calls, mean share %.4f%s\n", __func__, pfx, stats.n_c14_pairs, stats.n_c14_calls,
++                stats.n_c14_pairs > 0 ? stats.c14_share_sum/stats.n_c14_pairs : 0.0,
++                c14_drop ? ", thrown away (C14_DROP=1)" : "");
++    }
++    if (c14_real) {
++        // SiegeLadder C14 proper (its own words: the bench parsers match phrases)
++        const int64_t w = std::max<int64_t>(1, stats.n_c14_waits);
++        LLAMA_LOG_WARN("%s: %smoe stream: C14 (lossy): %" PRId64 " pairs deferred past the next layer's attention in %" PRId64
++                " calls, mean share %.4f, %" PRId64 " of them from the drive; their copies held the host in %" PRId64
++                " calls, %.1f ms (per such call <0.25/0.5/1/2/4/8/16/more ms: %.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0f%%), %"
++                PRId64 " stream flushes\n", __func__, pfx, stats.n_c14_pairs, stats.n_c14_calls,
++                stats.n_c14_pairs > 0 ? stats.c14_share_sum/stats.n_c14_pairs : 0.0, stats.n_c14_drive, stats.n_c14_waits,
++                stats.t_c14_wait_us/1000.0, 100.0*stats.n_c14_hist[0]/w, 100.0*stats.n_c14_hist[1]/w,
++                100.0*stats.n_c14_hist[2]/w, 100.0*stats.n_c14_hist[3]/w, 100.0*stats.n_c14_hist[4]/w,
++                100.0*stats.n_c14_hist[5]/w, 100.0*stats.n_c14_hist[6]/w, 100.0*stats.n_c14_hist[7]/w, stats.n_c14_flush);
++    }
+     if (subst > 0) {
+         // one line, in words no other line of this block uses: the bench parsers keep the last match of each phrase
+         char m2[160] = "";
+@@ -3212,6 +3376,15 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 LLAMA_LOG_WARN("%s: %smoe stream: P16 reads from the copies = %" PRId64 ", %.2f GB (%.1f%% of the bytes)\n",
+                         __func__, pfx, io_mirror_n.load(), io_mirror_bytes.load()/1e9,
+                         b_all > 0 ? 100.0*io_mirror_bytes.load()/b_all : 0.0);
++                // SiegeLadder D14: the copies' own share of the drive latencies above (which count every read)
++                const io_path & q = io_mir_lat;
++                if (q.n.load() > 0) {
++                    LLAMA_LOG_WARN("%s: %smoe stream: D14 the copies' reads alone: avg %.2f ms, max %.2f ms; "
++                            "<1 / 1-2 / 2-4 / 4-8 / 8-16 / >=16 ms: %" PRId64 " / %" PRId64 " / %" PRId64 " / %" PRId64
++                            " / %" PRId64 " / %" PRId64 "\n", __func__, pfx, q.us.load()/1000.0/q.n.load(),
++                            q.us_max.load()/1000.0, q.hist[0].load(), q.hist[1].load(), q.hist[2].load(),
++                            q.hist[3].load(), q.hist[4].load(), q.hist[5].load());
++                }
+             }
+         }
+     }
+@@ -3512,8 +3685,9 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+ }
+ 
+ // c13_sel / c13_probs: C13's scores, [n_expert, n_tokens] each (moe_unpack_ids_weights), or nullptr
++// issue_only: 0 - the whole remap; 1 - runahead's first half; 2 - G31's first half (SiegeLadder G31, no approximate pass)
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+-        const ggml_tensor * wts, void * userdata, bool issue_only = false,
++        const ggml_tensor * wts, void * userdata, int issue_only = 0,
+         const float * c13_sel = nullptr, const float * c13_probs = nullptr);
+ 
+ // M12: what a decode call is about to wait for - its loads still in flight, by where their bytes come from (slot_src).
+@@ -3651,19 +3825,24 @@ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * user
+     }
+ }
+ 
+-void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * userdata) {
+-    GGML_UNUSED(nth);
+-    if (ith != 0) {
+-        return;
+-    }
++// a first half: runahead's (half 1) or, SiegeLadder G31, the one without the approximate pass (half 2)
++static void moe_stream_remap_issue_half(ggml_tensor * dst, void * userdata, int half) {
+     // with the drop rule next to runahead the routing weights come too: packed with the ids in src[0], or apart in src[1]
+     // (C13: packed, with the scores after them)
+     moe_ids_weights u;
+     if (moe_unpack_ids_weights(dst, dst->src[0], u, ((const llama_moe_stream_layer *) userdata)->n_expert)) {
+-        moe_stream_remap_impl(dst, &u.a, nullptr, &u.w, userdata, /*issue_only =*/ true, u.sel, u.probs);
++        moe_stream_remap_impl(dst, &u.a, nullptr, &u.w, userdata, half, u.sel, u.probs);
+         return;
+     }
+-    moe_stream_remap_impl(dst, dst->src[0], nullptr, dst->src[1], userdata, /*issue_only =*/ true);
++    moe_stream_remap_impl(dst, dst->src[0], nullptr, dst->src[1], userdata, half);
++}
++
++void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    moe_stream_remap_issue_half(dst, userdata, /*half =*/ 1);
+ }
+ 
+ void llama_moe_stream_exact_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -3694,6 +3873,7 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+     sl.ra_ids.assign(ids, ids + n);
+     sl.ra_pending = true;
+     sl.ra_valid   = true;
++    sl.ra_g31     = false;
+     sl.drop_mask.assign((size_t) n, 1.0f);
+ 
+     // C13: a pair with a substitute reads the substitute, at its weight multiplier (subst_f), when that one is resident
+@@ -3797,6 +3977,45 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+     sl.ra_t_issue = ggml_time_us();
+ }
+ 
++// SiegeLadder G31, the end of the first half without runahead's pass: a pair whose expert is resident now (it was when the
++// call came, or all its copies were enqueued since) reads its own slot in the first expert GEMMs, which the card runs while
++// the call's other copies fly; every other pair - a miss, a slot still loading, a pair the drop rule took out - gets the
++// skip id there and its slot from the second half (llama_moe_stream_remap_wait), whose GEMMs write the other rows into the
++// same output. No slot is borrowed and none kept beyond the remap's own, so the cache lives as with the single remap. The
++// resident slots are fenced now: the first GEMMs wait on the device for their copies only
++static void moe_stream_g31_issue_locked(llama_moe_stream & mgr, llama_moe_stream_layer & sl, const int32_t * ids,
++        int64_t n, int32_t * out) {
++    sl.ra_ids.assign(ids, ids + n);
++    sl.ra_pending = true;
++    sl.ra_valid   = false; // no prediction: nothing for the second half to stage
++    sl.ra_g31     = true;
++    sl.ra_row_ok.assign((size_t) n, 0);
++    int64_t n_first = 0;
++    for (int64_t i = 0; i < n; i++) {
++        out[i] = LLAMA_MOE_STREAM_SKIP_ID;
++        if (sl.touched[ids[i]] == 2) {
++            continue; // dropped, no slot: the second half maps it onto a kept slot of its token, at multiplier 0
++        }
++        const auto it = sl.expert_slot.find(ids[i]);
++        if (it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++            out[i]          = it->second;
++            sl.ra_row_ok[i] = 1;
++            n_first++;
++        }
++    }
++    sl.g31_wait = false;
++    for (const int32_t s : sl.demand_slots) {
++        sl.g31_wait = sl.g31_wait || sl.slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT;
++    }
++    mgr.stats.n_g31_calls++;
++    mgr.stats.n_g31_pairs += n;
++    mgr.stats.n_g31_first += n_first;
++    mgr.stats.n_g31_all   += n_first == n ? 1 : 0;
++    mgr.stats.n_g31_none  += n_first == 0 ? 1 : 0;
++    mgr.fence_slots_locked(sl, out, (size_t) n);
++    sl.ra_t_issue = ggml_time_us();
++}
++
+ // G32: bound around each compute by llama_context::process_ubatch - the graph's eligible blocks (llm_graph_g32) to the
+ // layers whose first half decides, then every flag taken off during the compute given back and the bindings dropped
+ void llama_moe_stream::g32_bind_layer(int32_t il, const std::vector<ggml_tensor *> * nodes) {
+@@ -4067,8 +4286,88 @@ static void moe_c13_weights_locked(const llama_moe_stream & mgr, llama_moe_strea
+     }
+ }
+ 
++// SiegeLadder C14, probe E1 (see c14_q in the header): a one-token call's deferred pairs - up to c14_n of its misses (no
++// VRAM slot, or one still loading) with a share under c14_q, by c14_sel - get their multiplier negated in drop_mask. They
++// load and are waited for as now; the graph sums the negated pairs apart (build_moe_ffn) and the model adds that sum after
++// the next layer's attention. After the drop rule: a pair it dropped or masked (multiplier 0) is not a candidate
++static void moe_c14_select_locked(llama_moe_stream & mgr, llama_moe_stream_layer & sl, const int32_t * ids, const float * w,
++        int64_t k) {
++    struct cand {
++        int64_t j;
++        float   share;
++        bool    drive;
++    };
++    float s = 0.0f;
++    for (int64_t j = 0; j < k; j++) {
++        s += w[j];
++    }
++    std::vector<cand> cands;
++    for (int64_t j = 0; j < k; j++) {
++        const int32_t e = ids[j];
++        if (sl.drop_mask[j] <= 0.0f || sl.touched[e] >= 2) {
++            continue;
++        }
++        const float share = s > 0.0f ? w[j]/s : 1.0f;
++        if (share >= mgr.c14_q) {
++            continue;
++        }
++        const auto it = sl.expert_slot.find(e);
++        bool drive = true; // not whole in the host tier
++        if (it != sl.expert_slot.end()) {
++            if (sl.slot_state[it->second] != LLAMA_MOE_STREAM_SLOT_LOADING) {
++                continue; // resident: nothing to hide
++            }
++            drive = (sl.slot_src[it->second] & 1) != 0;
++        } else if (mgr.l2) {
++            drive = false;
++            for (const auto & wt : sl.weights) {
++                if (!mgr.l2->has(wt.file_idx, wt.offs + (size_t) e*wt.nb_expert, wt.nb_expert)) {
++                    drive = true;
++                    break;
++                }
++            }
++        }
++        if (mgr.c14_sel == 2 && drive) {
++            continue;
++        }
++        cands.push_back({ j, share, drive });
++    }
++    std::sort(cands.begin(), cands.end(), [&](const cand & x, const cand & y) {
++        if (mgr.c14_sel == 0 && x.drive != y.drive) {
++            return x.drive;
++        }
++        return x.share != y.share ? x.share < y.share : x.j < y.j;
++    });
++    // the token keeps a pair of its own in the call's GEMMs: a dropped or deferred pair reads a kept slot of its token
++    int32_t n_kept = 0;
++    for (int64_t j = 0; j < k; j++) {
++        n_kept += sl.drop_mask[j] > 0.0f ? 1 : 0;
++    }
++    int32_t n_def = 0;
++    for (const cand & c : cands) {
++        if (n_def >= mgr.c14_n || n_kept < 2) {
++            break;
++        }
++        if (mgr.c14_real) {
++            // C14 proper: weight 0 in the call's own GEMMs (on a kept slot of the token, as a dropped pair); the expert
++            // loads behind the call's waited loads, and c14_wait hands its slot to the deferred GEMMs with this multiplier
++            sl.c14_pairs.push_back({ (int32_t) c.j, ids[c.j], sl.drop_mask[c.j] });
++            sl.c14_def.push_back(ids[c.j]);
++            sl.drop_mask[c.j] = 0.0f;
++            mgr.stats.n_c14_drive += c.drive ? 1 : 0;
++        } else {
++            sl.drop_mask[c.j] = -sl.drop_mask[c.j];
++        }
++        mgr.stats.n_c14_pairs++;
++        mgr.stats.c14_share_sum += c.share;
++        n_kept--;
++        n_def++;
++    }
++    mgr.stats.n_c14_calls += n_def > 0 ? 1 : 0;
++}
++
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+-        const ggml_tensor * wts, void * userdata, bool issue_only, const float * c13_sel, const float * c13_probs) {
++        const ggml_tensor * wts, void * userdata, int issue_only, const float * c13_sel, const float * c13_probs) {
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
+@@ -4165,6 +4464,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // is heavy, so it is kept or substituted, never dropped: every token still keeps a pair with a slot.
+     moe_nvtx_push("remap_drop", sl->il); // G24: the parts of the remap's work under the lock, before the loads go
+     sl->dropped.clear();
++    sl->c14_pairs.clear(); // C14 proper: the last call's were handed out by its c14_wait
++    sl->c14_def.clear();
+     sl->drop_thr = 0.0f;
+     sl->subst.clear();
+     sl->subst_added.clear();
+@@ -4435,6 +4736,16 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         if (!sl->subst.empty()) {
+             moe_c13_weights_locked(*mgr, *sl, ids, w, c13_probs, k, n_tok); // C13's multipliers on top of the drop rule's
+         }
++        // SiegeLadder C14 (probe E1, or proper): the deferred pairs, on top of the drop rule's multipliers
++        if (mgr->c14_q > 0.0f && sl->c14_ok && issue_only == 0 && n_tok == 1) {
++            moe_c14_select_locked(*mgr, *sl, ids, w, k);
++        }
++        if (!sl->c14_def.empty()) {
++            // C14 proper: the deferred experts' loads are queued last, behind every load the call waits for
++            std::stable_partition(sl->uniq.begin(), sl->uniq.end(), [&](int32_t e) {
++                return std::find(sl->c14_def.begin(), sl->c14_def.end(), e) == sl->c14_def.end();
++            });
++        }
+     }
+ 
+     moe_nvtx_pop();
+@@ -4465,6 +4776,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     bool pending_wake = false;
+     const bool wake_once = mgr->wake_once;
+     for (const int32_t e : sl->uniq) {
++        // SiegeLadder C14 proper: a deferred expert loads as any other, but the call does not wait for it - c14_wait does,
++        // after the next layer's attention
++        const bool c14_d = !sl->c14_def.empty() && std::find(sl->c14_def.begin(), sl->c14_def.end(), e) != sl->c14_def.end();
+         const auto it = sl->expert_slot.find(e);
+         if (it != sl->expert_slot.end()) {
+             const int32_t s = it->second;
+@@ -4473,7 +4787,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                 mgr->want_stage_slot_locked(*sl, s); // stage dispatcher: its deferred copies go now, as demand
+                 mgr->enqueue_slot_locked(*sl, e, s, /*stage =*/ false, /*notify =*/ !wake_once);
+                 pending_wake = wake_once;
+-                waited = true;
++                waited = waited || !c14_d;
+             }
+             if (sl->slot_staged[s]) {
+                 // staged ahead for this very call (A4b): still a miss of the cache as it stood, so the
+@@ -4489,7 +4803,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             }
+             if (sl->slot_pinned[s]) mgr->stats.n_hit_pin++;
+             sl->keep[s] = 1;
+-            sl->demand_slots.push_back(s);
++            if (!c14_d) {
++                sl->demand_slots.push_back(s);
++            }
+         } else {
+             int32_t v = mgr->pick_victim_locked(*sl, sl->keep.data());
+             if (v < 0) {
+@@ -4525,9 +4841,11 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             mgr->enqueue_slot_locked(*sl, e, v, /*stage =*/ false, /*notify =*/ !wake_once);
+             pending_wake = wake_once;
+             mgr->stats.n_miss++;
+-            waited = true;
++            waited = waited || !c14_d;
+             sl->keep[v] = 1;
+-            sl->demand_slots.push_back(v);
++            if (!c14_d) {
++                sl->demand_slots.push_back(v);
++            }
+         }
+     }
+     moe_nvtx_pop(); // remap_classify
+@@ -4565,6 +4883,10 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         if (sl->g4_k_sel > 0 && std::find(sl->g4_picked.begin(), sl->g4_picked.end(), e) != sl->g4_picked.end()) {
+             continue; // G4 probe: the stand-in lane's experts are whole in the host tier already
+         }
++        if (!mgr->drop_spec) {
++            mgr->stats.n_drop_spec_skipped++; // SiegeLadder G34 (LLAMA_MOE_STREAM_DROP_SPEC=0): not read ahead
++            continue;
++        }
+         mgr->speculate_locked(*sl, e);
+     }
+     // G4 probe, mode 4: the lane's experts keep their place in the card's cache - staged after the call's own loads
+@@ -4601,7 +4923,13 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             GGML_ASSERT(sl->dropped.empty());
+             sl->exact_mask.clear();
+         }
+-        moe_stream_runahead_issue_locked(*mgr, *sl, ids, n, a->ne[0], out);
++        if (issue_only == 2) {
++            // SiegeLadder G31: no approximate pass - the first GEMMs take the resident pairs; exact_mask holds the
++            // single remap's multipliers for the second half (llama_moe_stream_exact_mask)
++            moe_stream_g31_issue_locked(*mgr, *sl, ids, n, out);
++        } else {
++            moe_stream_runahead_issue_locked(*mgr, *sl, ids, n, a->ne[0], out);
++        }
+         return;
+     }
+ 
+@@ -4640,7 +4968,12 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
+-    if (!sl->dropped.empty()) {
++    // SiegeLadder C14 proper: a deferred pair reads a kept slot of its token at weight 0 here, as a dropped one does; its own
++    // slot (used above, so the cache lives as without C14) goes to its GEMMs through c14_wait
++    for (const auto & p : sl->c14_pairs) {
++        out[p.i] = -1;
++    }
++    if (!sl->dropped.empty() || !sl->c14_pairs.empty()) {
+         // a dropped pair still runs through the expert GEMMs, with weight 0: any resident slot of the same
+         // token will do, and there is one - a token's top pair is never dropped (with C13 it may read a
+         // substitute's slot instead), except under VRAM_ONLY=2, where a token may lose every pair: then any
+@@ -4681,6 +5014,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+ // hands its slots to the exact expert GEMMs, as the remap does. Its experts were kept since the first half and
+ // nothing stages into this layer in between, so each still holds the slot it was given; one that does not is
+ // loaded again (counted in n_ra_redo).
++// SiegeLadder G31's second half is this one without a prediction (src[1] null, llama_moe_stream_remap_wait_g31): the
++// call's loads, the wait, the slots and the drop rule's kept slots as the single remap gives them, then the skip id for
++// the pairs the first GEMMs computed
+ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith != 0) {
+@@ -4693,24 +5029,27 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+     moe_nvtx_range r_wait("remap_wait", sl->il);
+ 
+     GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
+-    GGML_ASSERT(pred != nullptr && pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred) && pred->ne[1] == dst->ne[1]);
++    GGML_ASSERT(pred == nullptr || (pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred) && pred->ne[1] == dst->ne[1]));
+ 
+     const int64_t n   = ggml_nelements(dst);
+     int32_t     * out = (int32_t *) dst->data;
+ 
+     const int64_t t_lk = ggml_time_us();
+     std::unique_lock<std::mutex> lk(mgr->mtx);
+-    mgr->stats.t_ra_lock_us += ggml_time_us() - t_lk; // G21: how much of the gap is this lock, held by the I/O workers
++    const bool g31 = sl->ra_g31; // SiegeLadder G31: the first half was llama_moe_stream_remap_issue_g31_mb's
++    // G21: how much of the gap is this lock, held by the I/O workers
++    (g31 ? mgr->stats.t_g31_lock_us : mgr->stats.t_ra_lock_us) += ggml_time_us() - t_lk;
+ 
+     if (mgr->load_failed) {
+         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+     }
+     GGML_ASSERT(sl->ra_pending && (int64_t) sl->ra_ids.size() == n && "runahead: the second half of a remap without its first");
++    GGML_ASSERT((pred == nullptr) == g31 && "G31: a second half of the other kind");
+     sl->ra_pending = false;
+-    mgr->stats.t_ra_gap_us += ggml_time_us() - sl->ra_t_issue;
++    (g31 ? mgr->stats.t_g31_gap_us : mgr->stats.t_ra_gap_us) += ggml_time_us() - sl->ra_t_issue;
+ 
+     // RA_DEBUG 4 / 16 / 64-192 hand over this layer's own ids in place of a prediction: nothing to stage then
+-    if (sl->ra_valid && (mgr->ra_debug & (1 | 4 | 16 | 64 | 128)) == 0) {
++    if (pred != nullptr && sl->ra_valid && (mgr->ra_debug & (1 | 4 | 16 | 64 | 128)) == 0) {
+         moe_nvtx_range r_pred("predict", sl->il);
+         mgr->predict_locked(*sl, (const int32_t *) pred->data, pred->ne[0], pred->ne[1]);
+     }
+@@ -4738,7 +5077,7 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+             sl->slot_src[v] = (from_drive ? 1 : 0) | 4;
+             mgr->enqueue_slot_locked(*sl, e, v);
+             sl->keep[v] = 1;
+-            mgr->stats.n_ra_redo++;
++            (g31 ? mgr->stats.n_g31_redo : mgr->stats.n_ra_redo)++;
+             s = v;
+         }
+         if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+@@ -4750,7 +5089,7 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+     // DROP_LATE (see drop_late in the header): the call waits for its heavy experts only, and the light ones still
+     // loading after that are dropped. Only next to the plain rule, whose threshold sits under 1/k, so a token's top
+     // pair is heavy and every token keeps a resident pair to map its dropped ones onto. demand_slots[i] is uniq[i]'s.
+-    if (waited && mgr->drop_late && sl->drop_thr > 0.0f && mgr->drop_vram_only == 0 &&
++    if (waited && !g31 && mgr->drop_late && sl->drop_thr > 0.0f && mgr->drop_vram_only == 0 &&
+             (int64_t) sl->exact_mask.size() == n) {
+         auto heavy_loading = [&]{
+             for (size_t i = 0; i < sl->uniq.size(); i++) {
+@@ -4864,18 +5203,40 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+         }
+     }
+     // G30: the pairs whose row the approximate pass computed from their own expert skip the exact GEMMs - their rows stay
+-    // as the pass wrote them. After the use counters above, so the cache sees the same call as before
+-    if (sl->ra_reuse_ok && (int64_t) sl->ra_row_ok.size() == n) {
++    // as the pass wrote them. After the use counters above, so the cache sees the same call as before. SiegeLadder G31:
++    // the same for the pairs its first GEMMs computed (counted at the first half); a dropped pair's kept slot was taken
++    // above, from the real slots, as the single remap takes it
++    if ((g31 || sl->ra_reuse_ok) && (int64_t) sl->ra_row_ok.size() == n) {
+         for (int64_t i = 0; i < n; i++) {
+             if (sl->ra_row_ok[i]) {
+                 out[i] = LLAMA_MOE_STREAM_SKIP_ID;
+-                mgr->stats.n_ra_reused++;
++                if (!g31) {
++                    mgr->stats.n_ra_reused++;
++                }
+             }
+         }
+     }
+     mgr->fence_slots_locked(*sl, out, (size_t) n);
+ }
+ 
++// SiegeLadder G31: the second half without runahead's pass - src[0], the first half's output, only orders it, and there
++// is no prediction. The card split before it (the first GEMMs) has no input from the host, so the scheduler launched it
++// without a synchronize; under WDDM a launch may sit in the command buffer until some call flushes it, and this half is
++// about to sleep on the call's loads - so the compute stream is flushed first, when there are loads to wait for
++void llama_moe_stream_remap_wait_g31(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    auto * sl  = (llama_moe_stream_layer *) userdata;
++    auto * mgr = sl->mgr;
++    if (sl->g31_wait && mgr->stream_query != nullptr && mgr->compute_backend != nullptr) {
++        mgr->stream_query(mgr->compute_backend); // the graph thread's own state, as the mailbox's flushes
++        mgr->stats.n_g31_flush++;
++    }
++    GGML_ASSERT(dst->src[1] == nullptr);
++    llama_moe_stream_remap_wait(dst, ith, nth, userdata);
++}
++
+ // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
+ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint32_t capacity) {
+     GGML_ASSERT(capacity >= 1 && capacity <= n_slots);
+@@ -5341,6 +5702,23 @@ void llama_moe_stream_remap_issue_mb(ggml_tensor * dst, int ith, int nth, void *
+     llama_moe_stream_remap_issue(&d2, ith, nth, userdata);
+ }
+ 
++// SiegeLadder G31: the first half without runahead's pass (moe_stream_g31_issue_locked), its input from record [0]
++void llama_moe_stream_remap_issue_g31_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    moe_mb_wait(*sl->mgr, *sl, 0);
++    ggml_tensor in0 = moe_mb_tensor(*sl, 0);
++    ggml_tensor d2  = *dst;
++    for (auto & s : d2.src) {
++        s = nullptr;
++    }
++    d2.src[0] = &in0;
++    moe_stream_remap_issue_half(&d2, userdata, /*half =*/ 2);
++}
++
+ void llama_moe_stream_remap_wait_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     if (ith != 0) {
+         return;
+@@ -5366,7 +5744,8 @@ void llama_moe_stream_remap_wait_mb(ggml_tensor * dst, int ith, int nth, void *
+ // that token's post, which the card makes after it read this one. The number at the record's head is checked by the
+ // card all the same (ggml_mbox_read), and a stale read stops the run at the next mailbox wait.
+ 
+-static void moe_rp_write(llama_moe_stream_layer & sl, int k, const ggml_tensor * dst) {
++// k_post: the record of the post this reply answers - k, but 0 for G31's second half (SiegeLadder G31 posts only [0])
++static void moe_rp_write(llama_moe_stream_layer & sl, int k, const ggml_tensor * dst, int k_post) {
+     char *              rec = (char *) sl.rp_rec[k];
+     const ggml_tensor * a   = dst->src[0];
+     const ggml_tensor * b   = dst->src[1];
+@@ -5379,7 +5758,7 @@ static void moe_rp_write(llama_moe_stream_layer & sl, int k, const ggml_tensor *
+         std::memcpy(rec + off, b->data, ggml_nbytes(b));
+     }
+     std::atomic_thread_fence(std::memory_order_release);
+-    *(volatile uint32_t *) rec = sl.mb_seen[k]; // the post this answers; the card compares it with that post's number
++    *(volatile uint32_t *) rec = sl.mb_seen[k_post]; // the post this answers; the card compares it with that post's number
+     sl.mgr->stats.n_rp_writes++;
+ }
+ 
+@@ -5397,13 +5776,90 @@ void llama_moe_stream_reply_0(ggml_tensor * dst, int ith, int nth, void * userda
+             sl.mgr->stats.t_g4_wait_us += ggml_time_us() - t0;
+             sl.g4_k_sel = 0;
+         }
+-        moe_rp_write(sl, 0, dst);
++        moe_rp_write(sl, 0, dst, 0);
+     }
+ }
+ 
+ void llama_moe_stream_reply_1(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith == 0) {
+-        moe_rp_write(*(llama_moe_stream_layer *) userdata, 1, dst);
++        moe_rp_write(*(llama_moe_stream_layer *) userdata, 1, dst, 1);
+     }
+ }
++
++// SiegeLadder G31: the second half's answers through record 1, numbered with post [0] - the only post of its call
++void llama_moe_stream_reply_1_g31(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith == 0) {
++        moe_rp_write(*(llama_moe_stream_layer *) userdata, 1, dst, 0);
++    }
++}
++
++// SiegeLadder C14 proper: runs on the host split the model graph placed right after the next layer's attention. The card
++// was launched on that attention without a synchronize; under WDDM the launch may sit in the command buffer, so the stream
++// is flushed before the host sleeps. dst's shape is the call's [k, n_tokens]: the record holds the slots there (the skip
++// id for the pairs not deferred), then the multipliers, as reply_0 lays out ids and drop_mask
++void llama_moe_stream_c14_wait(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * sl  = (llama_moe_stream_layer *) userdata;
++    auto * mgr = sl->mgr;
++    moe_nvtx_range r_c14("c14_wait", sl->il);
++
++    const int64_t n = ggml_nelements(dst);
++    std::vector<int32_t> slots((size_t) n, LLAMA_MOE_STREAM_SKIP_ID);
++    std::vector<float>   mult((size_t) n, 0.0f);
++    {
++        std::unique_lock<std::mutex> lk(mgr->mtx);
++        if (!sl->c14_pairs.empty()) {
++            auto ready = [&] {
++                if (mgr->load_failed) {
++                    return true;
++                }
++                for (const auto & p : sl->c14_pairs) {
++                    const auto it = sl->expert_slot.find(p.e);
++                    if (it == sl->expert_slot.end() || sl->slot_state[it->second] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                        return false;
++                    }
++                }
++                return true;
++            };
++            if (!ready()) {
++                if (mgr->stream_query != nullptr && mgr->compute_backend != nullptr) {
++                    mgr->stream_query(mgr->compute_backend); // the graph thread's own state, as the mailbox's flushes
++                    mgr->stats.n_c14_flush++;
++                }
++                const int64_t t0 = ggml_time_us();
++                mgr->cv_done.wait(lk, ready);
++                const int64_t dt = ggml_time_us() - t0;
++                mgr->stats.t_c14_wait_us += dt;
++                mgr->stats.n_c14_waits++;
++                mgr->stats.n_c14_hist[dt < 250 ? 0 : dt < 500 ? 1 : dt < 1000 ? 2 : dt < 2000 ? 3 : dt < 4000 ? 4 :
++                        dt < 8000 ? 5 : dt < 16000 ? 6 : 7]++;
++            }
++            if (mgr->load_failed) {
++                GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++            }
++            for (const auto & p : sl->c14_pairs) {
++                GGML_ASSERT(p.i >= 0 && p.i < n);
++                slots[p.i] = sl->expert_slot.at(p.e);
++                mult[p.i]  = p.m;
++            }
++            sl->c14_pairs.clear();
++            sl->c14_def.clear();
++            // the deferred GEMMs wait on the device for these copies only (the skip ids are passed over)
++            mgr->fence_slots_locked(*sl, slots.data(), (size_t) n);
++        }
++    }
++    // the record as moe_rp_write lays it out: the payload, then the number of the post it answers
++    char * rec = (char *) sl->rp_rec[2];
++    GGML_ASSERT(rec != nullptr && "C14: no reply record [2]");
++    const size_t off_b = 64 + GGML_PAD((size_t) n*sizeof(int32_t), 64);
++    GGML_ASSERT(off_b + (size_t) n*sizeof(float) <= LLAMA_MOE_STREAM_RP_REC_BYTES);
++    std::memcpy(rec + 64, slots.data(), (size_t) n*sizeof(int32_t));
++    std::memcpy(rec + off_b, mult.data(), (size_t) n*sizeof(float));
++    std::atomic_thread_fence(std::memory_order_release);
++    *(volatile uint32_t *) rec = sl->mb_seen[0];
++}
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 423311c..bac915f 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -88,6 +88,25 @@ struct llama_moe_stream_layer {
+     // graph build only, the same way (SiegeLadder G16): the layer's shared expert, built before build_moe_ffn, which
+     // expands it right after the router's mailbox post - the card computes it while the host runs the remap
+     ggml_tensor * graph_shexp = nullptr;
++    // graph build only, the same way (SiegeLadder C14, probe E1; c14_q in llama_moe_stream): the routed sum of the pairs
++    // this layer's remap deferred ([n_embd, n_tokens]), left out of build_moe_ffn's output; the model graph adds
++    // post_F (x) it to the residual of the next layer's attention and resets it. c14_ok: set by the model graph at build
++    // - this layer may defer (one-token graph, a next layer to take the sum, not skipped); the remap reads it
++    ggml_tensor * graph_c14_delta = nullptr;
++    bool          c14_ok          = false;
++    // SiegeLadder C14 proper (c14_real in llama_moe_stream), graph build only as well: the host op that waits for the
++    // deferred pairs' copies and writes reply record [2] (llama_moe_stream_c14_wait); the model graph expands it right
++    // after the next layer's attention, then graph_c14_delta - the deferred pairs' GEMMs read that record
++    ggml_tensor * graph_c14_wait  = nullptr;
++    // ... and at run time, under mgr->mtx: the deferred pairs of this layer's current call - the pair's index in the call,
++    // its expert and its multiplier - and their experts (the classification loads them without waiting for them)
++    struct c14_pair {
++        int32_t i;
++        int32_t e;
++        float   m;
++    };
++    std::vector<c14_pair> c14_pairs;
++    std::vector<int32_t>  c14_def;
+     // SiegeLadder G16 (on by default; LLAMA_MOE_STREAM_MAILBOX=0 - off), the router's mailbox at decode: pinned host records the card posts
+     // into (ggml_mbox_post) and the remap reads instead of the scheduler's copy of a card tensor - so its CPU split
+     // has no card input, and the scheduler neither synchronizes nor copies before it. [0]: the call's ids, or the
+@@ -104,8 +123,9 @@ struct llama_moe_stream_layer {
+     // with the number of the post they answer (llama_moe_stream_reply_0 / _1); ggml_mbox_read at the head of the next
+     // card split reads them instead of the scheduler's copy, so that split has no input from the host: the scheduler
+     // neither waits for the copies to land nor copies the ids, and the host launches it while the copies fly.
+-    // rp_on: set at graph build
+-    void * rp_rec[2] = { nullptr, nullptr };
++    // rp_on: set at graph build. [2] (SiegeLadder C14): the deferred pairs' slots and multipliers, answering post [0], written
++    // by llama_moe_stream_c14_wait after the next layer's attention
++    void * rp_rec[3] = { nullptr, nullptr, nullptr };
+     bool   rp_on     = false;
+ 
+     // residency state, guarded by mgr->mtx
+@@ -187,6 +207,10 @@ struct llama_moe_stream_layer {
+     bool                 ra_pending = false;
+     bool                 ra_valid   = false;
+     int64_t              ra_t_issue = 0; // ggml_time_us() at the end of the first half
++    // SiegeLadder G31 (g31 in llama_moe_stream): the pending split is G31's - no approximate pass, no prediction - and
++    // whether its second half has loads to wait for (some slot of the call not RESIDENT at the end of the first half)
++    bool                 ra_g31     = false;
++    bool                 g31_wait   = false;
+     std::vector<int32_t> dropped;
+     // SiegeLadder G4, probe 3 (g4_probe in llama_moe_stream): the experts this call gave the stand-in CPU lane, how many,
+     // and when they were picked (the reply of modes 2 and 4 waits until g4_t_sel + g4_k_sel * g4_t_us)
+@@ -714,6 +738,16 @@ struct llama_moe_stream {
+     int64_t spec_frontier  = -1;
+     // workers with id below this never take speculative work, so demand always has a pool
+     int32_t n_spec_workers_from = 0;
++    // SiegeLadder G34 (theories): at decode the speculative reads - mostly the drop rule's dropped experts read ahead into
++    // the host tier - share the drive with the critical demand reads, and a started read is not preempted. Measurement
++    // keys, all off by default: LLAMA_MOE_STREAM_SPEC_WORKERS=N - how many I/O workers may take speculative work (unset:
++    // the pool's upper half, n - max(1, n/2)); LLAMA_MOE_STREAM_SPEC_IDLE=1 - a speculative read starts only while no
++    // demand or staged read is queued or in flight; LLAMA_MOE_STREAM_DROP_SPEC=0 - the dropped experts are not read ahead.
++    // They change when the drop rule finds an expert in the host tier, so its output too
++    int32_t spec_workers = -1;
++    bool    spec_idle    = false;
++    bool    drop_spec    = true;
++    int32_t n_io_busy    = 0; // demand / staged reads a worker has taken and not finished (under mtx), for spec_idle
+     // A4b, staging into VRAM (LLAMA_MOE_STREAM_VRAM_AHEAD, oracle only for now). The remap of call c also
+     // reserves cache slots for the experts of calls c+1..c+vram_ahead and queues their loads, so the
+     // uploads run while the GPU computes instead of after the next router. 0 = off, the default.
+@@ -775,6 +809,15 @@ struct llama_moe_stream {
+     // llama_context::process_ubatch, around each compute: the graph's blocks bound to their layers, then unbound
+     void g32_bind_layer(int32_t il, const std::vector<ggml_tensor *> * nodes);
+     void g32_unbind();
++    // SiegeLadder G31 (LLAMA_MOE_STREAM_G31=1; 0 - off, the default): at decode, without runahead, a streamed layer's remap
++    // in two halves as runahead's but with no approximate pass. The first queues the call's loads and decides the drop
++    // rule as the remap does, and gives the expert GEMMs the slots of the pairs resident at its end (the others the skip
++    // id); the card runs those GEMMs in a split of their own while the other copies fly. The second waits for the loads
++    // and gives the slots of the other pairs, whose GEMMs write their rows into the first ones' output (G30's mechanism);
++    // the multipliers and the weighted sum are the single remap's - the output is the same bit for bit. Not next to
++    // runahead (its remap is split already), C13, the G4 probe or the drop rule's VRAM_ONLY=2; needs the mailbox and its
++    // reply (G16 / G22), and the expert pipeline ending in the down GEMM (build_moe_ffn)
++    int32_t  g31             = 0;
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
+     bool     skip_capable    = true;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+@@ -831,6 +874,33 @@ struct llama_moe_stream {
+     int32_t g4_probe = 0;
+     int32_t g4_k[8]  = {0, 1, 1, 2, 2, 3, 3, 3};
+     int64_t g4_t_us  = 430;
++    // SiegeLadder C14, probe E1 (measurement, lossy; docs/v41/c14-design.md section 6): the math of C14 at the old timing.
++    // In a one-token call of a layer the model graph marked c14_ok, up to c14_n of the call's misses - no VRAM slot, or one
++    // still loading - with a share of the token's routing weight under c14_q are deferred: they load and are waited for as
++    // now, but their multiplier (drop_mask) is negated; the graph sums them apart (delta) and the model adds post_F (x)
++    // delta to the residual of layer L+1's attention - that attention does not see them, everything after it does.
++    // LLAMA_MOE_STREAM_C14_Q=X (0 - off, the default; it needs the drop rule's path, DROP_W > 0 - 1e-6 for the exact one),
++    // _C14_N=N (1), _C14_SEL=late|light|tier (late: the ones on the drive first, then the lightest; light: the lightest;
++    // tier: only those whole in the host tier), _C14_SKIP=19 (layers that never defer, a comma list; the last layer never
++    // does), _C14_DROP=1 (the sum thrown away - the same pairs dropped: the harm's upper bound), _C14_DEPTH=2 (the sum
++    // enters after the next layer's FFN instead - carried through its attention's mix as the residual path would carry it:
++    // the window is a whole layer, but that layer's router and experts do not see it either)
++    // SiegeLadder C14 proper (LLAMA_MOE_STREAM_C14=X in place of _C14_Q; lossy, off by default): the same selection, but the
++    // deferred pairs are NOT waited for by their call - their loads are queued last, the call's GEMMs give them weight 0
++    // on a kept slot of their token (as a dropped pair), and llama_moe_stream_c14_wait, a host op the model graph places
++    // right after the next layer's attention, waits for their copies there and hands their slots through reply record
++    // [2] to their own GEMMs, whose weighted sum enters as in the probe. The copies fly while that attention computes.
++    // DEPTH 1 only; needs the mailbox and its reply (G16 / G22) and skip-capable expert caches
++    bool                 c14_real  = false;
++    float                c14_q     = 0.0f;
++    int32_t              c14_n     = 1;
++    int32_t              c14_sel   = 0; // 0 late, 1 light, 2 tier
++    bool                 c14_drop  = false;
++    int32_t              c14_depth = 1;
++    std::vector<int32_t> c14_skip = { 19 };
++    bool c14_layer_ok(int32_t il) const {
++        return c14_q > 0.0f && std::find(c14_skip.begin(), c14_skip.end(), il) == c14_skip.end();
++    }
+     // C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; lossy, so opt-in: LLAMA_MOE_STREAM_SUBST=M, 0 = off).
+     // The drop rule lets a light expert on the drive go, but a heavy one is waited for, and with it the whole step. Here a
+     // routed expert of the call held neither in VRAM (no slot, resident or loading) nor whole in the host tier, and heavy -
+@@ -1019,6 +1089,8 @@ struct llama_moe_stream {
+         std::atomic<int64_t> hist[6] = {}; // <1, 1-2, 2-4, 4-8, 8-16, >=16 ms
+     };
+     io_path io[2];
++    io_path io_mir_lat; // SiegeLadder D14: the P16 copy's reads alone (pread_slab; bytes unused) - is the drives' tail theirs?
++    int64_t slow_read_us = 0; // SiegeLadder D14: LLAMA_MOE_STREAM_SLOW_READ_MS=N - log every read of N ms or more (0 - off)
+     std::atomic<int64_t> io_first_us{INT64_MAX}, io_last_us{0};
+     void io_record(bool spec, int64_t t0_us, int64_t t1_us, size_t nbytes);
+ 
+@@ -1030,6 +1102,7 @@ struct llama_moe_stream {
+         int64_t n_miss_cold = 0; // first-ever touch of an expert
+         int64_t n_spec_queued = 0; // experts guessed ahead (A4)
+         int64_t n_spec_filled = 0; // of those, actually read into the host tier
++        int64_t n_drop_spec_skipped = 0; // SiegeLadder G34: dropped experts not read ahead (LLAMA_MOE_STREAM_DROP_SPEC=0)
+         int64_t n_stage       = 0; // experts staged into VRAM slots ahead of their call (A4b)
+         int64_t n_stage_ready = 0; // of those, RESIDENT when their call came
+         int64_t n_stage_late  = 0; // of those, still LOADING when their call came
+@@ -1084,6 +1157,15 @@ struct llama_moe_stream {
+         int64_t n_g32_skip    = 0; // of those, the real block was left out of the compute (G32=1)
+         int64_t t_ra_gap_us   = 0; // time from the end of the first half to the start of the second (the approximate pass)
+         int64_t t_ra_lock_us  = 0; // of that, waiting for mgr->mtx at the start of the second half (G21)
++        int64_t n_g31_calls   = 0; // SiegeLadder G31: remap calls split in two without runahead's pass
++        int64_t n_g31_pairs   = 0; // their routed pairs
++        int64_t n_g31_first   = 0; // of those, computed by the first GEMMs (resident when the first half ended)
++        int64_t n_g31_all     = 0; // calls whose every pair was (the second GEMMs computed nothing)
++        int64_t n_g31_none    = 0; // calls with no such pair (the first GEMMs computed nothing)
++        int64_t n_g31_flush   = 0; // compute-stream flushes at the second half (it had loads to wait for)
++        int64_t n_g31_redo    = 0; // experts the second half found evicted and loaded again (expected 0)
++        int64_t t_g31_gap_us  = 0; // time from the end of the first half to the start of the second
++        int64_t t_g31_lock_us = 0; // of that, waiting for mgr->mtx at the start of the second half
+         int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)
+         int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
+         int64_t n_drop_exp    = 0; // experts not loaded for their call because of it
+@@ -1092,6 +1174,14 @@ struct llama_moe_stream {
+         int64_t n_g4_exp      = 0; // the experts it took (in modes 1, 2 and 4 they are in n_drop_exp too)
+         int64_t n_g4_elig[8]  = {}; // decode calls without a drive wait, by n - experts whole in the host tier, off the card (7 = 7+)
+         int64_t t_g4_wait_us  = 0; // modes 2 and 4: the reply's wait for the lane's time
++        int64_t n_c14_calls   = 0; // C14 probe E1: calls that deferred a pair
++        int64_t n_c14_pairs   = 0; // the pairs deferred
++        double  c14_share_sum = 0.0; // their shares of their token's routing weight
++        int64_t n_c14_drive   = 0; // C14 proper: deferred pairs whose expert came from the drive
++        int64_t n_c14_waits   = 0; // c14_wait calls that found a deferred copy not yet enqueued and waited
++        int64_t n_c14_flush   = 0; // compute-stream flushes there (WDDM: the attention launched before the host sleeps)
++        int64_t t_c14_wait_us = 0; // the host's wait in c14_wait
++        int64_t n_c14_hist[8] = {}; // that wait per waiting call: <0.25/0.5/1/2/4/8/16/more ms
+         int64_t n_drop_late_exp   = 0; // DROP_LATE: experts not waited for at the wait, still loading there
+         int64_t n_drop_late_pairs = 0; // their pairs
+         int64_t n_drop_late_calls = 0; // calls with at least one
+@@ -1224,11 +1314,25 @@ void llama_moe_stream_remap_mb(ggml_tensor * dst, int ith, int nth, void * userd
+ void llama_moe_stream_remap_v_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_remap_issue_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_remap_wait_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
++// SiegeLadder G31 (see g31 in llama_moe_stream): the remap in two halves without runahead's pass. _issue_g31_mb reads
++// record [0] as _issue_mb does and returns the slots of the pairs resident at its end, the skip id for the others;
++// _wait_g31: src[0] = the issue's output (it orders the two), no prediction - it flushes the compute stream when the
++// call has loads to wait for, waits for them and returns the slots of the other pairs, the skip id for those the first
++// GEMMs computed
++void llama_moe_stream_remap_issue_g31_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_remap_wait_g31(ggml_tensor * dst, int ith, int nth, void * userdata);
+ 
+ // SiegeLadder G22: copy the remap's answers - src[0], the slot ids, and src[1], the multipliers, if given - into the
+-// layer's reply record 0 / 1 with the number of the post they answer; dst is a 1-element placeholder
++// layer's reply record 0 / 1 with the number of the post they answer; dst is a 1-element placeholder. _1_g31: G31's
++// second half into record 1, answering post [0] (G31 posts nothing into record 1)
+ void llama_moe_stream_reply_0(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_reply_1(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_reply_1_g31(ggml_tensor * dst, int ith, int nth, void * userdata);
++// SiegeLadder C14 proper (c14_real in llama_moe_stream): wait for the copies of this layer's deferred pairs, fence them, and
++// write their slots (the skip id for the other pairs) and multipliers (0 for the others) into reply record [2], numbered
++// with post [0]; dst - a placeholder of the call's shape [k, n_tokens], without sources - is expanded by the model graph
++// right after the next layer's attention
++void llama_moe_stream_c14_wait(ggml_tensor * dst, int ith, int nth, void * userdata);
+ 
+ // SiegeLadder (runs.md 4.76, theory G23): NVTX ranges for the phases of llama_decode - the graph build, the scheduler's
+ // allocation, the inputs, the compute - to see what the card waits for at a token's boundary. No-ops without
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 810478a..76d3a5f 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2516,6 +2516,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+     cb(inpL, "hc_init", -1);
+ 
++    // SiegeLadder C14, probe E1: the deferred pairs of the layer before, post_F (x) delta, for this layer's attention residual
++    // (DEPTH 2: c14_ffn, the same carried through this layer's attention mix, for its FFN residual)
++    ggml_tensor * c14_carry = nullptr;
++    ggml_tensor * c14_ffn   = nullptr;
++    // C14 proper: the host op of the layer before that waits for its deferred copies, expanded right after this attention
++    ggml_tensor * c14_wait  = nullptr;
++
+     for (int il = 0; il < n_layer; ++il) {
+         // G32: the attention block of this layer, which the first half of layer il - 1 may leave out. Its inputs go into
+         // the graph first, so the nodes added from here to its copies below are the block's own (the engram included)
+@@ -2588,8 +2595,27 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+ 
+         cur = build_attention(model, inp_dsv4, cur, inp_pos, il, &topk_carry_v, &cand_carry_v);
+ 
++        if (c14_wait != nullptr) {
++            // C14 proper: the attention first in node order, then the host op - the scheduler gives it a split of its own
++            // between this attention and the deferred GEMMs, which come with c14_carry below
++            ggml_build_forward_expand(gf, cur);
++            ggml_build_forward_expand(gf, c14_wait);
++            c14_wait = nullptr;
++        }
++        // SiegeLadder C14, probe E1: the previous layer's deferred pairs join the residual of this attention's mix - the
++        // attention did not see them, its residual path carries them on as it would have from the start
++        if (c14_carry != nullptr && mstream->c14_depth < 2) {
++            residual  = ggml_add(ctx0, residual, c14_carry);
++            c14_carry = nullptr;
++        }
+         inpL = build_hc_post(cur, residual, post, comb, il);
+         cb(inpL, "hc_attn_post", il);
++        if (c14_carry != nullptr) {
++            // DEPTH 2: carried through this attention's mix alone (zero output, the residual path), for this layer's FFN
++            ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f);
++            c14_ffn   = build_hc_post(zero, c14_carry, post, comb, il);
++            c14_carry = nullptr;
++        }
+ 
+         if (g32_here) {
+             const g32_pass_out & gp = g32_pass[il];
+@@ -2680,6 +2706,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             mstream->layer(il)->graph_shexp = ffn_shexp;
+         }
+ 
++        // SiegeLadder C14, probe E1 (c14_q in llama_moe_stream): may this layer's remap defer pairs - a one-token graph and a
++        // next layer in it to take their sum after its attention (c14_carry below)
++        if (mstream != nullptr && mstream->layer(il) != nullptr) {
++            mstream->layer(il)->c14_ok = n_tokens == 1 && il + 1 < n_layer_moe && mstream->c14_layer_ok(il);
++        }
++
+         ggml_tensor * moe_out = build_moe_ffn(cur,
+                 layer.ffn_gate_inp,
+                 layer.ffn_up_exps,
+@@ -2699,6 +2731,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                 selected_experts);
+         cb(moe_out, "ffn_moe_out", il);
+ 
++        // SiegeLadder C14, probe E1: the deferred pairs' sum delta enters the streams with this FFN's mix, post_F (x) delta
++        // (as hc_post would add it with the rest), but only after the next layer's attention
++        if (mstream != nullptr && mstream->layer(il) != nullptr && mstream->layer(il)->graph_c14_delta != nullptr) {
++            ggml_tensor * delta = mstream->layer(il)->graph_c14_delta;
++            mstream->layer(il)->graph_c14_delta = nullptr;
++            c14_wait = mstream->layer(il)->graph_c14_wait; // C14 proper (null for the probe)
++            mstream->layer(il)->graph_c14_wait = nullptr;
++            if (!mstream->c14_drop) {
++                ggml_tensor * d3 = ggml_reshape_3d(ctx0, delta, n_embd, 1, n_tokens);
++                ggml_tensor * p3 = ggml_reshape_3d(ctx0, ggml_cont(ctx0, post), 1, hc, n_tokens);
++                c14_carry = ggml_mul(ctx0, ggml_repeat_4d(ctx0, d3, n_embd, hc, n_tokens, 1), p3);
++                cb(c14_carry, "c14_carry", il);
++            }
++        }
++
+         if (ffn_shexp == nullptr) {
+             ffn_shexp = build_ffn(cur,
+                     layer.ffn_up_shexp, nullptr, nullptr,
+@@ -2711,6 +2758,10 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+         cb(cur, "ffn_out", il);
+ 
++        if (c14_ffn != nullptr) {
++            residual = ggml_add(ctx0, residual, c14_ffn); // SiegeLadder C14, probe E1, DEPTH 2
++            c14_ffn  = nullptr;
++        }
+         inpL = build_hc_post(cur, residual, post, comb, il);
+         inpL = build_cvec(inpL, il);
+         cb(inpL, "l_last", il);

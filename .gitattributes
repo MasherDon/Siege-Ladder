@@ -1,0 +1,2 @@
+# patches must keep their bytes: no line-ending conversion on Windows checkouts
+*.patch -text

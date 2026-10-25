@@ -1,0 +1,29 @@
+From e4095c04cbe99fa099ddcf5ab6756adca8e60570 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:15:47 +0000
+Subject: [PATCH 61/91] logits : a scoring call may be as long as -ub when that
+ is above 2048 (SiegeLadder P13's check runs router-112 at the consultant's
+ -ub 6144; the 2048 cap capped the ubatch too)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/logits/logits.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/tools/logits/logits.cpp b/tools/logits/logits.cpp
+index a674121..dc2bcec 100644
+--- a/tools/logits/logits.cpp
++++ b/tools/logits/logits.cpp
+@@ -662,8 +662,10 @@ int main(int argc, char ** argv) {
+             max_first = std::max(max_first, (int) j.prompt.size() + (score_batch ? (int) j.target.size() - 1 : 0));
+             max_total = std::max(max_total, (int) (j.prompt.size() + j.target.size()));
+         }
+-        // at most 2048 tokens per decode call, as the server's default -b; long prompts go in several calls
+-        const int n_call = std::min(max_first, 2048);
++        // at most 2048 tokens per decode call, as the server's default -b - or -ub when that is larger (SiegeLadder P13:
++        // the consultant's prompts run at -ub 6144 with P11, and a call capped at 2048 capped the ubatch too); long
++        // prompts go in several calls
++        const int n_call = std::min(max_first, std::max(2048, n_ubatch));
+         llama_context_params sp = llama_context_default_params();
+         sp.n_ctx    = n_ctx > 0 ? (uint32_t) n_ctx : (uint32_t) max_total + 8;
+         sp.n_batch  = (uint32_t) n_call;

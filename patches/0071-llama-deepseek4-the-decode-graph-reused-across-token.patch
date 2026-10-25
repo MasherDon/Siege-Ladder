@@ -1,0 +1,259 @@
+From 512e30eb330c978b41cefef937128af306447b3e Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:28:18 +0000
+Subject: [PATCH 71/91] llama, deepseek4 : the decode graph reused across
+ tokens - Engram's can_reuse / on_reuse, warmup and head_out in allow_reuse, a
+ build counter of the expert stream, the raw ring's stream (SiegeLadder G23
+ step 1, on by default; LLAMA_GRAPH_REUSE_DISABLE=1 - off)
+
+The DeepSeek V4.1 decode graph was rebuilt every token: llm_graph_input_engram had no can_reuse (the base one says no).
+Every other DSV4 input already keeps its shape (compressed widths padded to 256, state_* fixed by an empty block), so the
+graph now changes 3 times per 512 tokens. Engram takes the new memory context in can_reuse and restarts its read-ahead
+(G26) in on_reuse - not in can_reuse, where another input's no would destroy it and its destructor would wait for the
+thread. Guards: warmup / head_out in llm_graph_params::allow_reuse; llama_moe_stream::n_build - a graph is reused only
+while no other build on the model (a reserve, another context) came after it, since the streamed layers keep fields their
+last build set; the raw ring's stream (the K views carry its offset; split_seq ubatches are not checked by seq id).
+LLAMA_GRAPH_RESULT_DEBUG=2 names the input class that says no. Design: SiegeLadder docs/v41/g23-design.md.
+Checks (oracle o42): exact runahead and exact without runahead - text = trace, graphs reused 0 -> 554.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    | 15 ++++++++++++++-
+ src/llama-graph.cpp      | 31 ++++++++++++++++++++++++++++++-
+ src/llama-graph.h        | 26 ++++++++++++++++++++++++++
+ src/llama-model.cpp      |  4 ++++
+ src/llama-moe-stream.h   |  4 ++++
+ src/models/deepseek4.cpp |  1 +
+ 6 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a73583c..728c3d1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1729,7 +1729,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
++    // SiegeLadder G23: the streamed layers keep fields their last graph build set (mailbox, runahead, wave flags) - a graph
++    // is reused only if no other build on this model (a reserve, another context) came after it
++    auto * mstream = model.moe_stream();
++    llama_moe_stream_nvtx_push("graph_reuse");
++    const bool reuse = !graph_reuse_disable && (mstream == nullptr || res->ms_build == mstream->n_build) &&
++            res->can_reuse(gparams);
++    llama_moe_stream_nvtx_pop();
++
++    if (reuse) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
+@@ -1739,6 +1747,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             ggml_backend_sched_synchronize(sched.get());
+         }
+ 
++        res->on_reuse(ubatch); // G23: what the inputs do at build for their ubatch (Engram's read-ahead, G26)
++
+         n_reused++;
+     } else {
+         res->reset();
+@@ -1751,6 +1761,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         llama_moe_stream_nvtx_push("graph_build"); // SiegeLadder G23: the phases of a token's boundary under Nsight
+         gf = model.build_graph(gparams);
+         llama_moe_stream_nvtx_pop();
++        if (mstream != nullptr) {
++            res->ms_build = mstream->n_build; // G23: this graph is the model's latest build
++        }
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index a38017e..30c68aa 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -27,6 +27,7 @@
+ #include <numeric>
+ #include <sstream>
+ #include <string>
++#include <typeinfo>
+ #include <unordered_set>
+ 
+ // dedup helpers
+@@ -129,6 +130,24 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+     return res;
+ }
+ 
++bool llm_graph_input_engram::can_reuse(const llm_graph_params & params) {
++    // set_input and read_ahead read the history through mctx: the build's context dies with its decode call
++    mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
++
++    bool res = !kv.empty();
++    for (const ggml_tensor * t : kv) {
++        res = res && t != nullptr && t->ne[1] == (int64_t) params.ubatch.n_tokens;
++    }
++
++    return res;
++}
++
++void llm_graph_input_engram::on_reuse(const llama_ubatch & ubatch) {
++    if (ahead_on) {
++        read_ahead(ubatch);
++    }
++}
++
+ void llm_graph_input_engram::read_ahead(const llama_ubatch & ubatch) {
+     if (ahead.joinable()) {
+         ahead.join();
+@@ -1841,6 +1860,9 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
+     const auto * raw_ctx = mctx->get_raw();
+     inp_raw->mctx = raw_ctx;
+ 
++    // SiegeLadder G23: the raw K views carry the stream offset of the build
++    res &= raw_ctx->get_stream() == raw_stream;
++
+     if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
+         res &= inp_raw->self_k_idxs->ne[0] == raw_ctx->get_n_write();
+     }
+@@ -2230,7 +2252,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+         const bool cur = input->can_reuse(params);
+ 
+         if (debug > 1) {
+-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
++            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", typeid(*input).name(), cur); // SiegeLadder G23: which input says no
+         }
+ 
+         res = res && cur;
+@@ -2243,6 +2265,12 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+     return res;
+ }
+ 
++void llm_graph_result::on_reuse(const llama_ubatch & ubatch) {
++    for (auto & input : inputs) {
++        input->on_reuse(ubatch);
++    }
++}
++
+ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
+     inputs.emplace_back(std::move(input));
+     return inputs.back().get();
+@@ -4653,6 +4681,7 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+ 
+     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
++    inp->raw_stream = raw_ctx->get_stream(); // SiegeLadder G23
+ 
+     dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream,
+             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 163bd80..2b13f2c 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -115,6 +115,12 @@ public:
+         GGML_UNUSED(params);
+         return false;
+     }
++
++    // SiegeLadder G23: the graph is reused for this ubatch (every input said can_reuse) - what an input does at build for
++    // the ubatch it was built with, it does here (Engram's read-ahead, G26)
++    virtual void on_reuse(const llama_ubatch & ubatch) {
++        GGML_UNUSED(ubatch);
++    }
+ protected:
+     // env: LLAMA_GRAPH_INPUT_DEBUG
+     int debug = 0;
+@@ -662,6 +668,10 @@ public:
+     ggml_tensor * p13_mask  = nullptr; // F16 [raw_len, n_tokens]: each token's mask over its chunk's rows
+     uint32_t      p13_n_swa = 0;
+ 
++    // SiegeLadder G23: the ring stream the graph was built for - the raw K views carry its offset, and ubatches split
++    // by split_seq (coupled sequences) are not checked by seq id in llm_graph_params::allow_reuse
++    uint32_t      raw_stream = 0;
++
+     // per chunk, made once per graph and shared by every layer. A view of a graph input stays on the CPU backend: each
+     // distinct view a GPU op reads gets its own copy, with a drain of the GPU queue before it (the scheduler's
+     // non-input branch) - once per graph here instead of once per layer and chunk. With one chunk, the input itself
+@@ -718,6 +728,13 @@ public:
+     // must not write it - and a row it gets wrong costs a fault later, never a wrong value
+     void read_ahead(const llama_ubatch & ubatch);
+     std::thread ahead;
++    bool ahead_on = false; // G26 is on (LLAMA_ENGRAM_AHEAD): on_reuse starts the read-ahead too
++
++    // SiegeLadder G23: the lookup tensors depend on n_tokens only - the rows are hashed anew in set_input every ubatch.
++    // The memory context is taken from the new params: the one of the build dies with its decode call
++    bool can_reuse(const llm_graph_params & params) override;
++    // not in can_reuse: if another input says no, this object is destroyed and its destructor would wait for the thread
++    void on_reuse(const llama_ubatch & ubatch) override;
+ 
+     std::vector<ggml_tensor *> kv; // per engram layer: F32 [n_hash_cols*head_dim, n_tokens]
+ 
+@@ -965,6 +982,9 @@ struct llm_graph_params {
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+             cparams.causal_attn             == other.cparams.causal_attn             &&
++            // SiegeLadder G23: warmup builds with every expert (n_expert_used), P1's released head ends graphs at t_embd
++            cparams.warmup                  == other.cparams.warmup                  &&
++            cparams.head_out                == other.cparams.head_out                &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+@@ -1010,6 +1030,9 @@ public:
+     // return true if the graph was updated and can be reused
+     bool can_reuse(const llm_graph_params & params);
+ 
++    // SiegeLadder G23: after can_reuse said yes - each input's on_reuse
++    void on_reuse(const llama_ubatch & ubatch);
++
+     llm_graph_input_i * add_input(llm_graph_input_ptr input);
+ 
+     void add_fused_node(llm_graph_fused_node result);
+@@ -1045,6 +1068,9 @@ public:
+ 
+     int64_t max_nodes;
+ 
++    // SiegeLadder G23: llama_moe_stream::n_build right after this graph's build - reused only while no other build came
++    uint64_t ms_build = 0;
++
+ private:
+     // keep a copy of the previous graph parameters
+     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 8eda33d..e77a99b 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2841,6 +2841,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+ }
+ 
+ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
++    if (auto * ms = moe_stream()) {
++        ms->n_build++; // SiegeLadder G23: the streamed layers' build-time fields now belong to this graph
++    }
++
+     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
+ 
+     // add on pooling layer
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index bbdd50a..b7291e8 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -541,6 +541,10 @@ struct llama_moe_stream {
+ 
+     std::vector<std::unique_ptr<llama_moe_stream_layer>> layers; // [n_layer], null = not streamed
+ 
++    // SiegeLadder G23: graph builds on this model (llama_model::build_graph, every context, reserves too). The layers keep
++    // fields their last build set, so a context reuses its graph only while this is still the count after its build
++    uint64_t n_build = 0;
++
+     llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n_io_threads, bool direct);
+     ~llama_moe_stream();
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 59da162..ea79d08 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2313,6 +2313,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         // thread while the rest of the graph is built and allocated - at decode their PrefetchVirtualMemory waited
+         // ~1.8 ms per token for the drive on the thread the card waits on (SiegeLadder runs.md 4.77)
+         static const bool engram_ahead = getenv("LLAMA_ENGRAM_AHEAD") == nullptr || atoi(getenv("LLAMA_ENGRAM_AHEAD")) != 0;
++        inp->ahead_on = engram_ahead; // and on every reuse of this graph (G23)
+         if (engram_ahead) {
+             inp->read_ahead(ubatch);
+         }

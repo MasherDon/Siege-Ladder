@@ -1,0 +1,53 @@
+From 11f5db943ddda3a9b968bdb6d3cb914dafa3ad94 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 06:05:22 +0000
+Subject: [PATCH 30/91] moe-stream : runahead on by default with K = 6 -
+ lossless (text = trace, KL at the floor); LLAMA_MOE_STREAM_RUNAHEAD=0 turns
+ it off, and next to an oracle, A' or the drop rule it stays off unless asked
+ for
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 14 ++++++++++++--
+ src/llama-moe-stream.h   |  3 ++-
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 9e34564..469d0e7 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -536,8 +536,18 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         drop_only_layer = atoi(p);
+     }
+     // G2 runahead; see runahead_k in the header. It stages through predict_locked, so it takes pred_vram over.
+-    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RUNAHEAD")) {
+-        runahead_k = (uint32_t) std::max(0, atoi(p));
++    // On by default with K = 6 (SiegeLadder 17.10: lossless, runs.md 4.42-4.43). The measurement modes that stage
++    // or drop on their own - an oracle (its staging and read-ahead series were all taken without runahead), A'
++    // (PRED_*), the drop rule - keep it off unless LLAMA_MOE_STREAM_RUNAHEAD asks for it.
++    const char * ra_env = std::getenv("LLAMA_MOE_STREAM_RUNAHEAD");
++    if (ra_env) {
++        runahead_k = (uint32_t) std::max(0, atoi(ra_env));
++    } else if (spec_oracle.empty() && pred_vram == 0 && pred_ram == 0 && pred_stage == 0 && drop_w <= 0.0f) {
++        runahead_k = 6;
++    } else {
++        runahead_k = 0;
++        LLAMA_LOG_INFO("%s: moe stream: runahead stays off next to the oracle / A' / the drop rule "
++                "(LLAMA_MOE_STREAM_RUNAHEAD=6 turns it on)\n", __func__);
+     }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_DEBUG")) {
+         ra_debug = atoi(p);
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 1eb4181..26421af 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -499,7 +499,8 @@ struct llama_moe_stream {
+     // says the next call will NOT use - its false positives, on top of the oracle's own staging; 2 nothing,
+     // the graph still computes it. 1 and 2 are measurement apparatus, like oracle_recall below.
+     int32_t pred_stage = 0;
+-    // G2 runahead (SiegeLadder theory G2, runs.md 4.30 and 4.42; LLAMA_MOE_STREAM_RUNAHEAD=K, 0 = off, the default).
++    // G2 runahead (SiegeLadder theory G2, runs.md 4.30 and 4.42; LLAMA_MOE_STREAM_RUNAHEAD=K, 0 = off). The ctor
++    // makes K = 6 the default, except next to an oracle, A' or the drop rule (17.10, runs.md 4.43).
+     // At decode the remap of a layer is split in two (llama_moe_stream_remap_issue / _wait). Between them the graph
+     // computes an approximate FFN of the layer from the experts resident when the call came (the others at weight
+     // 0), then the next layer's attention and router on it; the second half stages the top K of that prediction

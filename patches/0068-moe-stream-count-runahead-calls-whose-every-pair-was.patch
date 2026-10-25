@@ -1,0 +1,53 @@
+From 8643bbe1fab1a3d713f22ac8774e0d258c23b1d1 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:34:09 +0000
+Subject: [PATCH 68/91] moe-stream : count runahead calls whose every pair was
+ resident at the end of the first half (SiegeLadder G32, a measurement)
+
+In those calls runahead's approximate pass ran the next layer's attention on its real input: the potential of reusing
+the pass's attention instead of recomputing it (which needs conditional execution on the card). SiegeLadder runs.md
+4.118: 53.3% of the calls of an exact runahead run (11641 of 21840; the pass kept 87.3% of the pairs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 6 ++++++
+ src/llama-moe-stream.h   | 2 ++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index e545def..036ac5e 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -3082,6 +3082,9 @@ void llama_moe_stream::print_stats(const char * role) const {
+                     "approximate pass, the exact GEMMs computed the others\n", __func__, pfx, stats.n_ra_reused,
+                     stats.n_ra_pairs > 0 ? 100.0*stats.n_ra_reused/stats.n_ra_pairs : 0.0);
+         }
++        LLAMA_LOG_WARN("%s: %smoe stream: runahead: G32 - %" PRId64 " calls (%.1f%%) had every pair resident at the end of "
++                "the first half (the pass's input to the next layer was the real one)\n", __func__, pfx, stats.n_ra_full,
++                100.0*stats.n_ra_full/stats.n_ra_calls);
+     }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+@@ -3710,6 +3713,9 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+     mgr.stats.n_ra_calls++;
+     mgr.stats.n_ra_pairs += n;
+     mgr.stats.n_ra_kept  += n_kept;
++    if (n_kept == n && sl.ra_valid) {
++        mgr.stats.n_ra_full++;
++    }
+     if (!sl.ra_valid) {
+         mgr.stats.n_ra_invalid++;
+     }
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index d5b6a28..bbdd50a 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -1038,6 +1038,8 @@ struct llama_moe_stream {
+         int64_t n_ra_invalid  = 0; // calls with no resident slot in the layer: approximate pass not trusted, nothing staged
+         int64_t n_ra_redo     = 0; // experts the second half found evicted and loaded again (expected 0)
+         int64_t n_ra_reused   = 0; // G30: pairs whose exact row was the approximate pass's (skipped by the exact GEMMs)
++        int64_t n_ra_full     = 0; // G32 (measurement): calls whose every pair was resident at the end of the first half -
++                                   // the pass's input to the next layer is then exactly the real one
+         int64_t t_ra_gap_us   = 0; // time from the end of the first half to the start of the second (the approximate pass)
+         int64_t t_ra_lock_us  = 0; // of that, waiting for mgr->mtx at the start of the second half (G21)
+         int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)

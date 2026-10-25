@@ -1,0 +1,375 @@
+From 94c17f845ea40d0f22b5c90725354516e8cefb93 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:25:04 +0000
+Subject: [PATCH 03/91] moe-stream : skip the pairs outside a prefill wave
+ instead of parking them
+
+LLAMA_MOE_STREAM_WAVE_SKIP=1, off by default, CUDA only, ubatches of 64 tokens and up.
+Multi-pass prefill parked the pairs of the other waves on resident slots, ran them through
+the expert GEMMs and zeroed them with a mask, so each of the 64 waves per layer multiplied
+the whole ubatch. Skipped, a pair gets an id past the last slot: the CUDA mul_mat_id (MMQ)
+leaves it out, op_params[2] = 1 on the down projection zeroes its rows of dst, and the mask
+goes away. ids_src1 is filled with -1 for the quantize kernels, which now skip those rows
+(through a signed cast: the old conditional promoted -1 to 4294967295), and the generic
+mul_mat_id path reads a zero row for them.
+
+Exact: KL against the build without it sits at the noise floor of the base file (max
+0.000058, same top token 100%), MUL_MAT_ID 877/877. It does not speed prompts up on this
+machine: the removed compute was hidden under the next wave's loads, and the disk is the
+limit. At -ub 2048 the CUDA VMM pool then fails to grow on an 8.9K prompt
+(cuMemSetAccess: not ready), hence off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 27 ++++++++++++++++++++----
+ ggml/src/ggml-cuda/mmq.cu       |  5 +++++
+ ggml/src/ggml-cuda/quantize.cu  | 30 ++++++++++++++++++++++----
+ src/llama-graph.cpp             | 26 +++++++++++++++++------
+ src/llama-moe-stream.cpp        | 37 +++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h          | 34 ++++++++++++++++++++++++++++++
+ 6 files changed, 143 insertions(+), 16 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 561ab7a..048c506 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1877,6 +1877,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+ 
++    // An id past the last expert marks a pair left out of the product (llama-moe-stream multi-pass
++    // prefill). No path below writes its rows of dst; op_params[2] = 1 asks for them to read as zero.
++    if (ggml_get_op_params_i32(dst, 2) != 0) {
++        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
++    }
++
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+@@ -1924,14 +1930,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     std::vector<int32_t> ids_to_sorted_host;
+     ids_to_sorted_host.reserve(2*ne_get_rows);
+-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
++    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, -1);
+ 
+     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
+ 
+     std::vector<int32_t> tokens_per_expert(ne02);
+ 
+     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
+-    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
++    // one row more than the pairs: the zero row that pairs left out of the product read back
++    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), (ne2*n_expert_used + 1)*ne0*ts_dst_sorted);
+ 
+     std::vector<char> ids_host(ggml_nbytes(ids));
+     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+@@ -1941,7 +1948,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+-                assert(expert_to_use >= 0 && expert_to_use < ne02);
++                assert(expert_to_use >= 0); // past ne02: a pair left out of the product
+                 if (expert_to_use == i02) {
+                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
+@@ -1951,7 +1958,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+             }
+         }
+     }
+-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
++    // pairs left out read the zero row after the sorted ones; ids_to_sorted is padded to ne_get_rows
++    // so that ids_from_sorted keeps its offset in the device buffer
++    const int64_t n_sorted = ids_to_sorted_host.size();
++    GGML_ASSERT(n_sorted <= ne_get_rows);
++    for (int32_t & i : ids_from_sorted_host) {
++        if (i < 0) {
++            i = n_sorted;
++        }
++    }
++    ids_to_sorted_host.resize(ne_get_rows, 0);
++    if (n_sorted < ne_get_rows) {
++        CUDA_CHECK(cudaMemsetAsync((char *) dst_sorted.ptr + n_sorted*ne0*ts_dst_sorted, 0, ne0*ts_dst_sorted, stream));
++    }
+ 
+     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
+ 
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 707437e..9e45c44 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -197,6 +197,11 @@ void ggml_cuda_mul_mat_q(
+         const int si1  = ids->nb[1] / ggml_element_size(ids);
+         const int sis1 = nb12 / nb11;
+ 
++        // A pair whose id is past the last expert (llama-moe-stream skips them) gets no compact row,
++        // so the helper writes no entry for it. -1 marks that for the quantize kernels, which would
++        // otherwise follow whatever the pool memory held.
++        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
++
+         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+         CUDA_CHECK(cudaGetLastError());
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index 2bd9b62..9d57683 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -139,7 +139,10 @@ static __global__ void quantize_mmq_nvfp4(
+     } else {
+         const int64_t i2  = blockIdx.y % ne2;
+         const int64_t i3  = blockIdx.y / ne2;
+-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
++        const int64_t i01 = ids ? (int64_t) ids[blockIdx.x] : (int64_t) blockIdx.x; // signed: see quantize_mmq_q8_1
++        if (i01 < 0) {
++            return; // compact row of no pair: the GEMM never reads it
++        }
+         base_idx = i3 * s03 + i2 * s02 + i01 * s01;
+     }
+     const float * __restrict__  x_row = x + base_idx;
+@@ -184,7 +187,9 @@ static __global__ void quantize_mmq_nvfp4(
+ #pragma unroll
+                 for (int slot = 0; slot < n_expert_used; ++slot) {
+                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+-                    scale[i] = warp_amax[0];
++                    if (i >= 0) { // -1: pair left out of the GEMM
++                        scale[i] = warp_amax[0];
++                    }
+                 }
+             } else {
+                 scale[blockIdx.y * ne1 + blockIdx.x] = warp_amax[0];
+@@ -310,6 +315,9 @@ static __global__ void quantize_mmq_nvfp4(
+ #pragma unroll
+             for (int slot = 0; slot < n_expert_used; ++slot) {
+                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++                if (i < 0) {
++                    continue; // pair left out of the GEMM
++                }
+                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
+                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
+                 yqs[2 * sub + 0] = q0;
+@@ -375,7 +383,10 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
+     } else {
+         const int64_t i2  = blockIdx.z % ne2;
+         const int64_t i3  = blockIdx.z / ne2;
+-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
++        const int64_t i01 = ids ? (int64_t) ids[blockIdx.x] : (int64_t) blockIdx.x; // signed: see quantize_mmq_q8_1
++        if (i01 < 0) {
++            return; // compact row of no pair: the GEMM never reads it
++        }
+         base_pos = i3 * s03 + i2 * s02 + i01 * s01;
+     }
+ 
+@@ -428,6 +439,9 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
+ #pragma unroll
+         for (int slot = 0; slot < n_expert_used; ++slot) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // pair left out of the GEMM
++            }
+             block_fp4_mmq * yb = y + (k_block * ne1 + i);
+             char2 * yqs2 = (char2 *) yb->qs;
+             if (lane_in_group == 0) {
+@@ -478,7 +492,12 @@ static __global__ void quantize_mmq_q8_1(
+     } else {
+         const int64_t i2  = blockIdx.z % ne2;
+         const int64_t i3  = blockIdx.z / ne2;
+-        const int64_t i01 = ids ? ids[blockIdx.x] : blockIdx.x;
++        // signed on purpose: with an unsigned blockIdx.x on the other side, the conditional is unsigned and turns
++        // the -1 of a pair left out of the GEMM into row 4294967295
++        const int64_t i01 = ids ? (int64_t) ids[blockIdx.x] : (int64_t) blockIdx.x;
++        if (i01 < 0) {
++            return; // compact row of no pair: the GEMM never reads it
++        }
+         base_idx = i3*s03 + i2*s02 + i01*s01;
+     }
+ 
+@@ -527,6 +546,9 @@ static __global__ void quantize_mmq_q8_1(
+         int64_t ib;
+         if constexpr (scatter) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // pair left out of the GEMM
++            }
+             ib = k_block*ne1 + i;
+         } else {
+             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 7c35fbd..4f3f4f1 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2461,6 +2461,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (msl && n_stream_waves > 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts);
+ 
++        bool wave_skip = false; // see llama_moe_stream_wave_skip; decided once the first wave is built
++
+         for (uint32_t w = 0; w < n_stream_waves; w++) {
+             ggml_tensor * args[2] = { ids_cont, nullptr };
+             int n_args = 1;
+@@ -2477,13 +2479,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+             ggml_tensor * e_w = build_expert_gemms(cur, ids_w);
+ 
+-            ggml_tensor * margs[2] = { ids_cont, ids_w };
+-            ggml_tensor * mask_w = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+-                    1, n_expert_used, n_tokens, 1,
+-                    margs, 2, llama_moe_stream_wave_mask, 1, msl->wave_userdata(w, stream_wave_cap));
+-            cb(mask_w, "ffn_moe_wave_mask", il);
++            if (w == 0) {
++                // skipping needs the pipeline to end in the down mul_mat_id itself: a bias, scale or
++                // LoRA term applied after it would land on the zeroed rows of the skipped pairs
++                msl->wave_skip_ok = e_w->op == GGML_OP_MUL_MAT_ID;
++                wave_skip = llama_moe_stream_wave_skip(*msl, n_tokens);
++            }
+ 
+-            e_w = ggml_mul(ctx0, e_w, mask_w); // zero the pairs that belong to other waves
++            if (wave_skip) {
++                // CUDA mul_mat_id: zero the rows of the pairs it leaves out (ids past the last slot)
++                e_w->op_params[2] = 1;
++            } else {
++                ggml_tensor * margs[2] = { ids_cont, ids_w };
++                ggml_tensor * mask_w = ggml_custom_4d(ctx0, GGML_TYPE_F32,
++                        1, n_expert_used, n_tokens, 1,
++                        margs, 2, llama_moe_stream_wave_mask, 1, msl->wave_userdata(w, stream_wave_cap));
++                cb(mask_w, "ffn_moe_wave_mask", il);
++
++                e_w = ggml_mul(ctx0, e_w, mask_w); // zero the pairs that belong to other waves
++            }
+ 
+             experts = experts == nullptr ? e_w : ggml_add(ctx0, experts, e_w);
+             ggml_build_forward_expand(gf, experts);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 3b24922..2630c1e 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -397,6 +397,11 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
+     use_direct_io = direct;
+ 
++    // opt-in: exact, but measured 2026-10-12 it does not speed up prompts (the disk is the limit) and at
++    // -ub 2048 the CUDA VMM pool then fails to grow (cuMemSetAccess: not ready) on an 8.9K prompt.
++    // alloc_bufs() keeps it only when every expert cache lands in a CUDA buffer.
++    wave_skip = std::getenv("LLAMA_MOE_STREAM_WAVE_SKIP") != nullptr;
++
+     // Router bias toward resident experts. Read once here rather than per call so a run cannot
+     // change policy halfway through and leave counters that describe two different experiments.
+     // Host-RAM tier size in whole GiB. Read once here, same reasoning as the bias below: a run
+@@ -556,6 +561,16 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+ 
+         LLAMA_LOG_INFO("%s: %12s expert cache size = %8.2f MiB (%u slots per layer)\n",
+                 __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, n_slots);
++
++        // skipped pairs carry an out-of-range id that only the CUDA mul_mat_id knows to leave out;
++        // any other backend would index past the cache with it
++        if (ggml_backend_buft_is_host(buft) || std::strncmp(ggml_backend_buft_name(buft), "CUDA", 4) != 0) {
++            wave_skip = false;
++        }
++    }
++    if (!no_alloc) {
++        LLAMA_LOG_INFO("%s: multi-pass prefill: pairs outside a wave are %s\n", __func__,
++                wave_skip ? "skipped (from 64 tokens)" : "parked and masked");
+     }
+ 
+     // The host tier is allocated here and not in the constructor: max_nb_expert only exists once
+@@ -1140,8 +1155,8 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 l2->n_lock_ops > 0 ? (double) l2->t_lock_us/l2->n_lock_ops : 0.0);
+     }
+     if (stats.n_wave_calls > 0) {
+-        LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms\n",
+-                __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0);
++        LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms, skipping = %" PRId64 "\n",
++                __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0, stats.n_waves_skip);
+     }
+ 
+     print_locality(pfx);
+@@ -1692,6 +1707,24 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+ // resident pool slots (pool_used prevents a repeat within the row, required by the Metal kernel)
+ void llama_moe_stream::emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out,
+         int32_t w, uint32_t n_ids, int64_t n_tok) {
++    if (llama_moe_stream_wave_skip(sl, n_tok)) {
++        // the GEMM leaves out every pair of another wave; no parking slot, no mask
++        stats.n_waves_skip++;
++        for (int64_t i = 0; i < n_tok*(int64_t) n_ids; i++) {
++            const int32_t e = ids[i];
++            GGML_ASSERT(sl.expert_wave[e] != 0xff);
++            if (sl.expert_wave[e] != (uint8_t) w) {
++                out[i] = LLAMA_MOE_STREAM_SKIP_ID;
++                continue;
++            }
++            const int32_t s = sl.expert_slot.at(e);
++            GGML_ASSERT(sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT);
++            sl.slot_last_use[s] = ++sl.use_counter;
++            out[i] = s;
++        }
++        return;
++    }
++
+     for (int64_t t = 0; t < n_tok; t++) {
+         sl.pool_used.clear();
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 2c2642e..76d43e9 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -119,6 +119,10 @@ struct llama_moe_stream_layer {
+ 
+     std::vector<std::unique_ptr<llama_moe_stream_wave>> wave_ud; // stable per-wave op userdata
+ 
++    // set at graph build: the expert pipeline of this layer ends in the down mul_mat_id itself, so
++    // the pairs outside a wave can be skipped instead of parked (see llama_moe_stream_wave_skip)
++    bool wave_skip_ok = false;
++
+     // stable userdata for wave w (grows lazily); called at graph build time only
+     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
+ 
+@@ -372,6 +376,12 @@ struct llama_moe_stream {
+     int64_t n_shift     = 0; // swaps made, guarded by mtx
+     int64_t n_shift_l2  = 0; // of those, substitutes found in the host tier
+ 
++    // Multi-pass prefill skips the pairs outside the current wave rather than parking them (see
++    // llama_moe_stream_wave_skip). Opt-in with LLAMA_MOE_STREAM_WAVE_SKIP=1, and only where the
++    // expert caches live in a CUDA buffer, the one backend whose mul_mat_id handles skipped ids.
++    // Exact either way - it changes which GEMM rows run, not what the model computes.
++    bool wave_skip = false;
++
+     llama_files files; // privately reopened GGUF files, same indices as the loader's
+ 
+     // Host-RAM tier below the VRAM slots. Off unless LLAMA_MOE_STREAM_L2_GIB is set; sized in
+@@ -469,6 +479,7 @@ struct llama_moe_stream {
+         int64_t n_preload_issued = 0; // next-wave loads started during a wave's compute
+         int64_t n_preload_ready  = 0; // wave experts already resident from the previous preload
+         int64_t t_stall_wave_us  = 0; // wait time in wave miss handling
++        int64_t n_waves_skip     = 0; // waves whose pairs of other waves were skipped, not parked
+     } stats;
+ 
+     // internals
+@@ -498,6 +509,29 @@ struct llama_moe_stream {
+     void emit_wave_slots(llama_moe_stream_layer & sl, const int32_t * ids, int32_t * out, int32_t w, uint32_t n_ids, int64_t n_tok); // write the slot ids
+ };
+ 
++// Pairs outside the current wave of a multi-pass prefill.
++//
++// They used to park on resident slots, run through the expert GEMMs and be zeroed by a mask, so
++// every wave multiplied the whole ubatch: with 18 slots that is 64 waves per layer. Measured
++// 2026-10-11 on an 8,897-token prompt (SiegeLadder runs.md 4.15): the wait on loads was 11% of
++// prompt time at -ub 2048 and 59% at -ub 512; the rest, ~15 ms per token at every ubatch size, was
++// mostly those 64 passes.
++//
++// Skipped, a pair gets LLAMA_MOE_STREAM_SKIP_ID, an id past the last slot. The CUDA mul_mat_id
++// leaves it out of the GEMM (the MMQ id helper never matches it), and op_params[2] = 1 on the down
++// projection zeroes its rows of dst, so the wave outputs add up without a mask.
++//
++// Only from LLAMA_MOE_STREAM_SKIP_MIN_TOKENS tokens: below that the CUDA backend can take the MMVQ
++// path, whose kernels index the expert by id with no range check.
++static const int32_t LLAMA_MOE_STREAM_SKIP_ID         = INT32_MAX;
++static const int64_t LLAMA_MOE_STREAM_SKIP_MIN_TOKENS = 64;
++
++// The one place the mode is decided. The graph (mask or no mask) and the wave ids op (park or
++// skip) must agree, or parked pairs would be summed unmasked.
++static inline bool llama_moe_stream_wave_skip(const llama_moe_stream_layer & sl, int64_t n_tokens) {
++    return sl.mgr->wave_skip && sl.wave_skip_ok && n_tokens >= LLAMA_MOE_STREAM_SKIP_MIN_TOKENS;
++}
++
+ // callback of the id-remapping custom op inserted by build_moe_ffn
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+ 

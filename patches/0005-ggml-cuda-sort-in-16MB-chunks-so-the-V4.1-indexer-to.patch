@@ -1,0 +1,42 @@
+From fd3adec4d12f681144c7351aba1fed12925d5348 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 20:20:12 +0000
+Subject: [PATCH 05/91] ggml-cuda : sort in 16MB chunks, so the V4.1 indexer
+ top-k keeps the pool flat
+
+With CUDA 13.0 the bundled CCCL is 3.0, below the 3.2 that enables the cub top-k, so
+ggml_top_k falls back to a chunked cub argsort. Each chunk keeps about five buffers of the
+chunk size in the pool at once (the copy top_k sorts into, cub's keys, indices and its two
+sort buffers). DeepSeek-V4.1 sorts a 2048 x n_ctx indexer score per layer at -ub 2048, so
+the pool grew by ~38 MiB per 1K of context until the 64MB chunks saturated near 8.2K, ~0.3 GB
+in all; on a 16 GB card under WDDM the last growth failed in cuMemSetAccess (not ready) on
+an 8.9K prompt. With 16MB chunks the peak stays near 80MB for any context: VRAM stayed flat
+at 15,778 MiB through the same 8.9K prompt, which now runs at 67.6 tokens/s with
+LLAMA_MOE_STREAM_WAVE_SKIP=1 (56.6 without it). test-backend-ops ARGSORT and TOP_K pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/argsort.cu | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/argsort.cu b/ggml/src/ggml-cuda/argsort.cu
+index 26af900..c713ec6 100644
+--- a/ggml/src/ggml-cuda/argsort.cu
++++ b/ggml/src/ggml-cuda/argsort.cu
+@@ -31,9 +31,13 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
+ 
+ // returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
+ int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
+-    // perform argsort in chunks up to approximately this size (currently 64MB)
+-    // to avoid excessive temporary buffers memory usage
+-    const int chunk_bytes = 1 << 26;
++    // perform argsort in chunks up to approximately this size (currently 16MB)
++    // to avoid excessive temporary buffers memory usage. Each chunk holds about five buffers of
++    // this size in the pool at once (the copy top_k sorts into, cub's keys, indices and two sort
++    // buffers), and DeepSeek-V4.1 sorts a 2048 x n_ctx indexer score per layer: at 64MB that
++    // peak was ~320MB, and on a 16GB card the pool could not grow the last ~80MB of it at an
++    // 8.9K context (cuMemSetAccess: not ready). 16MB keeps it near 80MB for any context.
++    const int chunk_bytes = 1 << 24;
+ 
+     // calculate how many rows will fit in one chunk (must be at least one)
+     const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);

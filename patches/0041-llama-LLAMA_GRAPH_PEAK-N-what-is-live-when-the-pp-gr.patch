@@ -1,0 +1,128 @@
+From 0fe2360590aabca01887978e5056c48363b27c08 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 19:21:57 +0000
+Subject: [PATCH 41/91] llama : LLAMA_GRAPH_PEAK=N, what is live when the pp
+ graph's compute tensors peak, and LLAMA_MOE_WEIGHT_INPLACE=1, the experts'
+ weighting in place (SiegeLadder P7) - the peak report replays the graph in
+ node order with every op output (views alias their source) alive from its
+ node to its last reader, and prints the step with the most live bytes and its
+ N largest tensors: an estimate of the allocator's (in-place reuse and
+ fragmentation left out). SiegeLadder runs.md 4.63: at -ub 2048, 12K, ~840 MiB
+ live of a 1 221 MiB buffer at layer 0's hyper-connections and Engram - four
+ hc streams [5120, 4, 2048] at 160 MiB and a [25600, 2048] product at 200 MiB
+ - not the attention, not the MoE; all of it grows with the ubatch. Weighting
+ in place (the same products into the down GEMM's own output, never into a
+ leaf) with the attention split by head groups (LLAMA_DSV4_ATTN_SPLIT=8): 1
+ 169 MiB, 52 MiB under the plain graph. Both off by default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 69 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-graph.cpp   | 14 ++++++++-
+ 2 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b2ea4df..9f59a14 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -821,6 +821,75 @@ void llama_context::sched_reserve() {
+                         (long long) t->ne[3], b ? ggml_backend_name(b) : "-");
+             }
+         }
++
++        // SiegeLadder P7 (runs.md 4.63): LLAMA_GRAPH_PEAK=N - what is live when the pp graph's compute tensors peak, an
++        // estimate of the allocator's: every op output (views alias their source) lives from its node to its last
++        // reader, the GPU's alone, in node order; the step with the most live bytes and its N largest tensors. In-place
++        // reuse and fragmentation are left out, so the real buffer may be smaller or larger - this says WHAT fills it
++        if (const char * p = std::getenv("LLAMA_GRAPH_PEAK")) {
++            const int n_nodes = ggml_graph_n_nodes(gf);
++            std::unordered_map<const ggml_tensor *, int> idx;  // tensor -> node index
++            std::vector<int> last(n_nodes, -1);                // node -> index of its last reader
++            auto owner = [](const ggml_tensor * t) { while (t->view_src) { t = t->view_src; } return t; };
++            for (int i = 0; i < n_nodes; i++) {
++                idx[ggml_graph_node(gf, i)] = i;
++            }
++            for (int i = 0; i < n_nodes; i++) {
++                const ggml_tensor * t = ggml_graph_node(gf, i);
++                for (int s = 0; s < GGML_MAX_SRC && t->src[s]; s++) {
++                    auto it = idx.find(owner(t->src[s]));
++                    if (it != idx.end()) {
++                        last[it->second] = std::max(last[it->second], i);
++                    }
++                }
++            }
++            auto on_gpu = [&](const ggml_tensor * t) {
++                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched.get(), const_cast<ggml_tensor *>(t));
++                // after the reserve the scheduler keeps no backend per node (null): count those, skip only known CPU ones
++                return b == nullptr || ggml_backend_dev_type(ggml_backend_get_device(b)) != GGML_BACKEND_DEVICE_TYPE_CPU;
++            };
++            std::vector<std::vector<int>> dies(n_nodes);
++            size_t live = 0, peak = 0;
++            int peak_at = -1;
++            std::vector<char> alive(n_nodes, 0);
++            for (int i = 0; i < n_nodes; i++) {
++                const ggml_tensor * t = ggml_graph_node(gf, i);
++                if (t->view_src == nullptr && on_gpu(t)) {
++                    alive[i] = 1;
++                    live += ggml_nbytes(t);
++                    dies[std::max(i, last[i])].push_back(i);
++                }
++                if (live > peak) {
++                    peak    = live;
++                    peak_at = i;
++                }
++                for (int j : dies[i]) {
++                    alive[j] = 0;
++                    live -= ggml_nbytes(ggml_graph_node(gf, j));
++                }
++            }
++            if (peak_at >= 0) {
++                // the live set at the peak, by replaying up to it
++                std::vector<int> set;
++                for (int j = 0; j <= peak_at; j++) {
++                    const ggml_tensor * t = ggml_graph_node(gf, j);
++                    if (t->view_src == nullptr && on_gpu(t) && std::max(j, last[j]) >= peak_at) {
++                        set.push_back(j);
++                    }
++                }
++                std::sort(set.begin(), set.end(), [&](int a, int b) {
++                    return ggml_nbytes(ggml_graph_node(gf, a)) > ggml_nbytes(ggml_graph_node(gf, b)); });
++                LLAMA_LOG_INFO("%s: pp graph peak (estimate): %.1f MiB of op outputs live at node %d of %d (%s), %zu tensors:\n",
++                        __func__, peak/1048576.0, peak_at, n_nodes, ggml_graph_node(gf, peak_at)->name, set.size());
++                const int top = std::max(1, atoi(p));
++                for (int k = 0; k < top && k < (int) set.size(); k++) {
++                    const ggml_tensor * t = ggml_graph_node(gf, set[k]);
++                    LLAMA_LOG_INFO("%s:   %8.1f MiB  %-34s %-16s [%lld, %lld, %lld, %lld] node %d, last read %d\n", __func__,
++                            ggml_nbytes(t)/1048576.0, t->name, ggml_op_desc(t), (long long) t->ne[0], (long long) t->ne[1],
++                            (long long) t->ne[2], (long long) t->ne[3], set[k], last[set[k]]);
++                }
++            }
++        }
+     }
+ 
+     // reserve with tg (token generation) graph to get the number of splits and nodes
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fd47048..18ad726 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2675,7 +2675,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     }
+ 
+     if (!weight_before_ffn) {
+-        experts = ggml_mul(ctx0, experts, drop_mask != nullptr ? ggml_mul(ctx0, weights, drop_mask) : weights);
++        // SiegeLadder P7 (runs.md 4.63): at a big ubatch the expert outputs [n_embd, n_expert_used, n_tokens] and their
++        // weighted copy live together - 480 MiB at 2048 tokens - and set the compute buffer's peak once the attention is
++        // split. LLAMA_MOE_WEIGHT_INPLACE=1 weights them in place (the same products, into the GEMM's own output); for
++        // A/B while it is measured
++        static const bool weight_inplace = getenv("LLAMA_MOE_WEIGHT_INPLACE") != nullptr &&
++                atoi(getenv("LLAMA_MOE_WEIGHT_INPLACE")) != 0;
++        ggml_tensor * w = drop_mask != nullptr ? ggml_mul(ctx0, weights, drop_mask) : weights;
++        // in place only into an op's output (the waves' in-place GEMMs make it a view of the first wave's), never a leaf
++        const ggml_tensor * own = experts;
++        while (own->view_src != nullptr) {
++            own = own->view_src;
++        }
++        experts = weight_inplace && own->op != GGML_OP_NONE ? ggml_mul_inplace(ctx0, experts, w) : ggml_mul(ctx0, experts, w);
+         cb(experts, "ffn_moe_weighted", il);
+     }
+ 

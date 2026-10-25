@@ -1,0 +1,105 @@
+From 44518c469a21af28021f5ba8fed878ab95288956 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:41:56 +0000
+Subject: [PATCH 70/91] ggml-cuda : FlashAttention with 32 heads per block for
+ one query per stream - the sparse prefill's streams (SiegeLadder D10 step 2,
+ LLAMA_DSV4_SPARSE_FA_NCOLS2 = 8 / 16 / 32, default 32)
+
+D10 gives every query its own stream with its own 768-row K. At 8 of the 64 heads per block each stream's K was read
+8 times, from DRAM: the stream-k blocks in flight on other streams thrash L2. Instances (512, 512, 1, 16) and
+(512, 512, 1, 32), declared in fattn.cu (not fattn-mma-f16.cuh, so adding them does not rebuild every MMA instance);
+picked only for Q->ne[1] == 1 && Q->ne[3] > 1 with the GQA path - generation (one stream) keeps 8.
+test-backend-ops FLASH_ATTN_EXT 2924/2924 (32), the stream cases 4/4 at 16; perf, 512 streams, kv 768:
+8 - 3.96 ms (13.0 TFLOPS), 16 - 2.10 ms (24.6), 32 - 1.34 ms (38.3).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/fattn.cu                   | 26 +++++++++++++++++++
+ ...ttn-mma-f16-instance-ncols1_1-ncols2_16.cu |  1 +
+ ...ttn-mma-f16-instance-ncols1_1-ncols2_32.cu |  1 +
+ .../template-instances/generate_cu_files.py   |  5 ++--
+ 4 files changed, 31 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index ab7a3b2..73886ea 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -5,6 +5,11 @@
+ #include "fattn-vec.cuh"
+ #include "fattn.cuh"
+ 
++// DeepSeek V4 sparse prefill (SiegeLadder D10 step 2): one query per stream, 16 or 32 of its 64 heads per block. Declared here,
++// not in fattn-mma-f16.cuh, so adding them does not rebuild every MMA instance file.
++extern DECL_FATTN_MMA_F16_CASE(512, 512, 1, 16);
++extern DECL_FATTN_MMA_F16_CASE(512, 512, 1, 32);
++
+ template <int DKQ, int DV, int ncols2>
+ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -88,6 +93,27 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
+         }
+     }
+ 
++    if constexpr (DKQ == 512 && DV == 512) {
++        // SiegeLadder D10 step 2: DeepSeek V4 sparse prefill gives every query its own stream (Q [512, 1, 64, n_stream]) and its
++        // own K of 768 rows. With 8 heads per block each stream's K is read 8 times, and with ~a block per SM in flight
++        // on other streams those reads miss L2. 16 / 32 heads per block read it 4 / 2 times. Generation (one stream) keeps 8.
++        // LLAMA_DSV4_SPARSE_FA_NCOLS2 = 8 / 16 / 32 (default 32).
++        static const int sparse_ncols2 = [] {
++            const char * s = getenv("LLAMA_DSV4_SPARSE_FA_NCOLS2");
++            return s ? atoi(s) : 32;
++        }();
++        if (use_gqa_opt && Q->ne[1] == 1 && Q->ne[3] > 1) {
++            if (sparse_ncols2 == 32 && gqa_ratio % 32 == 0) {
++                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 32>(ctx, dst);
++                return;
++            }
++            if (sparse_ncols2 == 16 && gqa_ratio % 16 == 0) {
++                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 16>(ctx, dst);
++                return;
++            }
++        }
++    }
++
+     if (use_gqa_opt && gqa_ratio > 4) {
+         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+         return;
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu
+index b2661b9..d27ef59 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_16.cu
+@@ -3,4 +3,5 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(192, 128, 1, 16);
++DECL_FATTN_MMA_F16_CASE(512, 512, 1, 16);
+ DECL_FATTN_MMA_F16_CASE(576, 512, 1, 16);
+diff --git a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu
+index 8fc3b17..6330ea1 100644
+--- a/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu
++++ b/ggml/src/ggml-cuda/template-instances/fattn-mma-f16-instance-ncols1_1-ncols2_32.cu
+@@ -3,4 +3,5 @@
+ #include "../fattn-mma-f16.cuh"
+ 
+ DECL_FATTN_MMA_F16_CASE(320, 256, 1, 32);
++DECL_FATTN_MMA_F16_CASE(512, 512, 1, 32);
+ DECL_FATTN_MMA_F16_CASE(576, 512, 1, 32);
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index d7cd271..c1d27cf 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -93,11 +93,12 @@ for ncols in [8, 16, 32, 64]:
+                     continue
+                 if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
+                     continue
+-                if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
++                # Gemma 4 (+ MTP); ncols1 1 with ncols2 16 / 32: DeepSeek V4 sparse prefill, one query per stream (SiegeLadder D10)
++                if head_size_kq == 512 and ncols2 not in (2, 4, 8) and not (ncols1 == 1 and ncols2 in (16, 32)):
+                     continue
+                 if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
+                     continue
+-                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
++                if head_size_kq not in (192, 320, 512, 576) and ncols2 in (16, 32):
+                     continue
+                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
+                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))

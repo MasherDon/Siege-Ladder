@@ -1,0 +1,71 @@
+From 499607161bf57a36e6b9a7006b1789a8d86ec998 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:50:16 +0000
+Subject: [PATCH 26/91] moe-stream : ORACLE_RECALL also drops the missed
+ experts from the oracle's read-ahead into L2
+
+A predictor that misses an expert of a call misses it on both paths: the same deterministic draw (call, expert) that
+keeps an expert out of the VRAM staging now keeps it out of the read-ahead (LLAMA_MOE_STREAM_AHEAD) too. Measurement
+apparatus only; nothing changes at recall 1 or without the oracle.
+
+SiegeLadder runs.md 4.40, theory G17 (predicting two layers ahead), at recall 0.85, main mode: staging one call ahead
+15.75 tok/s; with the read-ahead two / three / four calls ahead 16.62 / 16.79 / 16.83 (+5.5 / +6.6 / +6.9%), text =
+trace in all 16 runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 11 +++++++++--
+ src/llama-moe-stream.h   |  4 +++-
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index e10560e..343edb0 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1421,6 +1421,8 @@ void llama_moe_stream::save_trace() const {
+             __func__, spec_trace.size(), spec_trace_path.c_str());
+ }
+ 
++static float moe_hash01(uint64_t a, uint64_t b); // ORACLE_RECALL's draw, defined with stage_ahead_locked
++
+ // A4. The index is this manager's OWN call counter, so a run that issues the same calls in the
+ // same order replays exactly. Recording happens whatever the mode, because a trace is only worth
+ // anything if it comes from a run that was not already being helped by one.
+@@ -1467,6 +1469,11 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+             continue;
+         }
+         for (const int32_t e : spec_oracle[j].second) {
++            // ORACLE_RECALL: a predictor that misses an expert of a call misses it on the drive too - the same
++            // deterministic draw as the staging, so a missed expert is neither read ahead nor staged
++            if (oracle_recall < 1.0f && moe_hash01((uint64_t) j0, (uint64_t) e) >= oracle_recall) {
++                continue;
++            }
+             speculate_locked(*layers[il_futuro], e);
+         }
+         spec_frontier = j0;
+@@ -1749,8 +1756,8 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 stats.n_stage_late, stats.n_stage_waste, stats.n_stage_skip, stats.n_pred_spec);
+     }
+     if (oracle_recall < 1.0f || pred_stage != 0) {
+-        LLAMA_LOG_WARN("%s: %smoe stream: measurement: the oracle's staging keeps %.2f of each call's experts; "
+-                "the prediction stages %s\n", __func__, pfx, oracle_recall,
++        LLAMA_LOG_WARN("%s: %smoe stream: measurement: the oracle's staging and read-ahead keep %.2f of each call's "
++                "experts; the prediction stages %s\n", __func__, pfx, oracle_recall,
+                 pred_stage == 0 ? "all it predicts" : pred_stage == 1 ? "only its false positives" : "nothing");
+     }
+     if (drop_w > 0.0f) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 2047fc4..94e73c0 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -482,7 +482,9 @@ struct llama_moe_stream {
+     // the graph still computes it. 1 and 2 are measurement apparatus, like oracle_recall below.
+     int32_t pred_stage = 0;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+-    // probability, by a deterministic hash of the call and the expert (LLAMA_MOE_STREAM_ORACLE_RECALL, 1 = all)
++    // probability, by a deterministic hash of the call and the expert (LLAMA_MOE_STREAM_ORACLE_RECALL, 1 = all).
++    // Since 17.10 the oracle's read-ahead into L2 (LLAMA_MOE_STREAM_AHEAD) drops the same experts: a predictor
++    // that misses an expert misses it on both paths (SiegeLadder theory G17, two layers ahead)
+     float   oracle_recall = 1.0f;
+     std::vector<int32_t> oracle_kept; // scratch of stage_ahead_locked, under mtx
+     // Drop rule (proposed by the user 2026-10-15; lossy, so opt-in and measured by KL first). A step waits

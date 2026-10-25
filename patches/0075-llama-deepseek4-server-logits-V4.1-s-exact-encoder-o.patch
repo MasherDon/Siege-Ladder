@@ -1,0 +1,775 @@
+From cdb3f3278567e56944736c1c24d0485d7d719c28 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 18:50:49 +0000
+Subject: [PATCH 75/91] llama, deepseek4, server, logits : V4.1's exact
+ encoder-only prefill, on by default (SiegeLadder P4; LLAMA_DSV4_ENC_ONLY=0 -
+ off) and the G4 CPU-lane probe (LLAMA_MOE_STREAM_G4_PROBE, measurement, off)
+
+P4: V4.1 is a causal encoder-decoder - of layers 20-39 only layer 20 (the last KV source) leaves anything for later
+positions (its compressed rows, index keys, compressor state); layers 21-39 write only their window rings, so the
+decoder's reach is (39 - 20) * (n_swa - 1) = 2413 positions. Inside every llama_decode call a ubatch without outputs whose
+positions all lie more than that before the first position the call hands back (an output, or the call's end) runs layers
+0-19 and layer 20's cache writes only (build_attention_impl src_only), and the graph ends there. Checked: bitwise at -ub 1
+(llama-logits score, 586 encoder-only ubatches) with a tight negative control (reach 2412 differs at the first target);
+at -ub 8192 the answer's top-20 logprobs equal a control with the same batching. Consultant 30K 549 -> 845 tok/s,
+128K 172 s, 256K 343 s (SiegeLadder runs.md 4.135-4.136). The server cuts the prompt 4 tokens before its end only when
+the context runs P4 (llama_dsv4_enc_only); llama-logits takes -b for score mode.
+
+G4 probe: in a decode call without a drive wait the last k(n) experts held in the host tier and off the card stand for a
+CPU lane's - dropped (1), dropped + the reply waits k x T us (2), control with weight 0 but loaded (3), or 2 + staged after
+the call's loads (4); counters in print_stats.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/llama.h                 |   2 +
+ src/llama-context.cpp           | 129 ++++++++++++++++++++++++++++++++
+ src/llama-context.h             |  15 ++++
+ src/llama-cparams.h             |   1 +
+ src/llama-graph.h               |   2 +
+ src/llama-hparams.cpp           |  33 ++++++++
+ src/llama-hparams.h             |   8 ++
+ src/llama-moe-stream.cpp        | 106 +++++++++++++++++++++++++-
+ src/llama-moe-stream.h          |  22 ++++++
+ src/models/deepseek4.cpp        |  62 ++++++++++++++-
+ src/models/models.h             |   5 +-
+ tools/logits/logits.cpp         |   9 ++-
+ tools/server/server-context.cpp |   8 +-
+ 13 files changed, 392 insertions(+), 10 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 2670be1..3cfe65f 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -564,6 +564,8 @@ extern "C" {
+     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
++    // SiegeLadder P4: true when the context runs DeepSeek-V4.1's encoder-only ubatches (LLAMA_DSV4_ENC_ONLY, on by default)
++    LLAMA_API bool     llama_dsv4_enc_only(const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d4afbc9..8e95079 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -534,6 +534,49 @@ llama_context::llama_context(
+             }
+         }
+ 
++        // SiegeLadder P4 (LLAMA_DSV4_ENC_ONLY, on by default since 21.10 - bitwise at -ub 1 with a tight negative control at
++        // reach - 1, the answer's top-20 logprobs equal at -ub 8192, runs.md; =0 - off; see p4_enc_only): the decoder of
++        // V4.1 (layers 20-39) reads nothing of a position but its window rings, so a ubatch more than its reach before the
++        // first position a call must hand back exact runs the encoder only - about half the experts, copies and compute
++        const char * p4_env   = std::getenv("LLAMA_DSV4_ENC_ONLY");
++        const bool   p4_asked = p4_env != nullptr && atoi(p4_env) != 0;
++        if (p4_env == nullptr || p4_asked) {
++            const int32_t first = model.hparams.dsv4_dec_first();
++            int32_t       reach = model.hparams.dsv4_dec_reach();
++            const char *  why   = nullptr;
++            if (model.arch != LLM_ARCH_DEEPSEEK41 || first < 0 || reach <= 0) {
++                why = "the model is not V4.1's causal encoder-decoder";
++            } else if (cparams.embeddings || cparams.embeddings_nextn || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
++                why = "embedding and MTP contexts read the last layer's state of every position";
++            } else if (std::getenv("LLAMA_DSV41_NO_HC_THREAD") != nullptr) {
++                why = "LLAMA_DSV41_NO_HC_THREAD (a measurement) collapses each sublayer with its own mix";
++            }
++            // on by default: another model needs no word about it
++            if (why != nullptr && !p4_asked && model.arch != LLM_ARCH_DEEPSEEK41) {
++                why = nullptr;
++            } else if (why != nullptr) {
++                LLAMA_LOG_WARN("%s: SiegeLadder P4 (LLAMA_DSV4_ENC_ONLY) is off: %s\n", __func__, why);
++            } else {
++                // a test of the bound only: below the model's reach the decoder starts too late and the logits differ
++                if (const char * r = std::getenv("LLAMA_DSV4_ENC_ONLY_REACH")) {
++                    const int32_t v = std::max(0, atoi(r));
++                    if (v < reach) {
++                        LLAMA_LOG_WARN("%s: SiegeLadder P4: LLAMA_DSV4_ENC_ONLY_REACH=%d is below the decoder's reach %d - "
++                                "NOT EXACT, a test of the bound\n", __func__, v, reach);
++                    }
++                    reach = v;
++                }
++                if (const char * m = std::getenv("LLAMA_DSV4_ENC_ONLY_MIN")) {
++                    p4_min = (uint32_t) std::max(1, atoi(m));
++                }
++                p4_reach = reach;
++                p4_dec_start.assign(LLAMA_MAX_SEQ, -1);
++                LLAMA_LOG_WARN("%s: SiegeLadder P4: a ubatch of >= %u tokens more than %d positions before the first "
++                        "position its call hands back (an output, or the call's end) runs layers 0-%d and layer %d's "
++                        "cache writes only\n", __func__, p4_min, p4_reach, first - 1, first);
++            }
++        }
++
+         sched_reserve();
+ 
+         // P1: the -ub buffers are reserved only when the first long prompt comes. Probe them now, with the head
+@@ -728,6 +771,10 @@ void llama_context::sched_reserve() {
+ 
+     sched_need_reserve = false;
+ 
++    // SiegeLadder P4: the worst case is the whole model - never an encoder-only graph (decode sets the flag around one
++    // ubatch's build only; this keeps a flag left by a throw out of the reserve)
++    cparams.dsv4_enc_only = false;
++
+     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+ 
+     synchronize();
+@@ -979,6 +1026,29 @@ uint32_t llama_context::n_ubatch_reserve() const {
+     return (p1_ub_small > 0 && !cparams.head_out && !p1_full) ? p1_ub_small : cparams.n_ubatch;
+ }
+ 
++// SiegeLadder P4: a ubatch runs the encoder only when it has no output and every position of every sequence it holds lies
++// below that sequence's p4_dec_start (set per call in decode). The decoder state it leaves behind - the window rings of
++// layers 21-39 at its positions - is stale, and the call's own full ubatches after it overwrite every part of it that a
++// logit or the call's final state can reach: a decoder layer d layers past the first reads its ring back (n_swa - 1)
++// positions per layer, d*(n_swa - 1) in all, and the first decoder layer's ring and caches are written here too
++bool llama_context::p4_enc_only(const llama_ubatch & ubatch) const {
++    if (p4_reach <= 0 || ubatch.n_tokens < p4_min) {
++        return false;
++    }
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.output[i]) {
++            return false;
++        }
++        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
++            const llama_seq_id seq = ubatch.seq_id[i][s];
++            if (seq < 0 || seq >= (llama_seq_id) p4_dec_start.size() || ubatch.pos[i] >= p4_dec_start[seq]) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ void llama_context::p1_enter() {
+     if (sched) {
+         ggml_backend_sched_synchronize(sched.get());
+@@ -2194,6 +2264,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+ 
++    // SiegeLadder P4: per sequence, the first position this call must hand back exact - its first output, or the end of
++    // the call when it has none before that (the state it leaves for the next call, a checkpoint, a slot file) - less the
++    // decoder's reach. A ubatch below it in every sequence it holds runs the encoder only (p4_enc_only); from the first
++    // ubatch at or past it on, the whole model. A layer input past the encoder, wanted for every position, keeps it off
++    if (p4_reach > 0) {
++        std::fill(p4_dec_start.begin(), p4_dec_start.end(), -1);
++        // (the MTP drafter reads the last layer's hidden state of every position: such a call runs the whole model)
++        bool p4_call = !output_all && !cparams.embeddings_nextn;
++        for (size_t il = (size_t) model.hparams.dsv4_dec_first() + 1; p4_call && il < cparams.embeddings_layer_inp.size(); ++il) {
++            p4_call = !cparams.embeddings_layer_inp[il];
++        }
++        if (p4_call) {
++            const llama_batch & b = balloc->get_batch();
++            std::vector<llama_pos> first_out(LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
++            std::vector<llama_pos> end(LLAMA_MAX_SEQ, -1);
++            for (int32_t i = 0; i < b.n_tokens; ++i) {
++                for (int32_t s = 0; s < b.n_seq_id[i]; ++s) {
++                    const llama_seq_id seq = b.seq_id[i][s];
++                    if (b.logits[i]) {
++                        first_out[seq] = std::min(first_out[seq], b.pos[i]);
++                    }
++                    end[seq] = std::max(end[seq], b.pos[i] + 1);
++                }
++            }
++            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
++                if (end[s] >= 0) {
++                    p4_dec_start[s] = std::min(first_out[s], end[s]) - p4_reach;
++                }
++            }
++        }
++    }
++
+     // SiegeLadder P9: the expert stream's host tier holds what a prompt touches while it runs; a long call begins the
+     // holding (anew from position 0), a few short calls in a row end it - llama_moe_stream::batch_begin
+     if (auto * ms = model.moe_stream()) {
+@@ -2342,8 +2444,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    // SiegeLadder P4: this call's encoder-only ubatches and their tokens
++    int64_t p4_ub_call  = 0;
++    int64_t p4_tok_call = 0;
++    int64_t n_ub_call   = 0;
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
++        n_ub_call++;
+ 
+         // count the outputs in this ubatch
+         {
+@@ -2361,9 +2469,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             n_outputs = n_outputs_new;
+         }
+ 
++        // SiegeLadder P4: this ubatch's graph - the encoder only, or the whole model. Set for its build and reset at once,
++        // so that no reserve and no other graph ever sees it
++        cparams.dsv4_enc_only = p4_enc_only(ubatch);
++        if (cparams.dsv4_enc_only) {
++            p4_ub_call++;
++            p4_tok_call += ubatch.n_tokens;
++        }
++
+         ggml_status status;
+ 
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
++        cparams.dsv4_enc_only = false;
+ 
+         if (!res) {
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+@@ -2534,6 +2651,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         n_tokens_prev  += ubatch.n_tokens;
+     } while (mctx->next());
+ 
++    if (p4_ub_call > 0) {
++        p4_n_ubatch += p4_ub_call;
++        p4_n_tokens += p4_tok_call;
++        LLAMA_LOG_INFO("%s: SiegeLadder P4: %lld of %lld ubatches (%lld of %u tokens) ran the encoder only (%lld / %lld "
++                "since the start)\n", __func__, (long long) p4_ub_call, (long long) n_ub_call, (long long) p4_tok_call,
++                n_tokens_all, (long long) p4_n_ubatch, (long long) p4_n_tokens);
++    }
++
+     // SiegeLadder P1: this call had outputs while the head was out - it comes back and computes them now
+     if (cparams.head_out && !p1_groups.empty()) {
+         if (!p1_leave()) {
+@@ -4210,6 +4335,10 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
+     return ctx->n_ubatch();
+ }
+ 
++bool llama_dsv4_enc_only(const llama_context * ctx) {
++    return ctx->p4_active();
++}
++
+ uint32_t llama_n_seq_max(const llama_context * ctx) {
+     return ctx->n_seq_max();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 08f722a..710a3e7 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -253,6 +253,9 @@ public:
+ 
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
++    // SiegeLadder P4: this context runs encoder-only ubatches (llama_dsv4_enc_only)
++    bool p4_active() const { return p4_reach > 0; }
++
+ private:
+     llm_graph_params graph_params(
+                         llm_graph_result * res,
+@@ -365,6 +368,18 @@ private:
+     bool p1_leave();                    // head back, logits of p1_groups, buffers for N tokens
+     bool p1_logits(int64_t row0, int64_t n_rows);
+ 
++    // SiegeLadder P4 (LLAMA_DSV4_ENC_ONLY=1, off by default): V4.1 as a causal encoder-decoder. Per decode call and
++    // sequence, p4_dec_start is the first position the call must hand back exact - its first output, or the end of the
++    // call (the state it leaves) - less the decoder's reach (llama_hparams::dsv4_dec_reach, 2413 on V4.1); a ubatch with
++    // every position below it runs the encoder only (cparams.dsv4_enc_only, models/deepseek4.cpp). No API: every logit
++    // and every state between calls is the full model's
++    int32_t  p4_reach = 0;                 // 0 = off
++    uint32_t p4_min   = 1;                 // the smallest ubatch that may skip the decoder (LLAMA_DSV4_ENC_ONLY_MIN)
++    std::vector<llama_pos> p4_dec_start;   // [LLAMA_MAX_SEQ] for the current call, -1 = none
++    int64_t  p4_n_ubatch = 0;              // encoder-only ubatches so far
++    int64_t  p4_n_tokens = 0;              // ... and their tokens
++    bool p4_enc_only(const llama_ubatch & ubatch) const;
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index c69058d..acd114d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -54,6 +54,7 @@ struct llama_cparams {
+     bool pipeline_parallel;
+     bool head_out = false;   // SiegeLadder P1: the output head is released - graphs end at t_embd, no logits
+     bool dsv4_reserve_dense = false; // SiegeLadder D10: the graph being reserved takes a DSV4 ubatch's non-sparse plan
++    bool dsv4_enc_only      = false; // SiegeLadder P4: this ubatch runs V4.1's encoder only (llama_context::p4_enc_only)
+ 
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 6f62d6d..2be72f5 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1005,6 +1005,8 @@ struct llm_graph_params {
+             // SiegeLadder G23: warmup builds with every expert (n_expert_used), P1's released head ends graphs at t_embd
+             cparams.warmup                  == other.cparams.warmup                  &&
+             cparams.head_out                == other.cparams.head_out                &&
++            // SiegeLadder P4: an encoder-only graph ends at the first decoder layer's cache writes
++            cparams.dsv4_enc_only           == other.cparams.dsv4_enc_only           &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
+index 846d4c6..4ed0019 100644
+--- a/src/llama-hparams.cpp
++++ b/src/llama-hparams.cpp
+@@ -281,6 +281,39 @@ uint32_t llama_hparams::n_layer() const {
+     return n_layer_all - n_layer_nextn;
+ }
+ 
++// SiegeLadder P4 (docs/v41 theories, row P4; design - docs/v41/p4-design.md). A DSV4 layer reads the compressed caches of
++// the last KV source at or before it (dsv4_kv_src_layer; the index keys too), and only a source writes any: so from the last
++// source on, the only state a layer leaves for other positions is its own window ring. A layer at position p attends over
++// its ring at p - (n_swa - 1) .. p (is_masked_swa, standard), written from the layer below at those positions; k layers
++// after the source the chain reaches back k*(n_swa - 1). With the source's caches and its own ring row written for every
++// position, the decoder's work is needed only at positions >= q - reach for a logit at q, and >= c - reach for the state
++// left after the first c positions (the rings at c - (n_swa - 1) .. c - 1). V4.1: source 20, 19 layers after it, n_swa 128
++// - 2413 positions
++int32_t llama_hparams::dsv4_dec_first() const {
++    if (!dsv4_v41 || n_swa == 0 || swa_type != LLAMA_SWA_TYPE_STANDARD) {
++        return -1;
++    }
++    int32_t src = -1;
++    for (uint32_t il = 0; il < n_layer(); ++il) {
++        if (!is_swa(il)) {
++            return -1; // a raw cache of every position: its rows would be needed everywhere
++        }
++        if (dsv4_is_kv_source[il]) {
++            src = (int32_t) il;
++        }
++    }
++    // the source's attention input collapses with the mix the FFN before it carried: it needs one
++    return src > 0 ? src : -1;
++}
++
++int32_t llama_hparams::dsv4_dec_reach() const {
++    const int32_t src = dsv4_dec_first();
++    if (src < 0) {
++        return 0;
++    }
++    return ((int32_t) n_layer() - 1 - src)*((int32_t) n_swa - 1);
++}
++
+ bool llama_hparams::use_mrope() const {
+     return rope_sections[0] > 0 && rope_sections[1] > 0;
+ }
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 69a7eca..a7b1056 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -402,6 +402,14 @@ struct llama_hparams {
+     // number of effective layers (excludes nextn layers)
+     uint32_t n_layer() const;
+ 
++    // SiegeLadder P4: DeepSeek-V4.1 as a causal encoder-decoder. dsv4_dec_first - the first decoder layer: the last KV
++    // source, -1 when the model is not of that shape; dsv4_dec_reach - how far back (in positions) the decoder's window
++    // chain carries: a logit at position q depends on decoder work only at positions >= q - reach, and the state left
++    // after the first c positions (what position c on reads) only at positions >= c - reach (the encoder's work and the
++    // first decoder layer's cache writes are needed everywhere). 0: not of that shape
++    int32_t dsv4_dec_first() const;
++    int32_t dsv4_dec_reach() const;
++
+     // note that this function uses different SWA parameters from those in the hparams
+     // note: inlined on purpose for performance reasons
+     // TODO: think of a better place for this function
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index b781d2d..9e4caed 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -821,6 +821,31 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ONLY_LAYER")) {
+         drop_only_layer = atoi(p);
+     }
++    // G4, probe 3 (measurement, lossy); see g4_probe in the header
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G4_PROBE")) {
++        g4_probe = std::min(4, std::max(0, atoi(p)));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G4_K")) {
++        int i = 0;
++        for (const char * q = p; *q != '\0' && i < 8; ) {
++            g4_k[i++] = std::max(0, atoi(q));
++            q = std::strchr(q, ',');
++            if (q == nullptr) {
++                break;
++            }
++            q++;
++        }
++        for (; i > 0 && i < 8; i++) {
++            g4_k[i] = g4_k[i - 1]; // the last value holds for larger n
++        }
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G4_T_US")) {
++        g4_t_us = std::max<int64_t>(0, atoll(p));
++    }
++    if (g4_probe > 0) {
++        LLAMA_LOG_WARN("%s: SiegeLadder G4 probe %d (measurement, lossy): k for n = 1..8: %d %d %d %d %d %d %d %d, T = %" PRId64
++                " us\n", __func__, g4_probe, g4_k[0], g4_k[1], g4_k[2], g4_k[3], g4_k[4], g4_k[5], g4_k[6], g4_k[7], g4_t_us);
++    }
+     // C13, substitute; see subst in the header. Lossy: it changes the output whenever it fires
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SUBST")) {
+         subst = std::min(2, std::max(0, atoi(p)));
+@@ -2049,6 +2074,9 @@ void llama_moe_stream::p11_read_ahead_locked(const llama_moe_stream_layer & sl)
+     if (next == nullptr) {
+         return; // the last streamed layer: the next ubatch's first layer is left to its own waves
+     }
++    if (graph_last_moe >= 0 && next->il > graph_last_moe) {
++        return; // SiegeLadder P4: an encoder-only graph - the next layer it runs is the next ubatch's first, as above
++    }
+     // its slot table is stale (the pool has moved on), so unlike speculate_locked nothing is skipped as resident in VRAM;
+     // a slab already in the host tier the worker skips
+     const size_t n_w = next->weights.size();
+@@ -3128,6 +3156,13 @@ void llama_moe_stream::print_stats(const char * role) const {
+                     stats.n_drop_late_pairs, stats.n_drop_late_exp, stats.n_drop_late_calls);
+         }
+     }
++    if (g4_probe > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: G4 probe %d (lossy): %" PRId64 " experts to the stand-in lane in %" PRId64 " calls; "
++                "decode calls without a drive wait by n = 0..7+: %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %"
++                PRId64 " %" PRId64 " %" PRId64 "; reply waited %.1f ms\n", __func__, pfx, g4_probe, stats.n_g4_exp,
++                stats.n_g4_calls, stats.n_g4_elig[0], stats.n_g4_elig[1], stats.n_g4_elig[2], stats.n_g4_elig[3],
++                stats.n_g4_elig[4], stats.n_g4_elig[5], stats.n_g4_elig[6], stats.n_g4_elig[7], stats.t_g4_wait_us/1000.0);
++    }
+     if (subst > 0) {
+         // one line, in words no other line of this block uses: the bench parsers keep the last match of each phrase
+         char m2[160] = "";
+@@ -4246,6 +4281,57 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             if (mgr->drop_all && heavy_on_drive) {
+                 sl->dropped.clear(); // the call waits for the drive anyway: dropping would only cost quality
+             }
++            // G4, probe 3 (see g4_probe in the header): a decode call that waits for no drive read gives its last k(n)
++            // experts held whole in the host tier and nowhere on the card to a stand-in CPU lane. Only experts the call
++            // keeps are candidates and at least one of them stays, so every token still keeps a pair with a slot
++            sl->g4_picked.clear();
++            sl->g4_k_sel = 0;
++            if (mgr->g4_probe > 0 && !issue_only && n_tok == 1 && !heavy_on_drive) {
++                bool   drive_wait = false;
++                size_t n_kept     = 0;
++                for (const int32_t e : sl->uniq) {
++                    if (sl->touched[e] == 2) {
++                        continue; // dropped by the rule above
++                    }
++                    n_kept++;
++                    const auto it = sl->expert_slot.find(e);
++                    if (it != sl->expert_slot.end()) {
++                        // a slot still loading from the drive: the call waits for the drive anyway
++                        drive_wait |= sl->slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_LOADING && (sl->slot_src[it->second] & 1);
++                        continue;
++                    }
++                    if (in_l2(e)) {
++                        sl->g4_picked.push_back(e);
++                    } else {
++                        drive_wait = true;
++                    }
++                }
++                const size_t n_c = sl->g4_picked.size();
++                if (!drive_wait) {
++                    mgr->stats.n_g4_elig[std::min<size_t>(n_c, 7)]++;
++                }
++                size_t kk = 0;
++                if (!drive_wait && n_c > 0) {
++                    kk = std::min<size_t>({ (size_t) mgr->g4_k[std::min<size_t>(n_c, 8) - 1], n_c, n_kept - 1 });
++                }
++                // the last kk in the call's order: their copies would have gone last
++                sl->g4_picked.erase(sl->g4_picked.begin(), sl->g4_picked.end() - (std::ptrdiff_t) kk);
++                for (const int32_t e : sl->g4_picked) {
++                    if (mgr->g4_probe == 3) {
++                        sl->touched[e] = 3; // control: weight 0, but it loads and the call waits for it
++                        n_masked++;
++                    } else {
++                        sl->touched[e] = 2;
++                        sl->dropped.push_back(e);
++                    }
++                }
++                if (kk > 0) {
++                    sl->g4_k_sel = (int32_t) kk;
++                    sl->g4_t_sel = ggml_time_us();
++                    mgr->stats.n_g4_calls++;
++                    mgr->stats.n_g4_exp += (int64_t) kk;
++                }
++            }
+             if (mgr->drop_vram_only >= 3) {
+                 // measurement of a runahead pass: its pairs get weight 0, but the experts load and the call waits
+                 // for them as usual, so this layer's cache lives exactly as in the exact run (marked 3, kept in uniq)
+@@ -4476,8 +4562,15 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // the drop rule's other half: what this call did not wait for is read into the host tier for the
+     // calls after it, behind every demand load, so the next call that wants it copies it from RAM
+     for (const int32_t e : sl->dropped) {
++        if (sl->g4_k_sel > 0 && std::find(sl->g4_picked.begin(), sl->g4_picked.end(), e) != sl->g4_picked.end()) {
++            continue; // G4 probe: the stand-in lane's experts are whole in the host tier already
++        }
+         mgr->speculate_locked(*sl, e);
+     }
++    // G4 probe, mode 4: the lane's experts keep their place in the card's cache - staged after the call's own loads
++    if (mgr->g4_probe == 4 && sl->g4_k_sel > 0) {
++        mgr->stage_experts_locked(*sl, sl->g4_picked.data(), sl->g4_picked.size(), /*add_keep =*/ true);
++    }
+     // and C13's: the routed experts that left the call for their substitutes, the same way
+     for (const int32_t e : sl->subst_gone) {
+         mgr->speculate_locked(*sl, e);
+@@ -5293,7 +5386,18 @@ static void moe_rp_write(llama_moe_stream_layer & sl, int k, const ggml_tensor *
+ void llama_moe_stream_reply_0(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith == 0) {
+-        moe_rp_write(*(llama_moe_stream_layer *) userdata, 0, dst);
++        auto & sl = *(llama_moe_stream_layer *) userdata;
++        if (sl.g4_k_sel > 0 && (sl.mgr->g4_probe == 2 || sl.mgr->g4_probe == 4)) {
++            // G4 probe: the card's part waits for the stand-in lane - k experts at T us each from the choice, where a
++            // real lane would hand its rows over (docs/v41/g4-design.md, §2.2 and §4)
++            const int64_t until = sl.g4_t_sel + (int64_t) sl.g4_k_sel * sl.mgr->g4_t_us;
++            const int64_t t0    = ggml_time_us();
++            while (ggml_time_us() < until) {
++            }
++            sl.mgr->stats.t_g4_wait_us += ggml_time_us() - t0;
++            sl.g4_k_sel = 0;
++        }
++        moe_rp_write(sl, 0, dst);
+     }
+ }
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 5afb1f1..423311c 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -188,6 +188,11 @@ struct llama_moe_stream_layer {
+     bool                 ra_valid   = false;
+     int64_t              ra_t_issue = 0; // ggml_time_us() at the end of the first half
+     std::vector<int32_t> dropped;
++    // SiegeLadder G4, probe 3 (g4_probe in llama_moe_stream): the experts this call gave the stand-in CPU lane, how many,
++    // and when they were picked (the reply of modes 2 and 4 waits until g4_t_sel + g4_k_sel * g4_t_us)
++    std::vector<int32_t> g4_picked;
++    int32_t              g4_k_sel = 0;
++    int64_t              g4_t_sel = 0;
+     std::vector<float>   drop_share; // [n_expert] the largest share of a token's routing weight it has
+     float                drop_thr = 0.0f; // the threshold the first half applied (late drop reuses it and drop_share)
+     // C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; see subst in llama_moe_stream), guarded by mgr->mtx
+@@ -604,6 +609,10 @@ struct llama_moe_stream {
+     uint32_t                p11_ahead   = 0;
+     int64_t                 p11_n_ahead = 0;  // experts queued ahead
+     void p11_read_ahead_locked(const llama_moe_stream_layer & sl);
++    // SiegeLadder P4: the last layer whose experts the latest graph build runs (-1: every layer) - an encoder-only ubatch
++    // stops before the first decoder layer's FFN, and nothing reads ahead into a layer it will not run. Set at graph build
++    // (models/deepseek4.cpp); like the layers' build-time fields it belongs to the latest build (G23's n_build)
++    int32_t                 graph_last_moe = -1;
+ 
+     size_t size_bufs() const;
+ 
+@@ -813,6 +822,15 @@ struct llama_moe_stream {
+     // LLAMA_MOE_STREAM_DROP_ONLY_LAYER=L (measurement): the drop rule acts on layer L alone, so the routing of
+     // L+1 shows the error of ONE approximate layer - what a runahead predictor would see
+     int32_t drop_only_layer = -1;
++    // SiegeLadder G4, probe 3 (measurement, lossy; docs/v41/g4-design.md §4). In a decode call (one token, not runahead's)
++    // that waits for no drive read, the last k(n) of its n experts held whole in the host tier and nowhere on the card stand
++    // for a CPU lane's: LLAMA_MOE_STREAM_G4_PROBE=1 - they are dropped (weight 0, no copy); =2 - as 1, and the reply waits
++    // until k x T us after the choice (the lane's time); =3 - control: weight 0, but they load and are waited for as now;
++    // =4 - as 2, and they are staged into VRAM after the call's own loads (the lane's expert keeps its slot).
++    // LLAMA_MOE_STREAM_G4_K=k1,k2,... - k for n = 1, 2, ... (default 0,1,1,2,2,3); LLAMA_MOE_STREAM_G4_T_US=T (default 430)
++    int32_t g4_probe = 0;
++    int32_t g4_k[8]  = {0, 1, 1, 2, 2, 3, 3, 3};
++    int64_t g4_t_us  = 430;
+     // C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; lossy, so opt-in: LLAMA_MOE_STREAM_SUBST=M, 0 = off).
+     // The drop rule lets a light expert on the drive go, but a heavy one is waited for, and with it the whole step. Here a
+     // routed expert of the call held neither in VRAM (no slot, resident or loading) nor whole in the host tier, and heavy -
+@@ -1070,6 +1088,10 @@ struct llama_moe_stream {
+         int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
+         int64_t n_drop_exp    = 0; // experts not loaded for their call because of it
+         int64_t n_drop_calls  = 0; // remap calls that dropped at least one expert
++        int64_t n_g4_calls    = 0; // G4 probe: calls that gave the stand-in lane at least one expert
++        int64_t n_g4_exp      = 0; // the experts it took (in modes 1, 2 and 4 they are in n_drop_exp too)
++        int64_t n_g4_elig[8]  = {}; // decode calls without a drive wait, by n - experts whole in the host tier, off the card (7 = 7+)
++        int64_t t_g4_wait_us  = 0; // modes 2 and 4: the reply's wait for the lane's time
+         int64_t n_drop_late_exp   = 0; // DROP_LATE: experts not waited for at the wait, still loading there
+         int64_t n_drop_late_pairs = 0; // their pairs
+         int64_t n_drop_late_calls = 0; // calls with at least one
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 9f82dd7..810478a 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1507,8 +1507,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         ggml_tensor ** topk_carry,
+         ggml_tensor ** cand_carry,
+         int64_t n_groups_used,
+-        bool groups_scale) const {
++        bool groups_scale,
++        bool src_only) const {
+     GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
++    GGML_ASSERT(!src_only || (inp_dsv4 != nullptr && hparams.dsv4_is_kv_source[il]));
+ 
+     const auto & layer = model.layers[il];
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4 ? inp_dsv4->get_raw() : nullptr;
+@@ -1910,6 +1912,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         ggml_build_forward_expand(gf, hca_state_score);
+     }
+ 
++    // SiegeLadder P4: in an encoder-only ubatch the KV source (the first decoder layer) leaves for later positions only
++    // what it wrote above - its compressed rows, its compressor state and its index keys - and its own window row, which
++    // the decoder's first positions attend over when the decoder starts. The row is the one every flavour below writes:
++    // kv after the K rotation, through cpy_k at this ubatch's cells. q and qr above are left unreferenced, so they never
++    // enter the graph; no indexer, no candidate mask, no attention, no output projection
++    if (src_only) {
++        ggml_tensor * k_rot = inp_attn->self_k_rot;
++        ggml_tensor * kv_w  = k_rot ? llama_mul_mat_hadamard(ctx0, kv, k_rot) : kv;
++        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, kv_w, inp_attn->get_k_idxs(), il));
++        return nullptr;
++    }
++
+     // SiegeLadder P13: at a big prefill ubatch (P11 makes -ub 4608-6144 the default for long prompts) every query ran
+     // FlashAttention over the whole window ring of the ubatch (ub + 128 cells padded to 256, of which it needs 128) and
+     // over the compressed columns up to the ubatch's widest query - per query ~1.65x the cost at -ub 1536 (runs.md 4.85),
+@@ -2278,9 +2292,25 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     llm_graph_context(params) {
+     ggml_tensor * cur;
+ 
++    // SiegeLadder P4 (LLAMA_DSV4_ENC_ONLY; the ubatch is chosen by llama_context::p4_enc_only): V4.1 as a causal
++    // encoder-decoder. A ubatch with no output whose positions all lie more than the decoder's reach before the first
++    // position of its call that must come out exact runs layers 0 .. p4_src - 1 as always; of the first decoder layer
++    // p4_src (the last KV source, 20) only what later positions read - its compressed rows, compressor state, index keys
++    // and its own window row - and the graph ends there: no attention or FFN of layers 20-39, no output rows, no head.
++    // Layers 20-39 of these positions are never needed: the decoder reads nothing of them but its window rings, whose
++    // chain reaches back hparams.dsv4_dec_reach() positions (2413) from any logit or state the call hands back
++    const int32_t p4_src = cparams.dsv4_enc_only ? hparams.dsv4_dec_first() : -1;
++    GGML_ASSERT(!cparams.dsv4_enc_only || p4_src > 0);
++    // the MoE layers this graph runs: the 3a prediction and runahead's pass never reach past them, nor P11's read-ahead
++    const int64_t n_layer_moe = p4_src >= 0 ? (int64_t) p4_src : (int64_t) n_layer;
++    if (mstream != nullptr) {
++        mstream->graph_last_moe = p4_src >= 0 ? p4_src - 1 : -1;
++    }
++
+     ggml_tensor * inp = build_inp_embd(model.tok_embd);
+     ggml_tensor * inp_pos = build_inp_pos();
+-    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    // P4: no output rows - and an out_ids input left out of the graph would be unallocated at set_input
++    ggml_tensor * inp_out_ids = p4_src >= 0 ? nullptr : build_inp_out_ids();
+     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+     // SiegeLadder P13: with the attention in chunks of queries nothing reads the whole-ring mask ([ring, n_tokens] f16,
+@@ -2526,6 +2556,22 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+         }
+ 
++        // SiegeLadder P4: the first decoder layer of an encoder-only ubatch - its attention input exactly as below (the
++        // collapse with the mix FFN il - 1 carried: build_hc_pre's own path when a carry is set, the same op on the same
++        // tensors), its norm, and the source part of its attention; then the graph ends. Its own mix (hc_attn_fn) is not
++        // built: only its attention's residual update and its FFN's collapse would read it
++        if (il == p4_src) {
++            GGML_ASSERT(hc_carry_v != nullptr && "P4: the first decoder layer needs the mix the FFN before it carried");
++            cur = build_hc_pre(inpL, hc_carry_v, il);
++            cb(cur, "hc_attn_pre", il);
++
++            cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
++            cb(cur, "attn_norm", il);
++
++            build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, nullptr, nullptr, 0, false, /*src_only =*/ true);
++            break;
++        }
++
+         ggml_tensor * residual = inpL;
+         ggml_tensor * post = nullptr;
+         ggml_tensor * comb = nullptr;
+@@ -2588,7 +2634,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cb(cur, "ffn_norm", il);
+ 
+         // 3a: leave the prediction of layer il+1 for this layer's remap; build_moe_ffn takes it
+-        if (pred_k > 0 && il + 1 < n_layer && mstream->layer(il) != nullptr && mstream->layer(il + 1) != nullptr) {
++        // (P4: not past the graph's last MoE layer - an encoder-only graph never runs the first decoder layer's experts)
++        if (pred_k > 0 && il + 1 < n_layer_moe && mstream->layer(il) != nullptr && mstream->layer(il + 1) != nullptr) {
+             mstream->layer(il)->graph_pred_next = build_pred_next(residual, post, comb, il);
+         }
+ 
+@@ -2602,7 +2649,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+ 
+         // G2 runahead: the shared expert first, so the approximate pass can add it; the exact sum below reuses it
+         ggml_tensor * ffn_shexp = nullptr;
+-        if (runahead && il + 1 < n_layer && mstream->layer(il) != nullptr && mstream->layer(il + 1) != nullptr) {
++        // (P4: as 3a above, never into a layer the graph does not run)
++        if (runahead && il + 1 < n_layer_moe && mstream->layer(il) != nullptr && mstream->layer(il + 1) != nullptr) {
+             ggml_tensor * shexp_a = build_ffn(cur,
+                     layer.ffn_up_shexp, nullptr, nullptr,
+                     layer.ffn_gate_shexp, nullptr, nullptr,
+@@ -2668,6 +2716,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cb(inpL, "l_last", il);
+     }
+ 
++    // SiegeLadder P4: an encoder-only graph is complete with the first decoder layer's cache writes - no output rows (the
++    // context chose a ubatch without any), no final collapse, no head; t_logits and t_embd stay null
++    if (p4_src >= 0) {
++        return;
++    }
++
+     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+         res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
+         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
+diff --git a/src/models/models.h b/src/models/models.h
+index 2f9669e..d18cd46 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1188,6 +1188,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * inp_pos,
+                 int il) const;
+ 
++        // src_only (SiegeLadder P4, an encoder-only ubatch): only what a KV source leaves for later positions - its
++        // compressor's rows and state, its index keys and its own window row; no query, indexer or attention, returns null
+         ggml_tensor * build_attention_impl(
+                 const llama_model & model,
+                 llm_graph_input_dsv4 * inp_dsv4,
+@@ -1198,7 +1200,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor ** topk_carry,
+                 ggml_tensor ** cand_carry,
+                 int64_t n_groups_used = 0,
+-                bool groups_scale = false) const;
++                bool groups_scale = false,
++                bool src_only = false) const;
+ 
+         ggml_tensor * build_hca_compressed_kv_from_state(
+                 ggml_tensor * kv_state,
+diff --git a/tools/logits/logits.cpp b/tools/logits/logits.cpp
+index dc2bcec..faa6a0b 100644
+--- a/tools/logits/logits.cpp
++++ b/tools/logits/logits.cpp
+@@ -495,6 +495,7 @@ static void uso(const char * exe) {
+     printf("  --tokens-file F   read the token ids from a file, for prompts too long for argv\n");
+     printf("  -c N              context size (default: prompt length rounded up)\n");
+     printf("  -ub N             ubatch size (default: the whole prompt, one forward; 1 with --score-file)\n");
++    printf("  -b N              with --score-file: tokens per decode call (default: 2048, or -ub when larger)\n");
+     printf("  --moe-stream      stream routed experts from disk\n");
+     printf("  --moe-stream-cache N|Ns   expert cache: budget in GiB, or exact slots per layer (18s)\n");
+     printf("  --moe-stream-l2 N      host RAM tier in GiB\n");
+@@ -550,7 +551,7 @@ static bool parse_kv_type(const std::string & s, ggml_type & t) {
+ 
+ int main(int argc, char ** argv) {
+     std::string modelo, prompt, saida, lista_tokens, lista_camadas, lista_nos, arq_tokenize, arq_score;
+-    int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0, moe_io_threads = 0;
++    int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0, moe_io_threads = 0, n_batch_arg = 0;
+     int   moe_slots = 0, n_threads = 0, n_top = 64;
+     bool  moe_stream = false, add_bos = true, moe_direct = false, score_batch = false, swa_window = false;
+     std::vector<llama_model_kv_override> kv_over;
+@@ -602,6 +603,7 @@ int main(int argc, char ** argv) {
+             lista_tokens = conteudo;
+         }
+         else if (a == "-ub")                   n_ubatch      = atoi(proximo("-ub").c_str());
++        else if (a == "-b")                    n_batch_arg   = atoi(proximo("-b").c_str());
+         else if (a == "--no-bos")              add_bos       = false;
+         else if (a == "--override-kv") {
+             llama_model_kv_override o;
+@@ -664,8 +666,9 @@ int main(int argc, char ** argv) {
+         }
+         // at most 2048 tokens per decode call, as the server's default -b - or -ub when that is larger (SiegeLadder P13:
+         // the consultant's prompts run at -ub 6144 with P11, and a call capped at 2048 capped the ubatch too); long
+-        // prompts go in several calls
+-        const int n_call = std::min(max_first, std::max(2048, n_ubatch));
++        // prompts go in several calls. -b N sets the cap (SiegeLadder P4: a call ends with the decoder computed over its
++        // last ~2.4K positions, so the encoder-only ubatches need the prompt in as few calls as possible)
++        const int n_call = std::min(max_first, n_batch_arg > 0 ? n_batch_arg : std::max(2048, n_ubatch));
+         llama_context_params sp = llama_context_default_params();
+         sp.n_ctx    = n_ctx > 0 ? (uint32_t) n_ctx : (uint32_t) max_total + 8;
+         sp.n_batch  = (uint32_t) n_call;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 45774b3..049cf7c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3553,7 +3553,13 @@ private:
+                         //  - 4
+                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                         if (do_checkpoint) {
+-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
++                            // SiegeLadder P4 (LLAMA_DSV4_ENC_ONLY, on by default for DeepSeek-V4.1): every llama_decode
++                            // call computes the decoder in full over the last ~2.4K positions before the state it leaves, so
++                            // a cut 4 + n_ubatch before the end costs the call before it a decoder tail of its own - one more
++                            // pass of layers 20-39's experts per prompt. When the context runs P4 the prompt is cut 4 tokens
++                            // before its end only (and the whole prompt before that goes in one call when -b allows)
++                            const bool p4 = llama_dsv4_enc_only(ctx_tgt);
++                            const int checkpoint_offsets[] = {p4 ? 4 : 4 + n_ubatch, 4};
+ 
+                             bool should_break = false;
+                             for (int offset : checkpoint_offsets) {

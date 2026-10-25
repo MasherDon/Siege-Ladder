@@ -1,0 +1,108 @@
+From 74d0419d3de3c3c2a88032f6a9ad4e0e8f4c5435 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 15:31:55 +0000
+Subject: [PATCH 09/91] llama-model : copy host tensors out of the files the
+ expert stream reads, so their mappings can be released
+
+3aa63fa releases a file's mapping only when no host-resident tensor is left in it. On DeepSeek V4.1-Flash
+Q2mix two expert files still held one each: an Engram scale table of 3.07 GB (file 5) and token_embd with
+small tensors (file 11), so ~21% of the expert reads still went to mapped files, where NTFS serialises
+unbuffered readers. Host tensors in a file that the stream reads now get a buffer of their own and are
+copied at load instead of pointing into the mapping; the loader then releases 7 of 11 files instead of 5.
+LLAMA_MOE_STREAM_KEEP_MAPPED=1 restores the old behaviour, for A/B.
+
+Measured with the oracle and staging two calls ahead into VRAM (SiegeLadder runs.md 4.21, series o8,
+two runs each, alternated, answers byte-identical to the trace): 17.73 / 17.74 tok/s vs 15.65 / 15.73
+mapped (+13%). The drive reads 9.4 GB/s instead of 8.2, and the slow tail is gone: reads of 8 ms and more
+fell from ~9.8 thousand to ~70 per run, the longest from 40-48 ms to 11-23. Costs 4.09 GiB of RAM
+and ~8 s more load time (the copy goes through the mapping's page faults).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-model.cpp | 59 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 59 insertions(+)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 443638b..533c615 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1719,6 +1719,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+ 
++    // Files the expert stream reads with its own handles. A host tensor in one of them gets a buffer of its
++    // own and a copy at load, instead of pointing into the file's mapping, so that the loader can release
++    // the mapping afterwards (llama_mmap::unmap_fragment). While a file is mapped, NTFS checks every
++    // unbuffered read of it against the section, and the stream's readers queue behind each other:
++    // measured 2026-10-14 (SiegeLadder runs.md 4.21), 11 readers on one expert file got 13.5 GB/s unmapped
++    // and 4.5 GB/s mapped. The price is RAM for those tensors - on DeepSeek V4.1-Flash Q2mix an Engram scale
++    // table of 3.07 GB and token_embd, 1.32 GB, which were only touched page by page while mapped.
++    // LLAMA_MOE_STREAM_KEEP_MAPPED=1 keeps them mapped, for A/B.
++    std::vector<bool> copy_host_from(ml.files.size(), false);
++    if (pimpl->moe_stream && !ml.no_alloc && std::getenv("LLAMA_MOE_STREAM_KEEP_MAPPED") == nullptr) {
++        for (const auto & sl : pimpl->moe_stream->layers) {
++            if (!sl) {
++                continue;
++            }
++            for (const auto & w : sl->weights) {
++                if (w.file_idx < copy_host_from.size()) {
++                    copy_host_from[w.file_idx] = true;
++                }
++            }
++        }
++    }
++    size_t   n_copied_bytes = 0;
++    uint32_t n_copied_bufs  = 0;
++
+     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
+         ggml_context * ctx = ctx_ptr.get();
+ 
+@@ -1758,6 +1782,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 if (first >= last) {
+                     continue;
+                 }
++                if (copy_host_from[idx]) {
++                    // a real buffer for this context's tensors of this file: load_all_data finds them allocated
++                    // and copies them out of the mapping, and the file then keeps no host tensor
++                    const size_t align = ggml_backend_buft_get_alignment(buft);
++                    size_t size = 0;
++                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                        const auto * w = ml.get_weight(ggml_get_name(t));
++                        if (w && w->idx == idx) {
++                            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
++                        }
++                    }
++                    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, size);
++                    if (buf == nullptr) {
++                        throw std::runtime_error(format("unable to allocate %s buffer of %zu bytes for the host tensors of file %u",
++                                ggml_backend_buft_name(buft), size, idx));
++                    }
++                    ggml_tallocr talloc = ggml_tallocr_new(buf);
++                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                        const auto * w = ml.get_weight(ggml_get_name(t));
++                        if (w && w->idx == idx) {
++                            GGML_ASSERT(ggml_tallocr_alloc(&talloc, t) == GGML_STATUS_SUCCESS);
++                        }
++                    }
++                    bufs.emplace_back(buf);
++                    buf_map.emplace(idx, buf);
++                    n_copied_bytes += size;
++                    n_copied_bufs++;
++                    continue;
++                }
+                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                 if (buf == nullptr) {
+@@ -1802,6 +1855,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         ctx_buf_maps.emplace_back(ctx, buf_map);
+     }
+ 
++    if (n_copied_bufs > 0) {
++        LLAMA_LOG_WARN("%s: host tensors in the streamed files are copied, not mapped: %u buffers, %.2f GiB "
++                "(LLAMA_MOE_STREAM_KEEP_MAPPED=1 keeps them mapped)\n",
++                __func__, n_copied_bufs, n_copied_bytes / 1024.0 / 1024.0 / 1024.0);
++    }
++
+     if (pimpl->moe_stream) {
+         if (pimpl->moe_stream->ctxs.empty()) {
+             LLAMA_LOG_WARN("%s: no streamable expert tensors found -- MoE expert streaming disabled\n", __func__);

@@ -1,0 +1,88 @@
+From 61ef684741907eda986e2981035f96c82d734308 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:34:06 +0000
+Subject: [PATCH 66/91] llama, deepseek4 : MoE weighting in place on by
+ default; q's rope part back into wq_b's output without a concat, opt-in
+ (SiegeLadder P17, step 1)
+
+LLAMA_MOE_WEIGHT_INPLACE (P7, bitwise in 4.63) is now on unless set to 0: at -ub 6144 the weighted copy of the expert
+outputs set the prefill buffer's mark (GGML_ALLOC_TRACE), 3706 -> 3491 MiB with P13, and -ub 12288 with P13 loads.
+LLAMA_DSV4_Q_ROPE_INPLACE=1 (off by default): the rotated rope part goes back into wq_b's own output with
+ggml_set_inplace - a view of the whole q that depends on the rope, so q's readers come after it and the allocator frees q
+after them (a rope in place on the view left a node nobody reads, and the allocator never freed q) - no second full copy
+of q. Off for now: with the greedy allocator wq_b's output itself lands past the holes and the mark did not drop. Both
+bitwise - SiegeLadder runs.md 4.115: kl_run k5 exact KLD 0; the 30K document at -ub 6144, 128 answer tokens: text,
+top-20 KL 0 and top-1 128/128 with either.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |  7 ++++---
+ src/models/deepseek4.cpp | 33 +++++++++++++++++++++++++--------
+ 2 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 3120f4b..38e7a45 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3314,9 +3314,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     if (!weight_before_ffn) {
+         // SiegeLadder P7 (runs.md 4.63): at a big ubatch the expert outputs [n_embd, n_expert_used, n_tokens] and their
+         // weighted copy live together - 480 MiB at 2048 tokens - and set the compute buffer's peak once the attention is
+-        // split. LLAMA_MOE_WEIGHT_INPLACE=1 weights them in place (the same products, into the GEMM's own output); for
+-        // A/B while it is measured
+-        static const bool weight_inplace = getenv("LLAMA_MOE_WEIGHT_INPLACE") != nullptr &&
++        // split. LLAMA_MOE_WEIGHT_INPLACE weights them in place (the same products, into the GEMM's own output). On by
++        // default since SiegeLadder P17 (runs.md 4.114: at -ub 6144 the weighted copy set the buffer's mark, -215 MiB);
++        // LLAMA_MOE_WEIGHT_INPLACE=0 - a separate weighted copy as before
++        static const bool weight_inplace = getenv("LLAMA_MOE_WEIGHT_INPLACE") == nullptr ||
+                 atoi(getenv("LLAMA_MOE_WEIGHT_INPLACE")) != 0;
+         ggml_tensor * w = drop_mask != nullptr ? ggml_mul(ctx0, weights, drop_mask) : weights;
+         // in place only into an op's output (the waves' in-place GEMMs make it a view of the first wave's), never a leaf
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 2a2a572..fe502d7 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1543,18 +1543,35 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         cb(q, "q_norm", il);
+     }
+ 
+-    ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_hd, nt,
+-            ggml_row_size(q->type, n_embd_head),
+-            ggml_row_size(q->type, n_embd_head)*n_hd,
+-            0);
++    // SiegeLadder P17 (LLAMA_DSV4_Q_ROPE_INPLACE=1, off by default): the rotated rope part goes back into wq_b's own
++    // output (ggml_set_inplace - a view of the whole q that depends on the rope, so readers of q come after it and the
++    // allocator frees q after them): the same values in the same layout as concat(q_nope, rope(q_pe)), without a second
++    // full copy of q live next to the first (768 MiB at -ub 6144). A rope in place on the view would leave a node nobody
++    // reads - the allocator then never frees q. Off for now: with today's greedy allocator wq_b's output itself lands past
++    // the holes, and the buffer did not shrink (runs.md 4.115)
++    static const bool q_rope_inplace = [] {
++        const char * s = getenv("LLAMA_DSV4_Q_ROPE_INPLACE");
++        return s != nullptr && atoi(s) != 0;
++    }();
+     ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_rope, n_hd, nt,
+             ggml_row_size(q->type, n_embd_head),
+             ggml_row_size(q->type, n_embd_head)*n_hd,
+             ggml_row_size(q->type, n_embd_head_nope));
+-    q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+-            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+-    cb(q_pe, "q_pe", il);
+-    q = ggml_concat(ctx0, q_nope, q_pe, 0);
++    if (q_rope_inplace && q->type == GGML_TYPE_F32 && ggml_is_contiguous(q)) {
++        q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
++                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
++        cb(q_pe, "q_pe", il);
++        q = ggml_set_inplace(ctx0, q, q_pe, q->nb[1], q->nb[2], q->nb[3], ggml_row_size(q->type, n_embd_head_nope));
++    } else {
++        ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_hd, nt,
++                ggml_row_size(q->type, n_embd_head),
++                ggml_row_size(q->type, n_embd_head)*n_hd,
++                0);
++        q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
++                freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
++        cb(q_pe, "q_pe", il);
++        q = ggml_concat(ctx0, q_nope, q_pe, 0);
++    }
+     cb(q, "q", il);
+ 
+     ggml_tensor * kv = build_lora_mm(layer.wkv, cur);

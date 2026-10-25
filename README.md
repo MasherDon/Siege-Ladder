@@ -106,25 +106,65 @@ be a starting point.
 
 ## Reproducing
 
-TODO — not ready yet:
+Not turnkey yet: the engine builds from this repository today; the weight assembly script and the benchmark scripts
+are still being cleaned up for publishing. Built and run on Windows 11 only.
 
-1. JigSawPT's llama.cpp fork (`dsv41-porte` @ `8ce0968`) + the patches in `patches/`, built with CUDA 13.0 (13.2
-   miscompiles `mul_mat_id` for the IQ types on Blackwell).
-2. The weights: the assembly script (sources: prometheusAIR, ISTA-DASLab, DeepSeek's official 1017 release).
-3. Server presets: `LLAMA_MOE_STREAM_PRESET=exact | default | fast`.
-4. The benchmark scripts.
+**1. The engine** — JigSawPT's llama.cpp fork with our patches on top:
+
+```sh
+git clone https://github.com/JigSawPT/llama.cpp
+cd llama.cpp
+git checkout 8ce0968539b1a6795f3413c2783dfa5646b4688a
+git am /path/to/Siege-Ladder/patches/*.patch
+```
+
+On Windows, clone into a short path or set `git config --global core.longpaths true`: some of llama.cpp's web UI files
+have long names. Build with CUDA 13.0 (13.2 miscompiles `mul_mat_id` for the IQ types on Blackwell). On Windows, from a Visual Studio
+2022 x64 developer prompt:
+
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DLLAMA_CURL=OFF
+cmake --build build --target llama-server llama-cli llama-perplexity
+```
+
+**2. The weights** — TODO: the assembly script and the GGUF headers it uses as a template (sources: prometheusAIR's
+and ISTA-DASLab's GGUFs of 1017, DeepSeek's official 1017 release).
+
+**3. Running** — the server line of our agent-turn measurements (up to 32K context; the model is the first of 11 GGUF
+parts):
+
+```sh
+llama-server -m DeepSeek-V4.1-Flash-MXFP4-engram-00001-of-00011.gguf -ngl 99 -t 6 --parallel 1 --reasoning off \
+  --moe-stream-direct --moe-stream-cache 22s --moe-stream-l2 43 \
+  -c 32768 -b 32768 -ub 8192 -ctk q8_0 -ctv q8_0
+```
+
+- `--moe-stream-cache 22s` — expert slots per layer in VRAM; `--moe-stream-l2 43` — the pinned RAM tier, GiB;
+  `--moe-stream-direct` — unbuffered NVMe reads.
+- `LLAMA_MOE_STREAM_PRESET=exact | default | fast` — `default` when unset. `exact` adds no approximation beyond the
+  quantized weights: every routed expert is waited for, and the prompt runs through all layers. `fast` trades a small
+  measured quality cost for speed; its numbers above were measured on a lighter build (`qd`: IQ2_XXS gate/up experts,
+  7% fewer expert bytes, the same dense part).
+- `LLAMA_MOE_STREAM_MIRROR=<folder>` — a copy of the expert parts (5–11) on a second NVMe (up to three folders,
+  `;`-separated); each read goes to the drive with fewer reads in flight.
+- The patches read 114 environment switches in all, each documented where it is read (mostly
+  `src/llama-moe-stream.cpp` and `src/models/deepseek4.cpp`); the commit messages say what each change measured.
+
+**4. The benchmark scripts** — TODO.
 
 ## Repository layout
 
-TODO.
+| path | what |
+|---|---|
+| `patches/` | 91 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order |
+| `docs/` | the logo; charts and notes to come |
 
 ## License
 
 Our own code and notes: [MIT-0](LICENSE) — use them however you like, no attribution needed.
 
 The patches modify llama.cpp (MIT, © the ggml authors) through JigSawPT's fork: whoever redistributes the patched
-files keeps llama.cpp's license notice, as its license requires. Code adapted from Project Maya keeps its MIT notice.
-See [NOTICE.md](NOTICE.md).
+files keeps llama.cpp's license notice, as its license requires. See [NOTICE.md](NOTICE.md).
 
 ## Built on
 

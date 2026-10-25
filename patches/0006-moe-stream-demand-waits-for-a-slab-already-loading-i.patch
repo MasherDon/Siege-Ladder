@@ -1,0 +1,182 @@
+From a352aba3c55b3b5b0c04e1d51f4121630ab4940e Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 16:22:51 +0000
+Subject: [PATCH 06/91] moe-stream : demand waits for a slab already loading in
+ L2 instead of reading it again
+
+find_wait(): a demand load that finds its slab LOADING in the host tier (a
+speculative read, usually) waits on the tier's condition variable and uploads
+from it once committed. commit() and abandon() notify; a 2 s bound falls back
+to reading the slab itself; LLAMA_MOE_STREAM_L2_WAIT=0 restores the old path.
+
+Measured 2026-10-13 (V4.1 Q2mix, chat, 512 tokens, -ub 1, L2 24 GiB):
+no prefetch 7.77 tok/s, 0 waits, same text as the trace; oracle prefetch one
+layer ahead 8.78 tok/s with 47,956 waits, all served, same text. Before this
+change the same oracle run gave 6.51 tok/s, 6% below no prefetch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 62 ++++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h   | 19 +++++++++++-
+ 2 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index a62090a..ddec7bd 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -5,6 +5,7 @@
+ #include "ggml-backend.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstdio>
+@@ -194,6 +195,54 @@ const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t
+     return base + it->second*slot_stride + e.head;
+ }
+ 
++const uint8_t * llama_moe_stream_l2::find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
++    if (base == nullptr) {
++        return nullptr;
++    }
++    const uint64_t key = make_key(file_idx, offs);
++
++    L2_LOCK(*this);
++    int64_t t_wait0 = -1;
++    while (true) {
++        // Looked up by KEY on every pass: while this thread slept the entry may have been committed,
++        // abandoned, or committed, evicted and reused for another slab.
++        auto it = index.find(key);
++        if (it == index.end()) {
++            break; // absent, or its fill was abandoned
++        }
++        entry & e = entries[it->second];
++        if (e.st == RESIDENT) {
++            if (e.len != len) {
++                break;
++            }
++            e.pins++;
++            e.ref = 1;
++            n_hit++;
++            if (t_wait0 >= 0) {
++                n_wait_hit++;
++                t_wait_us += ggml_time_us() - t_wait0;
++            }
++            *out_slot = it->second;
++            return base + it->second*slot_stride + e.head;
++        }
++        // LOADING: a read of these very bytes is in flight
++        if (!wait_loading) {
++            break;
++        }
++        if (t_wait0 < 0) {
++            t_wait0 = ggml_time_us();
++            n_wait++;
++        } else if (ggml_time_us() - t_wait0 > 2000000) {
++            break; // never hang a demand load on someone else's read
++        }
++        cv.wait_for(lk, std::chrono::milliseconds(50));
++    }
++    if (t_wait0 >= 0) {
++        t_wait_us += ggml_time_us() - t_wait0;
++    }
++    return nullptr;
++}
++
+ void llama_moe_stream_l2::release(size_t slot) {
+     L2_LOCK(*this);
+     entry & e = entries[slot];
+@@ -270,6 +319,7 @@ void llama_moe_stream_l2::commit(size_t slot, size_t head) {
+     e.head = (uint32_t) head;
+     e.st   = RESIDENT;
+     n_fill++;
++    cv.notify_all(); // demand loads waiting in find_wait() for this slab
+ }
+ 
+ void llama_moe_stream_l2::abandon(size_t slot) {
+@@ -278,6 +328,7 @@ void llama_moe_stream_l2::abandon(size_t slot) {
+     index.erase(e.key);
+     e.key = UINT64_MAX;
+     e.st  = FREE;
++    cv.notify_all(); // the waiters fall back to reading the slab themselves
+ }
+ 
+ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+@@ -303,6 +354,9 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_CLOCK")) {
+         tier->clock = std::strtol(s, nullptr, 10) != 0;
+     }
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_WAIT")) {
++        tier->wait_loading = std::strtol(s, nullptr, 10) != 0;
++    }
+ 
+     const size_t bytes = n_l2 * stride;
+ 
+@@ -760,8 +814,9 @@ void llama_moe_stream::worker_loop(int worker_id) {
+             size_t filled_slot = SIZE_MAX; // fill -> committed after the upload
+             size_t filled_head = 0;        // payload offset inside that slot
+ 
+-            // 1. host tier. A hit skips the drive entirely and uploads from page-locked memory.
+-            const uint8_t * data = l2 ? l2->find(wt.file_idx, offs, wt.nb_expert, &pinned_slot) : nullptr;
++            // 1. host tier. A hit skips the drive entirely and uploads from page-locked memory. A slab
++            //    still LOADING (a speculative read, usually) is waited for rather than read twice.
++            const uint8_t * data = l2 ? l2->find_wait(wt.file_idx, offs, wt.nb_expert, &pinned_slot) : nullptr;
+ 
+             if (data == nullptr) {
+                 // 2. drive. The read lands DIRECTLY in an L2 slot when one is free, so the tier
+@@ -1161,6 +1216,9 @@ void llama_moe_stream::print_stats(const char * role) const {
+         LLAMA_LOG_INFO("%s: moe stream: L2 lock wait = %.2f ms total over %" PRId64 " ops (%.3f us each)\n",
+                 __func__, l2->t_lock_us/1000.0, l2->n_lock_ops,
+                 l2->n_lock_ops > 0 ? (double) l2->t_lock_us/l2->n_lock_ops : 0.0);
++        LLAMA_LOG_WARN("%s: moe stream: L2 demand waits on a slab in flight = %" PRId64 " (%" PRId64 " served from it, %.2f ms waited)%s\n",
++                __func__, l2->n_wait, l2->n_wait_hit, l2->t_wait_us/1000.0,
++                l2->wait_loading ? "" : " - waiting OFF (LLAMA_MOE_STREAM_L2_WAIT=0)");
+     }
+     if (stats.n_wave_calls > 0) {
+         LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms, skipping = %" PRId64 "\n",
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 76d43e9..432af8a 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -265,15 +265,23 @@ struct llama_moe_stream_l2 {
+     std::unordered_map<uint64_t, size_t> index; // key -> entry; only LOADING/RESIDENT are in it
+     size_t                               next_victim = 0; // CLOCK hand
+     bool                                 clock       = true; // off = plain FIFO, for A/B
++    bool                                 wait_loading = true; // find_wait(); LLAMA_MOE_STREAM_L2_WAIT=0 = off, for A/B
+ 
+     ggml_backend_buffer_ptr buf; // holds the pinned allocation when there is one
+ 
+-    mutable std::mutex mtx;
++    mutable std::mutex      mtx;
++    std::condition_variable cv; // a LOADING entry was committed or abandoned
+ 
+     int64_t n_hit   = 0; // slab served out of host RAM, no SSD read
+     int64_t n_fill  = 0; // slab read from SSD straight into a slot
+     int64_t n_evict = 0;
+ 
++    // find_wait(): demand lookups that found their slab LOADING and waited for it, how many of those
++    // got the bytes (the rest saw the fill abandoned and read the slab themselves), and the time.
++    int64_t n_wait     = 0;
++    int64_t n_wait_hit = 0;
++    int64_t t_wait_us  = 0;
++
+     // Time spent WAITING to enter this tier's mutex, and the number of entries it is spread over.
+     // Measured 2026-08-09: with the tier on, load stall fell from 346,389 to 150,083 ms - 196
+     // seconds less waiting on the drive - and total wall time did not move. So the saved time is
+@@ -304,6 +312,15 @@ struct llama_moe_stream_l2 {
+     // emitted 8,191 characters of "<<<<<<<<" instead of an answer. Nothing about that failure is
+     // visible in a throughput number - it looks like a fast run.
+     const uint8_t * find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
++    // The demand path's lookup: find(), except that a LOADING entry is WAITED for instead of read a
++    // second time. The fill under way is a read already in flight (a speculative read commits right
++    // after it, a demand fill right after its upload), so the wait is at most what is left of that
++    // read, while a second read costs a whole one plus the drive bandwidth it takes from the rest.
++    // Measured 2026-10-11: with the oracle prefetching one layer ahead, demand re-read the slabs
++    // still loading and the run came out 6% slower than with no prefetch at all. nullptr when the
++    // slab is absent, its fill was abandoned, or the wait passed a 2 s safety bound - the caller
++    // then reads it itself, exactly as with find(). Same pin/release contract as find().
++    const uint8_t * find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
+     // Is this slab resident? Unlike find(), this counts nothing and marks nothing: a
+     // speculative probe that bumped n_hit would inflate the tier's own hit rate, and one
+     // that set the reference bit would protect a slab from eviction on the strength of a

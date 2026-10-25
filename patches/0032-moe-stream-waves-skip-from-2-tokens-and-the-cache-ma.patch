@@ -1,0 +1,280 @@
+From e830016ac25d51f4d57111717658bb75cb1b5470 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 07:49:48 +0000
+Subject: [PATCH 32/91] moe-stream : waves skip from 2 tokens and the cache may
+ have 2*K slots - the MMVQ kernels leave skipped ids out (an id at or past
+ INT32_MAX), LLAMA_MOE_STREAM_SKIP_MIN (default 2, 64 = before); the node
+ budget plans with skipping below 3*K; the load-time VRAM note uses the probed
+ limit (dedicated - 330 MiB), LLAMA_GRAPH_TOP=N lists the largest tensors of
+ the pp graph
+
+17 slots instead of 18 free 380 MiB: -ub 2048 at 12K fits again under "Prefer No Sysmem Fallback" (162 tok/s on an 8.9K prompt), decode within noise (13.25 vs 13.39 tok/s, text = trace). Small batches: -ub 4 (MMVQ) parking, skipping and 17 slots give the same numbers bit for bit; -ub 32 (MMQ) KL 0.0073 vs 0.0075 for parking. MUL_MAT_ID 877/877.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmvq.cu | 12 ++++++++++
+ src/llama-context.cpp      | 45 +++++++++++++++++++++++++++++++++++++-
+ src/llama-graph.cpp        |  2 +-
+ src/llama-model.cpp        |  7 +++++-
+ src/llama-moe-stream.cpp   | 31 ++++++++++++++++++--------
+ src/llama-moe-stream.h     | 25 ++++++++++++++-------
+ 6 files changed, 102 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0589e65..cced12c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -517,6 +517,13 @@ static __global__ void mul_mat_vec_q(
+     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+     sample_dst = blockIdx.z;
+ 
++    // SiegeLadder (17.10, runs.md 4.45): an id at or past INT32_MAX is a pair left out of the product - the skip
++    // marker of llama-moe-stream's multi-pass prefill, which the MMQ id helper never matches. The whole block shares
++    // channel_dst, so it leaves together, before any barrier, and dst keeps what it had.
++    if (ncols_dst == 1 && ids && channel_x >= 0x7FFFFFFFu) {
++        return;
++    }
++
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+     const uint32_t sample_y    = sample_dst;
+ 
+@@ -740,6 +747,11 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
++    // a skipped pair (see mul_mat_vec_q): each warp works alone, so this one just stops
++    if (channel_x >= 0x7FFFFFFFu) {
++        return;
++    }
++
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8ef7565..843f99b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -13,8 +13,10 @@
+ #include "llama-ext.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <stdexcept>
+@@ -683,6 +685,43 @@ void llama_context::sched_reserve() {
+ 
+         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
+         n_nodes_pp  = ggml_graph_n_nodes(gf);
++
++        // SiegeLadder (M11, runs.md 4.43): LLAMA_GRAPH_TOP=N prints the N largest kinds of tensor the pp graph
++        // computes (name without the layer suffix, largest size, how many) - what fills the compute buffer at a
++        // large -ub. Sizes, not the allocator's peak: tensors of one kind mostly reuse the same memory.
++        if (const char * p = std::getenv("LLAMA_GRAPH_TOP")) {
++            struct kind { size_t max_nb = 0; int n = 0; const ggml_tensor * t = nullptr; };
++            std::map<std::string, kind> kinds;
++            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
++                const ggml_tensor * t = ggml_graph_node(gf, i);
++                if (t->view_src != nullptr) {
++                    continue;
++                }
++                std::string name = t->name;
++                const size_t dash = name.rfind('-');
++                if (dash != std::string::npos && dash + 1 < name.size() &&
++                        name.find_first_not_of("0123456789", dash + 1) == std::string::npos) {
++                    name.resize(dash);
++                }
++                kind & k = kinds[name];
++                k.n++;
++                if (ggml_nbytes(t) > k.max_nb) {
++                    k.max_nb = ggml_nbytes(t);
++                    k.t      = t;
++                }
++            }
++            std::vector<std::pair<std::string, kind>> v(kinds.begin(), kinds.end());
++            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.max_nb > b.second.max_nb; });
++            const int top = std::max(1, atoi(p));
++            for (int i = 0; i < top && i < (int) v.size(); i++) {
++                const ggml_tensor * t = v[i].second.t;
++                ggml_backend_t      b = ggml_backend_sched_get_tensor_backend(sched.get(), const_cast<ggml_tensor *>(t));
++                LLAMA_LOG_INFO("%s: pp graph: %8.1f MiB  x%-4d %-34s %-16s %s [%lld, %lld, %lld, %lld] on %s\n", __func__,
++                        v[i].second.max_nb/1048576.0, v[i].second.n, v[i].first.c_str(), ggml_op_desc(t),
++                        ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
++                        (long long) t->ne[3], b ? ggml_backend_name(b) : "-");
++            }
++        }
+     }
+ 
+     // reserve with tg (token generation) graph to get the number of splits and nodes
+@@ -2411,8 +2450,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         // multi-pass streamed prefill adds a bounded number of extra nodes per wave per streamed
+         //   layer. Same plan as build_moe_ffn, from the same function, so the budget cannot drift
+         //   away from the graph it is budgeting for.
++        //   The parking plan has more waves, so it bounds the skipping one - where the cache is big enough for
++        //   it at all: below 3*n_expert_used slots only skipping can run (SiegeLadder 17.10, 17 slots).
++        const uint32_t n_dyn   = mstream->n_slots - mstream->pin_budget;
++        const bool     bound_s = n_dyn < llama_moe_stream_min_slots(model.hparams.n_expert_used);
+         const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
+-                mstream->n_slots - mstream->pin_budget, model.hparams.n_expert, model.hparams.n_expert_used, n_tokens);
++                n_dyn, model.hparams.n_expert, model.hparams.n_expert_used, n_tokens, bound_s);
+         // only STREAMED layers produce wave nodes; layers[] carries a null for every other one
+         uint32_t n_streamed = 0;
+         for (const auto & sl : mstream->layers) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 62004aa..21e66ba 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2302,7 +2302,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //   against the built graph below, because a wave cap planned for skipping leaves no parking slots.
+     bool skip_planned = false;
+     if (msl) {
+-        skip_planned = msl->mgr->wave_skip && (int64_t) n_tokens >= LLAMA_MOE_STREAM_SKIP_MIN_TOKENS &&
++        skip_planned = msl->mgr->wave_skip && (int64_t) n_tokens >= msl->mgr->skip_min_tokens &&
+                        down_exps_b == nullptr && down_exps_s == nullptr;
+         for (const auto & lora : *loras) {
+             skip_planned = skip_planned && lora.first->get_weight(down_exps) == nullptr;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a5433d9..b7c22df 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1350,7 +1350,12 @@ static bool llama_moe_stream_resolve_slots(const llama_model_params & params, co
+         return true;
+     }
+ 
+-    const uint32_t n_min = llama_moe_stream_min_slots(hparams.n_expert_used);
++    // skipping waves need 2*n_expert_used slots, parking ones 3*n_expert_used (llama_moe_stream_min_slots). Skipping
++    // is on unless LLAMA_MOE_STREAM_WAVE_SKIP=0 - the same test as the ctor's; a backend that cannot skip (not CUDA)
++    // turns it off later, and alloc_bufs refuses a cache smaller than parking needs then
++    const char *   skip_env = std::getenv("LLAMA_MOE_STREAM_WAVE_SKIP");
++    const bool     skip_ok  = skip_env == nullptr || std::atoi(skip_env) != 0;
++    const uint32_t n_min    = llama_moe_stream_min_slots(hparams.n_expert_used, skip_ok);
+ 
+     uint32_t n_slots = params.moe_stream_slots;
+     const char * source = "--moe-stream-cache <N>s";
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 5205996..16783f8 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -607,6 +607,10 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         const char * s = std::getenv("LLAMA_MOE_STREAM_WAVE_SKIP");
+         wave_skip = s == nullptr || std::atoi(s) != 0;
+     }
++    // the smallest batch that skips; see skip_min_tokens in the header (64 = before 17.10)
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SKIP_MIN")) {
++        skip_min_tokens = std::max<int64_t>(2, std::strtoll(s, nullptr, 10));
++    }
+ 
+     // Router bias toward resident experts. Read once here rather than per call so a run cannot
+     // change policy halfway through and leave counters that describe two different experiments.
+@@ -701,16 +705,19 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+     // process's VRAM budget is all the CUDA pool can grow into (with "Prefer No Sysmem Fallback" a growth past it
+     // is a crash in the middle of a prompt: -ub 2048 at 12K, runs.md 4.43)
+     {
++        // The DXGI budget is not the limit: runs went 100-440 MiB past it. What failed, in every configuration
++        // probed (SiegeLadder runs.md 4.44, RTX 5070 Ti, driver 617.42), was ~330 MiB short of the dedicated size.
++        const double limit_margin = 330.0;
+         const llama_wddm_budget wb = llama_wddm_query_budget();
+         if (wb.ok) {
+-            const double headroom = ((double) wb.local_budget - (double) wb.local_usage)/1048576.0;
+-            LLAMA_LOG_INFO("%s: WDDM budget of %s: VRAM %.0f of %.0f MiB in use (dedicated %.0f), %.0f MiB left for "
+-                    "the CUDA pool; shared %.0f of %.0f MiB\n", __func__, wb.name, wb.local_usage/1048576.0,
+-                    wb.local_budget/1048576.0, wb.dedicated/1048576.0, headroom, wb.nonlocal_usage/1048576.0,
++            const double headroom = ((double) wb.dedicated - (double) wb.local_usage)/1048576.0 - limit_margin;
++            LLAMA_LOG_INFO("%s: WDDM (%s): VRAM %.0f MiB in use, dedicated %.0f, DXGI budget %.0f; about %.0f MiB "
++                    "left for the CUDA pool; shared %.0f of %.0f MiB\n", __func__, wb.name, wb.local_usage/1048576.0,
++                    wb.dedicated/1048576.0, wb.local_budget/1048576.0, headroom, wb.nonlocal_usage/1048576.0,
+                     wb.nonlocal_budget/1048576.0);
+-            if (headroom < 256.0) {
+-                LLAMA_LOG_WARN("%s: only %.0f MiB of the VRAM budget left after load - a prompt batch that grows the "
+-                        "CUDA pool past it fails under \"Prefer No Sysmem Fallback\" (a smaller -ub needs less)\n",
++            if (headroom < 128.0) {
++                LLAMA_LOG_WARN("%s: only about %.0f MiB of VRAM left after load - a prompt batch that grows the CUDA "
++                        "pool past it fails under \"Prefer No Sysmem Fallback\" (a smaller -ub needs less)\n",
+                         __func__, headroom);
+             }
+         }
+@@ -1175,12 +1182,18 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+         // skipped pairs carry an out-of-range id that only the CUDA mul_mat_id knows to leave out;
+         // any other backend would index past the cache with it
+         if (ggml_backend_buft_is_host(buft) || std::strncmp(ggml_backend_buft_name(buft), "CUDA", 4) != 0) {
++            if (wave_skip) {
++                // the slot count was resolved for skipping (2*n_expert_used); parking needs 3*n_expert_used, and
++                // a smaller cache stops at the wave plan's assert on the first batch that needs waves
++                LLAMA_LOG_WARN("%s: %s cannot skip pairs: waves park them, which needs 3*n_expert_used slots "
++                        "(%u per layer here)\n", __func__, ggml_backend_buft_name(buft), n_slots);
++            }
+             wave_skip = false;
+         }
+     }
+     if (!no_alloc) {
+-        LLAMA_LOG_INFO("%s: multi-pass prefill: pairs outside a wave are %s\n", __func__,
+-                wave_skip ? "skipped (from 64 tokens)" : "parked and masked");
++        LLAMA_LOG_INFO("%s: multi-pass prefill: pairs outside a wave are %s (from %lld tokens)\n", __func__,
++                wave_skip ? "skipped" : "parked and masked", (long long) (wave_skip ? skip_min_tokens : 2));
+     }
+ 
+     // The host tier is allocated here and not in the constructor: max_nb_expert only exists once
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 26421af..36c07b2 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -219,8 +219,13 @@ struct llama_moe_stream_work {
+ // discovered inside graph building instead, on the first batch that touched more experts than the
+ // cache holds - measured 2026-08-03 in runs/2026-08-03/stream-a1-on/run-01.raw.txt as
+ // "have 16, need 18", where 16 was what the DEFAULT resolved to.
+-static inline uint32_t llama_moe_stream_min_slots(uint32_t n_expert_used) {
+-    return 3*n_expert_used;
++//
++// skip: the waves skip the pairs outside them (llama_moe_stream_wave_skip) - no parking slots, a wave takes half
++// the cache and the next wave's preload the other half, so n_slots >= 2*n_expert_used. SiegeLadder 17.10 (runs.md
++// 4.45): once the MMVQ kernels left skipped ids out as well, every batch of two tokens or more could skip, and a
++// cache of 17 slots - 380 MiB below the 18 the parking rule asked for at K = 6 - became possible.
++static inline uint32_t llama_moe_stream_min_slots(uint32_t n_expert_used, bool skip = false) {
++    return (skip ? 2 : 3)*n_expert_used;
+ }
+ 
+ // Worst-case wave plan for one ubatch. cap is experts per wave, n_waves passes over the expert
+@@ -261,7 +266,7 @@ static inline llama_moe_stream_wave_budget llama_moe_stream_wave_plan(
+         return b; // everything this ubatch can touch is already resident-able: one pass
+     }
+ 
+-    GGML_ASSERT(n_slots >= llama_moe_stream_min_slots(n_expert_used));
++    GGML_ASSERT(n_slots >= llama_moe_stream_min_slots(n_expert_used, skip));
+ 
+     b.split   = true;
+     b.cap     = skip ? n_slots/2 : (n_slots - n_expert_used)/2;
+@@ -450,6 +455,10 @@ struct llama_moe_stream {
+     // expert caches live in a CUDA buffer, the one backend whose mul_mat_id handles skipped ids.
+     // Exact either way - it changes which GEMM rows run, not what the model computes.
+     bool wave_skip = false;
++    // The smallest batch that skips (LLAMA_MOE_STREAM_SKIP_MIN, default 2). It was 64: below that a batch may take
++    // the MMVQ path, whose kernels used to index the expert by id with no range check (SiegeLadder 17.10, runs.md
++    // 4.45: they leave skipped ids out now). 64 brings the old behaviour back, for A/B.
++    int64_t skip_min_tokens = 2;
+ 
+     llama_files files; // privately reopened GGUF files, same indices as the loader's
+ 
+@@ -789,15 +798,15 @@ struct llama_moe_stream {
+ // leaves it out of the GEMM (the MMQ id helper never matches it), and op_params[2] = 1 on the down
+ // projection zeroes its rows of dst, so the wave outputs add up without a mask.
+ //
+-// Only from LLAMA_MOE_STREAM_SKIP_MIN_TOKENS tokens: below that the CUDA backend can take the MMVQ
+-// path, whose kernels index the expert by id with no range check.
+-static const int32_t LLAMA_MOE_STREAM_SKIP_ID         = INT32_MAX;
+-static const int64_t LLAMA_MOE_STREAM_SKIP_MIN_TOKENS = 64;
++// From llama_moe_stream::skip_min_tokens tokens (2 by default since SiegeLadder 17.10): it used to be
++// 64, because below that the CUDA backend can take the MMVQ path, whose kernels indexed the expert by
++// id with no range check. They leave an id at or past LLAMA_MOE_STREAM_SKIP_ID out now (mmvq.cu).
++static const int32_t LLAMA_MOE_STREAM_SKIP_ID = INT32_MAX;
+ 
+ // The one place the mode is decided. The graph (mask or no mask) and the wave ids op (park or
+ // skip) must agree, or parked pairs would be summed unmasked.
+ static inline bool llama_moe_stream_wave_skip(const llama_moe_stream_layer & sl, int64_t n_tokens) {
+-    return sl.mgr->wave_skip && sl.wave_skip_ok && n_tokens >= LLAMA_MOE_STREAM_SKIP_MIN_TOKENS;
++    return sl.mgr->wave_skip && sl.wave_skip_ok && n_tokens >= sl.mgr->skip_min_tokens;
+ }
+ 
+ // callback of the id-remapping custom op inserted by build_moe_ffn

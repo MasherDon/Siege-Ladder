@@ -1,0 +1,33 @@
+From c900a379f5cc3c6616a633c895859da2101d6640 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 14:20:42 +0000
+Subject: [PATCH 57/91] moe-stream : LLAMA_MOE_STREAM_SPEC_QUEUE - the
+ speculative queue's ceiling in slabs (default 512, as before)
+
+Measurement apparatus for SiegeLadder P14's ceiling: in prefill each layer of an ubatch is one remap call whose
+trace entry is the union of experts the ubatch touches there, so the oracle with AHEAD=1 reads the next layer's
+union into the host tier when a layer plans its waves - an ideal P14. A prompt's next layer touches 70-80% of its
+384 experts (~870 slabs), more than the default ceiling of 512.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 6f3affd..ce705e3 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -769,6 +769,12 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                        "anticipation stays off\n", __func__);
+         spec_ahead = 0;
+     }
++    // the speculative queue's ceiling in slabs (default 512, about 170 experts): a prompt's next layer touches 70-80% of
++    // its 384 experts (~870 slabs), so the oracle's read-ahead of a whole layer in prefill (SiegeLadder P14's ceiling)
++    // needs more
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_QUEUE")) {
++        spec_queue_max = (size_t) std::max(1, atoi(p));
++    }
+     // A4b. Staging into VRAM slots ahead of the call; for now it takes the future from the oracle only.
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_VRAM_AHEAD")) {
+         vram_ahead = atoi(p);

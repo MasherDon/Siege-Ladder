@@ -1,0 +1,882 @@
+From 351adf33517475bc8c9db9c14c0d7199049ca057 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:14:45 +0000
+Subject: [PATCH 60/91] deepseek4 : a large prefill ubatch's attention in query
+ chunks (SiegeLadder P13, LLAMA_DSV4_ATTN_QCHUNK=nq, off by default)
+
+With P11 the prompt ubatch is 4608-6144 tokens and attention became the prefill's main compute: every query ran
+FlashAttention over the whole SWA ring of the ubatch (ub + 128 cells padded to 256 - 6400 at 6144, of which a query
+needs 128) and over the compressed columns up to the ubatch's maximum (SiegeLadder runs.md 4.85: ~40 of 107 s of the
+30K document at -ub 6144). Now each layer's attention runs in chunks of ~nq queries inside the same graph:
+- per chunk its own window rows of the ring, gathered by cell index from the ring after this layer's write (the
+  ring wraps; new input p13_rows, I32, the rows in position order padded with a masked real row) with their own
+  continuous F16 mask (p13_mask, the rules of set_input_kq_mask), and the compressed columns only up to the chunk's
+  own max n_visible padded to 256 (the top-k mask built at full width and sliced, never narrowed before set_rows);
+- MoE and everything outside attention stays on the whole ubatch; each chunk's tail (Hadamard back, rope_back by
+  its positions, wo_a) follows its FA call in graph order, chunks are joined pairwise, wo_b runs once; layers 0-1
+  take the window slice only; P7 (LLAMA_DSV4_ATTN_SPLIT) is off while P13 is on;
+- the per-chunk views of graph inputs (p13_mask, inp_hca's mask, inp_pos) are made once per graph (a view of an
+  input per layer cost the scheduler a separate synchronous copy each); the reserve uses chunks of exactly nq, the
+  worst case of every runtime chunk; one sequence, FA, causal SWA, raw cache f16 / q8_0 / q4_0, n_tokens >= 2 nq
+  (LLAMA_DSV4_ATTN_QCHUNK_MIN), else the old path;
+- LLAMA_DSV4_ATTN_QCHUNK_IDENTITY=1: one chunk with the ring in ring order and the full widths - K, mask and FA
+  are those of the old path, bitwise.
+
+Drafted by an agent from SiegeLadder docs/v41/p13-design.md, reviewed by a second one (two fixes applied: input
+views once per graph, the reserve's worst case). SiegeLadder (bench/results/p2/p13): default path unchanged (n1p
+text = trace, o32's counters); identity vs off on the 30K document at -ub 6144 KL 0.000000 over 128 answer
+positions; nq 1536 - the document 107.4 -> 93.2 s (-13%), the consultant 276.3 / 279.0 -> 320.6 / 320.8 tok/s; not
+bitwise (FA's tiles): KL 0.0041 on the first answer tokens (other prefill changes gave ~0.01, runs.md 4.85).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp         | 347 ++++++++++++++++++++++++++++++++++++
+ src/llama-graph.h           |  37 ++++
+ src/llama-kv-cache-dsv4.cpp |  16 ++
+ src/llama-kv-cache-dsv4.h   |   9 +
+ src/models/deepseek4.cpp    | 217 +++++++++++++++++++++-
+ src/models/models.h         |  22 ++-
+ 6 files changed, 638 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index fb7c59c..a06b2cc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -20,6 +20,7 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -1249,6 +1250,317 @@ static void dsv4_build_comp_inputs(
+     }
+ }
+ 
++// SiegeLadder P13 (models/deepseek4.cpp, build_attention_impl): the attention of a big prefill ubatch in chunks of
++// queries, each with its own window rows of the ring and its own compressed width.
++//   LLAMA_DSV4_ATTN_QCHUNK=nq          chunks of at most nq queries, as equal as possible (0 = off, the default)
++//   LLAMA_DSV4_ATTN_QCHUNK_MIN=m       only ubatches of at least m tokens (default 2*nq)
++//   LLAMA_DSV4_ATTN_QCHUNK_IDENTITY=1  the check of the gather and the masks: every ubatch of at least _MIN tokens
++//                                      (default 2) takes one chunk with all n_kv ring rows in ring order and the full
++//                                      compressed widths, so its K and masks equal the old concatenations bit for bit,
++//                                      and the logits must equal those of the attention of before
++// Only one sequence without coupled tokens, FlashAttention, causal attention, standard SWA and an f16 / q8_0 / q4_0
++// cache (their gather round trip is exact, as on the sparse decode path); any other ubatch keeps the attention of before
++struct dsv4_p13_env {
++    int64_t nq       = 0;
++    int64_t n_min    = 0;
++    bool    identity = false;
++};
++
++static const dsv4_p13_env & dsv4_p13_get_env() {
++    static const dsv4_p13_env env = [] {
++        dsv4_p13_env e;
++
++        const char * s = getenv("LLAMA_DSV4_ATTN_QCHUNK");
++        e.nq = s != nullptr ? std::max<int64_t>(0, (int64_t) atoll(s)) : 0;
++        if (e.nq > 0 && e.nq < 256) {
++            // every chunk adds ~25 nodes per layer and a FlashAttention call; below 256 queries it only costs
++            LLAMA_LOG_WARN("%s: SiegeLadder P13: LLAMA_DSV4_ATTN_QCHUNK=%lld raised to 256\n", __func__, (long long) e.nq);
++            e.nq = 256;
++        }
++
++        s = getenv("LLAMA_DSV4_ATTN_QCHUNK_IDENTITY");
++        e.identity = s != nullptr && atoi(s) != 0;
++
++        s = getenv("LLAMA_DSV4_ATTN_QCHUNK_MIN");
++        e.n_min = s != nullptr ? std::max<int64_t>(0, (int64_t) atoll(s)) : 0;
++        if (e.n_min == 0) {
++            e.n_min = e.identity ? 2 : 2*e.nq;
++        }
++        e.n_min = std::max<int64_t>(2, e.n_min);
++
++        if (e.identity) {
++            LLAMA_LOG_WARN("%s: SiegeLadder P13 identity mode (LLAMA_DSV4_ATTN_QCHUNK_IDENTITY=1): ubatches of %lld+ "
++                    "tokens attend in one chunk over the gathered ring and the full compressed widths - a check of the "
++                    "gather and the masks, bitwise against the attention of before, not a speed-up\n",
++                    __func__, (long long) e.n_min);
++        } else if (e.nq > 0) {
++            LLAMA_LOG_INFO("%s: SiegeLadder P13: ubatches of %lld+ tokens attend in chunks of at most %lld queries "
++                    "(LLAMA_DSV4_ATTN_QCHUNK)\n", __func__, (long long) e.n_min, (long long) e.nq);
++        }
++
++        return e;
++    }();
++
++    return env;
++}
++
++// the chunk plan of a ubatch: its shapes only (the rows and the mask are set_input's). The same at graph build, in
++// can_reuse and - from the same cells - at set_input
++static llm_graph_input_dsv4::p13_plan dsv4_p13_build_plan(
++        const llama_cparams & cparams,
++        const llama_hparams & hparams,
++        const llama_kv_cache_dsv4_context * mctx,
++        const llama_ubatch & ubatch) {
++    llm_graph_input_dsv4::p13_plan plan;
++
++    const dsv4_p13_env & env = dsv4_p13_get_env();
++    if (env.nq <= 0 && !env.identity) {
++        return plan;
++    }
++
++    const int64_t nt = ubatch.n_tokens;
++    if (nt < env.n_min || !cparams.flash_attn || !cparams.causal_attn || hparams.use_alibi || ubatch.is_pos_2d() ||
++            hparams.swa_type != LLAMA_SWA_TYPE_STANDARD || hparams.n_swa == 0) {
++        return plan;
++    }
++
++    const llama_kv_cache_dsv4_raw_context * raw = mctx->get_raw();
++
++    const ggml_type type_k = raw->get_type_k();
++    if (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_0 && type_k != GGML_TYPE_Q4_0) {
++        return plan;
++    }
++
++    const auto & plan_csa = mctx->get_csa_plan(ubatch);
++    const auto & plan_hca = mctx->get_hca_plan(ubatch);
++    if (plan_csa.n_stream != 1 || plan_hca.n_stream != 1) {
++        return plan;
++    }
++
++    // the reserve graph has neither cells nor positions behind its ubatch: it takes the full compressed widths
++    const bool reserve = mctx->is_reserve();
++    if (!reserve) {
++        if (ubatch.n_seqs_unq != 1 || (int64_t) raw->get_n_write() != nt) {
++            return plan;
++        }
++        for (int64_t i = 0; i < nt; ++i) {
++            if (ubatch.n_seq_id[i] != 1 || ubatch.pos[i] < 0) {
++                return plan;
++            }
++        }
++    }
++
++    const int64_t n_chunk = env.identity ? 1 : (nt + env.nq - 1)/env.nq;
++
++    // a ubatch runs chunks as equal as possible, at most nq each; the reserve graph runs chunks of exactly nq, the
++    // widest any ubatch can get (balanced chunks of a smaller ubatch reach nq: 2 x 1665 at nq 1665 against 4 x 1536
++    // at -ub 6144), so its window rows, FlashAttention outputs and masks bound every chunk the buffers will see
++    std::vector<int64_t> t0(n_chunk + 1);
++    int64_t n_max = 0;
++    for (int64_t c = 0; c <= n_chunk; ++c) {
++        t0[c] = reserve && !env.identity ? std::min<int64_t>(c*env.nq, nt) : c*nt/n_chunk;
++        if (c > 0) {
++            n_max = std::max<int64_t>(n_max, t0[c] - t0[c - 1]);
++        }
++    }
++
++    // a chunk of n consecutive positions needs n + n_swa - 1 window rows; FlashAttention with the 512-wide head takes
++    // K only in multiples of 256 (anything else sends it to the CPU)
++    const int64_t raw_len = env.identity ? (int64_t) raw->get_n_kv() : GGML_PAD(n_max + (int64_t) hparams.n_swa - 1, 256);
++    if (raw_len <= 0 || raw_len % 256 != 0) {
++        return plan;
++    }
++
++    if (!reserve && !env.identity) {
++        // the window rows of a chunk are the cells of its sequence from its first position - (n_swa - 1) to its last.
++        // Positions with gaps can make more of them than raw_len: such a ubatch keeps the attention of before
++        const llama_seq_id     seq_id = ubatch.seq_id[0][0];
++        const llama_kv_cells & cells  = raw->get_cells(seq_id);
++
++        for (int64_t c = 0; c < n_chunk; ++c) {
++            llama_pos p_lo = ubatch.pos[t0[c]];
++            llama_pos p_hi = p_lo;
++            for (int64_t i = t0[c]; i < t0[c + 1]; ++i) {
++                p_lo = std::min(p_lo, ubatch.pos[i]);
++                p_hi = std::max(p_hi, ubatch.pos[i]);
++            }
++            p_lo -= (llama_pos) hparams.n_swa - 1;
++
++            int64_t n_rows = 0;
++            for (uint32_t j = 0; j < cells.size(); ++j) {
++                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
++                    const llama_pos p0 = cells.pos_get(j);
++                    n_rows += p0 >= p_lo && p0 <= p_hi ? 1 : 0;
++                }
++            }
++            if (n_rows > raw_len) {
++                static bool warned = false;
++                if (!warned) {
++                    warned = true;
++                    LLAMA_LOG_WARN("%s: SiegeLadder P13: a chunk of a %lld-token ubatch needs %lld window rows, more than "
++                            "its %lld - positions with gaps; such ubatches attend as before\n", __func__,
++                            (long long) nt, (long long) n_rows, (long long) raw_len);
++                }
++                return plan;
++            }
++        }
++    }
++
++    // the compressed columns of a chunk: up to its widest query, padded to 256 like the plan's own n_kv; a column past
++    // a query's n_visible is masked for it anyway, so the narrower K drops only -inf entries
++    const auto widths = [&](const llama_kv_cache_dsv4_context::comp_plan & cp) {
++        std::vector<int64_t> w(n_chunk, 0);
++        if (cp.n_kv <= 0) {
++            return w;
++        }
++        for (int64_t c = 0; c < n_chunk; ++c) {
++            if (env.identity || reserve) {
++                w[c] = cp.n_kv;
++                continue;
++            }
++            GGML_ASSERT((int64_t) cp.n_visible.size() == nt);
++            int64_t n_vis = 0;
++            for (int64_t i = t0[c]; i < t0[c + 1]; ++i) {
++                n_vis = std::max<int64_t>(n_vis, cp.n_visible[i]);
++            }
++            w[c] = std::min<int64_t>(cp.n_kv, std::max<int64_t>(256, GGML_PAD(n_vis, 256)));
++        }
++        return w;
++    };
++
++    plan.w_csa    = widths(plan_csa);
++    plan.w_hca    = widths(plan_hca);
++    plan.n_chunk  = n_chunk;
++    plan.raw_len  = raw_len;
++    plan.identity = env.identity;
++    plan.t0       = std::move(t0);
++
++    return plan;
++}
++
++static std::string dsv4_p13_list(const std::vector<int64_t> & values) {
++    std::ostringstream ss;
++    ss << "[";
++    for (size_t i = 0; i < values.size(); ++i) {
++        if (i > 0) {
++            ss << ", ";
++        }
++        ss << values[i];
++    }
++    ss << "]";
++    return ss.str();
++}
++
++// the rows and the mask of the chunks: for each chunk the cells of its window - sorted by position, padded with a real
++// row masked for every query - or, in the identity mode, cells 0 .. n_kv - 1 of the ring as the old raw view had them;
++// the mask follows the rules of the whole-ring mask (llama_kv_cache::set_input_kq_mask, causal, standard SWA)
++static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_ubatch & ubatch) {
++    const auto & plan = inp.p13;
++    if (plan.n_chunk == 0 || !inp.p13_rows || !inp.p13_rows->buffer || !inp.p13_mask || !inp.p13_mask->buffer) {
++        return;
++    }
++
++    const int64_t nt      = ubatch.n_tokens;
++    const int64_t raw_len = plan.raw_len;
++
++    GGML_ASSERT(plan.t0.back() == nt);
++    GGML_ASSERT(inp.p13_rows->type == GGML_TYPE_I32 && inp.p13_rows->ne[0] == raw_len*plan.n_chunk);
++    GGML_ASSERT(inp.p13_mask->type == GGML_TYPE_F16 && inp.p13_mask->ne[0] == raw_len && inp.p13_mask->ne[1] == nt);
++    GGML_ASSERT(ggml_backend_buffer_is_host(inp.p13_rows->buffer));
++    GGML_ASSERT(ggml_backend_buffer_is_host(inp.p13_mask->buffer));
++
++    const llama_kv_cache_dsv4_raw_context * raw = inp.mctx->get_raw();
++
++    const llama_seq_id     seq_id = ubatch.seq_id[0][0];
++    const llama_kv_cells & cells  = raw->get_cells(seq_id);
++    const int64_t          off    = (int64_t) raw->get_stream()*raw->get_size();
++    const llama_pos        n_swa  = (llama_pos) inp.p13_n_swa;
++
++    int32_t     * rows = (int32_t     *) inp.p13_rows->data;
++    ggml_fp16_t * mask = (ggml_fp16_t *) inp.p13_mask->data;
++
++    const ggml_fp16_t f16_zero = llama_cast<ggml_fp16_t>(0.0f);
++    const ggml_fp16_t f16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
++
++    std::vector<uint32_t>  cell    (raw_len, 0);
++    std::vector<llama_pos> cell_pos(raw_len, -1); // -1: padding, an empty cell or another sequence's - masked for all
++    std::vector<std::pair<llama_pos, uint32_t>> found;
++
++    for (int64_t c = 0; c < plan.n_chunk; ++c) {
++        const int64_t i0 = plan.t0[c];
++        const int64_t i1 = plan.t0[c + 1];
++
++        int64_t n_rows = 0;
++        if (plan.identity) {
++            GGML_ASSERT(raw_len <= (int64_t) cells.size());
++            for (int64_t r = 0; r < raw_len; ++r) {
++                cell[r] = (uint32_t) r;
++            }
++            n_rows = raw_len;
++        } else {
++            llama_pos p_lo = ubatch.pos[i0];
++            llama_pos p_hi = p_lo;
++            for (int64_t i = i0; i < i1; ++i) {
++                p_lo = std::min(p_lo, ubatch.pos[i]);
++                p_hi = std::max(p_hi, ubatch.pos[i]);
++            }
++            p_lo -= n_swa - 1;
++
++            found.clear();
++            for (uint32_t j = 0; j < cells.size(); ++j) {
++                if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
++                    const llama_pos p0 = cells.pos_get(j);
++                    if (p0 >= p_lo && p0 <= p_hi) {
++                        found.emplace_back(p0, j);
++                    }
++                }
++            }
++            GGML_ASSERT((int64_t) found.size() <= raw_len && "P13: more window rows than the plan has room for");
++            std::sort(found.begin(), found.end());
++
++            n_rows = (int64_t) found.size();
++            for (int64_t r = 0; r < n_rows; ++r) {
++                cell[r] = found[r].second;
++            }
++        }
++
++        for (int64_t r = 0; r < raw_len; ++r) {
++            if (r < n_rows) {
++                const uint32_t j = cell[r];
++                rows[c*raw_len + r] = (int32_t) (off + j);
++                cell_pos[r] = !cells.is_empty(j) && cells.seq_has(j, seq_id) ? cells.pos_get(j) : -1;
++            } else {
++                rows[c*raw_len + r] = (int32_t) (off + (n_rows > 0 ? cell[0] : 0));
++                cell_pos[r] = -1;
++            }
++        }
++
++        // a cell of the token's sequence, not after it, inside its window: p1 - p0 < n_swa (is_masked_swa, standard)
++        for (int64_t i = i0; i < i1; ++i) {
++            const llama_pos p1 = ubatch.pos[i];
++            ggml_fp16_t * m = mask + i*raw_len;
++            for (int64_t r = 0; r < raw_len; ++r) {
++                const llama_pos p0 = cell_pos[r];
++                m[r] = p0 >= 0 && p0 <= p1 && p1 - p0 < n_swa ? f16_zero : f16_ninf;
++            }
++        }
++    }
++
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        std::vector<int64_t> n_tok(plan.n_chunk);
++        for (int64_t c = 0; c < plan.n_chunk; ++c) {
++            n_tok[c] = plan.t0[c + 1] - plan.t0[c];
++        }
++        LLAMA_LOG_INFO("%s: SiegeLadder P13%s: the first ubatch so planned - %lld tokens in %lld chunk(s) (nq = %lld): "
++                "tokens %s, window rows per chunk %lld (of %u ring cells), compressed columns CSA %s, HCA %s\n",
++                __func__, plan.identity ? " identity mode" : "", (long long) nt, (long long) plan.n_chunk,
++                (long long) dsv4_p13_get_env().nq, dsv4_p13_list(n_tok).c_str(), (long long) raw_len,
++                raw->get_size(), dsv4_p13_list(plan.w_csa).c_str(), dsv4_p13_list(plan.w_hca).c_str());
++    }
++}
++
+ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
+     if (self_k_idxs && self_k_idxs->buffer) {
+         mctx->set_input_k_idxs(self_k_idxs);
+@@ -1287,6 +1599,8 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+     if (inp_lid.k_rot && inp_lid.k_rot->buffer) {
+         mctx->get_lid()->set_input_k_rot(inp_lid.k_rot);
+     }
++
++    dsv4_p13_set_input(*this, *ubatch);
+ }
+ 
+ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
+@@ -1316,6 +1630,9 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
+     res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
+     res &= dsv4_can_reuse_comp_input(inp_lid, plan_lid, params.ubatch.n_tokens, n_stream);
+ 
++    // SiegeLadder P13: the chunks are graph structure (views, widths, how many FlashAttention calls)
++    res &= dsv4_p13_build_plan(params.cparams, params.hparams, mctx, params.ubatch) == p13;
++
+     return res;
+ }
+ 
+@@ -4113,6 +4430,36 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+     inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
+     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+ 
++    // SiegeLadder P13: the chunk plan of this ubatch and its two inputs (off by default: no tensors, the graph of before)
++    inp->p13       = dsv4_p13_build_plan(cparams, hparams, mctx_cur, ubatch);
++    inp->p13_n_swa = hparams.n_swa;
++    if (inp->p13.n_chunk > 0) {
++        inp->p13_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, inp->p13.raw_len*inp->p13.n_chunk);
++        ggml_set_input(inp->p13_rows);
++        ggml_set_name(inp->p13_rows, "dsv4_p13_rows");
++
++        inp->p13_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, inp->p13.raw_len, ubatch.n_tokens);
++        ggml_set_input(inp->p13_mask);
++        ggml_set_name(inp->p13_mask, "dsv4_p13_kq_mask");
++
++        // the chunks' views of the input masks, once per graph (see p13_mask_c)
++        const auto & p13 = inp->p13;
++        for (int64_t c = 0; c < p13.n_chunk; ++c) {
++            const int64_t i0 = p13.t0[c];
++            const int64_t n  = p13.t0[c + 1] - i0;
++
++            ggml_tensor * m = inp->p13_mask;
++            inp->p13_mask_c.push_back(p13.n_chunk == 1 ? m :
++                    ggml_view_2d(ctx0, m, p13.raw_len, n, m->nb[1], (size_t) i0*m->nb[1]));
++
++            ggml_tensor * h = inp->inp_hca.kq_mask;
++            if (h != nullptr && p13.w_hca[c] > 0) {
++                inp->p13_hca_c.push_back(p13.n_chunk == 1 && p13.w_hca[c] == h->ne[0] ? h :
++                        ggml_view_2d(ctx0, h, p13.w_hca[c], n, h->nb[1], (size_t) i0*h->nb[1]));
++            }
++        }
++    }
++
+     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b64cdba..12fd2eb 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -590,6 +590,30 @@ public:
+         ggml_tensor * k_rot      = nullptr;
+     };
+ 
++    // SiegeLadder P13: the attention of a big prefill ubatch in chunks of queries (LLAMA_DSV4_ATTN_QCHUNK, off by
++    // default; models/deepseek4.cpp, build_attention_impl). Fixed at graph build from the ubatch and the cache - the
++    // reserve graph takes the full compressed widths - and compared by can_reuse; set_input fills p13_rows / p13_mask
++    // from the cells. n_chunk == 0: the attention of before.
++    struct p13_plan {
++        int64_t n_chunk  = 0;
++        int64_t raw_len  = 0;     // window rows per chunk, a multiple of 256
++        bool    identity = false; // LLAMA_DSV4_ATTN_QCHUNK_IDENTITY: one chunk with all n_kv ring rows in ring order and
++                                  // the full compressed widths - its K and masks equal the old concatenations bit for bit
++
++        std::vector<int64_t> t0;    // [n_chunk + 1] the first token of each chunk, then n_tokens
++        std::vector<int64_t> w_csa; // [n_chunk] compressed columns of each chunk in the CSA layers (0: no CSA mask)
++        std::vector<int64_t> w_hca; // [n_chunk] the same in the HCA layers
++
++        bool operator==(const p13_plan & other) const {
++            return n_chunk  == other.n_chunk  &&
++                   raw_len  == other.raw_len  &&
++                   identity == other.identity &&
++                   t0       == other.t0       &&
++                   w_csa    == other.w_csa    &&
++                   w_hca    == other.w_hca;
++        }
++    };
++
+     llm_graph_input_dsv4(
+             const llama_cparams & cparams,
+             std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw,
+@@ -615,6 +639,19 @@ public:
+     comp_input inp_hca;
+     comp_input inp_lid;
+ 
++    // SiegeLadder P13 (see p13_plan)
++    p13_plan      p13;
++    ggml_tensor * p13_rows  = nullptr; // I32 [raw_len*n_chunk]: the ring rows (stream*size + cell) of each chunk
++    ggml_tensor * p13_mask  = nullptr; // F16 [raw_len, n_tokens]: each token's mask over its chunk's rows
++    uint32_t      p13_n_swa = 0;
++
++    // per chunk, made once per graph and shared by every layer. A view of a graph input stays on the CPU backend: each
++    // distinct view a GPU op reads gets its own copy, with a drain of the GPU queue before it (the scheduler's
++    // non-input branch) - once per graph here instead of once per layer and chunk. With one chunk, the input itself
++    std::vector<ggml_tensor *> p13_mask_c; // [raw_len, n_c]: the chunk's rows of p13_mask
++    std::vector<ggml_tensor *> p13_hca_c;  // [w_hca, n_c]: the chunk's block of inp_hca.kq_mask (V4's HCA flavour)
++    std::vector<ggml_tensor *> p13_pos_c;  // [n_c]: the chunk's positions, views of inp_pos (made by the model graph)
++
+     const llama_cparams cparams;
+ 
+     const llama_kv_cache_dsv4_context * mctx;
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 6f14039..b2cb549 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -2033,6 +2033,22 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
+     kv_swa->set_input_k_rot(dst);
+ }
+ 
++uint32_t llama_kv_cache_dsv4_raw_context::get_size() const {
++    return kv_swa->get_size();
++}
++
++uint32_t llama_kv_cache_dsv4_raw_context::get_stream() const {
++    return sinfos_read.empty() ? 0 : sinfos_read[i_next].s0;
++}
++
++ggml_type llama_kv_cache_dsv4_raw_context::get_type_k() const {
++    return kv_swa->type_k();
++}
++
++const llama_kv_cells & llama_kv_cache_dsv4_raw_context::get_cells(llama_seq_id seq_id) const {
++    return kv_swa->get_cells(seq_id);
++}
++
+ //
+ // llama_kv_cache_dsv4_comp_context
+ //
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index ca0f3df..2a5448c 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -245,6 +245,12 @@ public:
+     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_k_rot(ggml_tensor * dst) const;
+ 
++    // SiegeLadder P13: the ring as the host sees it, to gather the window rows of a chunk of queries by cell
++    uint32_t  get_size()   const; // cells per stream
++    uint32_t  get_stream() const; // the stream the current ubatch reads (the stream offset of get_k)
++    ggml_type get_type_k() const;
++    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
++
+ private:
+     size_t i_next = 0;
+ 
+@@ -423,6 +429,9 @@ public:
+     uint32_t get_hca_ratio() const { return hca_ratio; }
+     bool get_comp_overlap() const { return kv->get_comp_overlap(); }
+ 
++    // the context of the graph reserve (init_full): its plans are worst-case shapes with no positions behind them
++    bool is_reserve() const { return reserve_plans; }
++
+ private:
+ 
+     std::vector<comp_plan> plans_csa;
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 4175c36..2a00cbe 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1137,7 +1137,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         int il,
+         ggml_tensor ** topk_carry,
+         ggml_tensor ** cand_carry,
+-        dsv4_attn_kv * kv_out) const {
++        dsv4_attn_kv * kv_out,
++        dsv4_attn_parts * parts) const {
+     // V4.1 runs this shape for both compressed groups; V4 only for the csa one
+     const auto & inp_csa = use_hca ? inp_dsv4->get_hca() : inp_dsv4->get_csa();
+     GGML_ASSERT(inp_csa.kq_mask);
+@@ -1167,7 +1168,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+ 
+     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+ 
+-    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
++    ggml_tensor * ring_w = mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il);
++    ggml_build_forward_expand(gf, ring_w);
+ 
+     // SiegeLadder D3: the candidate source's block verdicts are computed here, in their own layer and after q. Their
+     // first reader is the next index source, four layers on, which would otherwise pull the whole chain - and this
+@@ -1196,6 +1198,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+ 
+     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+ 
++    // SiegeLadder P13: the parts only - the top-k mask at the full width (a top-k mask built on a narrower width could
++    // point past it: set_rows out of range), the compressed K and the ring after the write; the chunks of queries make
++    // their own K, masks and FlashAttention calls. Prefill only, so the sparse decode path below is never skipped
++    if (parts) {
++        parts->q         = q;
++        parts->ring      = ring_w;
++        parts->comp_k    = csa_k;
++        parts->comp_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
++        parts->k_rot     = k_rot;
++        return nullptr;
++    }
++
+     // At decode the dense path below attends over every compressed position and masks all but the indexer's
+     // top-k with -inf, so its cost grows with the context. One token in one stream can read only the picked
+     // blocks: gather their K rows and their mask entries (a pick may still be masked when fewer positions are
+@@ -1313,7 +1327,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+         ggml_tensor * sinks,
+         float kq_scale,
+         int il,
+-        dsv4_attn_kv * kv_out) const {
++        dsv4_attn_kv * kv_out,
++        dsv4_attn_parts * parts) const {
+     const auto & inp_hca = inp_dsv4->get_hca();
+     GGML_ASSERT(inp_hca.kq_mask);
+ 
+@@ -1328,7 +1343,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+ 
+     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+ 
+-    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
++    ggml_tensor * ring_w = mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il);
++    ggml_build_forward_expand(gf, ring_w);
+ 
+     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
+     cb(raw_k, "hca_raw_k", il);
+@@ -1345,6 +1361,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+             hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
+     cb(hca_k, "hca_comp_k", il);
+ 
++    // SiegeLadder P13: the parts only (see build_csa_lid_attention); here the compressed mask is the input itself
++    if (parts) {
++        parts->q         = q;
++        parts->ring      = ring_w;
++        parts->comp_k    = hca_k;
++        parts->comp_mask = inp_hca.kq_mask;
++        parts->k_rot     = k_rot;
++        return nullptr;
++    }
++
+     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+     cb(k_all, "hca_k_all", il);
+ 
+@@ -1373,7 +1399,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
+         ggml_tensor * sinks,
+         float kq_scale,
+         int il,
+-        dsv4_attn_kv * kv_out) const {
++        dsv4_attn_kv * kv_out,
++        dsv4_attn_parts * parts) const {
+     GGML_ASSERT(hparams.is_swa(il));
+ 
+     ggml_tensor * k_rot = inp_attn->self_k_rot;
+@@ -1388,7 +1415,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
+ 
+     const llama_kv_cache_dsv4_raw_context * mctx_cur = inp_attn->mctx;
+ 
+-    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
++    ggml_tensor * ring_w = mctx_cur->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il);
++    ggml_build_forward_expand(gf, ring_w);
++
++    // SiegeLadder P13: the parts only - the window is all this layer attends over
++    if (parts) {
++        parts->q     = q;
++        parts->ring  = ring_w;
++        parts->k_rot = k_rot;
++        return nullptr;
++    }
+ 
+     ggml_tensor * kq_mask = inp_attn->get_kq_mask();
+ 
+@@ -1824,6 +1860,160 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         ggml_build_forward_expand(gf, hca_state_score);
+     }
+ 
++    // SiegeLadder P13: at a big prefill ubatch (P11 makes -ub 4608-6144 the default for long prompts) every query ran
++    // FlashAttention over the whole window ring of the ubatch (ub + 128 cells padded to 256, of which it needs 128) and
++    // over the compressed columns up to the ubatch's widest query - per query ~1.65x the cost at -ub 1536 (runs.md 4.85),
++    // and the kernel's skip of a masked tail does not help, the window mask is not a tail. Here the attention runs in
++    // chunks of queries (LLAMA_DSV4_ATTN_QCHUNK; the plan is llm_graph_input_dsv4::p13): a chunk attends over its own
++    // window rows - gathered by cell from the ring as this layer's write left it, since the live part of the ring wraps
++    // in almost every ubatch - and over the compressed columns up to its own widest query, padded to 256. The indexer,
++    // the cache writes and the full-width top-k mask are made once per layer by the flavour (parts only); a chunk takes
++    // its rows of that mask and its leading columns. Each chunk goes through FlashAttention, the K rotation back, the
++    // inverse RoPE at its own positions and wo_a; wo_b takes their concatenation - the P7 structure turned from head
++    // groups to tokens, and P7 is not built with it. MoE and everything outside attention keep the whole ubatch. Not
++    // bitwise against the whole-ubatch call (other tiles, another stream-k split); the identity mode is (one chunk with
++    // all ring rows in ring order and the full widths: the same K, mask and FlashAttention call as below).
++    // LLAMA_DSV4_DENSE_SHIFT does not apply here. Prefill only: decode, the MTP path and runahead's pass are as before.
++    if (!inp_mtp && !part && inp_dsv4->p13.n_chunk > 0) {
++        const auto  & p13      = inp_dsv4->p13;
++        const float   kq_scale = 1.0f/sqrtf(float(n_embd_head));
++        GGML_ASSERT(p13.t0.back() == nt);
++        GGML_ASSERT(inp_dsv4->p13_rows != nullptr && inp_dsv4->p13_mask != nullptr);
++
++        dsv4_attn_parts pa;
++        const std::vector<int64_t> * widths = nullptr;
++        if (ratio == csa_ratio && inp_dsv4->get_csa().kq_mask) {
++            build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, sinks, kq_scale,
++                    false, il, topk_carry, cand_carry, nullptr, &pa);
++            widths = &p13.w_csa;
++        } else if (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() && inp_dsv4->get_hca().kq_mask) {
++            build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, sinks, kq_scale,
++                    true, il, topk_carry, cand_carry, nullptr, &pa);
++            widths = &p13.w_hca;
++        } else if (ratio == hca_ratio && inp_dsv4->get_hca().kq_mask) {
++            build_hca_attention(inp_dsv4, inp_attn, q, kv, sinks, kq_scale, il, nullptr, &pa);
++            widths = &p13.w_hca;
++        } else {
++            build_raw_attention(inp_attn, q, kv, sinks, kq_scale, il, nullptr, &pa);
++        }
++        GGML_ASSERT(pa.q != nullptr && pa.ring != nullptr);
++        GGML_ASSERT((widths != nullptr) == (pa.comp_k != nullptr) && (pa.comp_k != nullptr) == (pa.comp_mask != nullptr));
++        GGML_ASSERT(pa.comp_mask == nullptr || (pa.comp_mask->type == GGML_TYPE_F16 && pa.comp_mask->ne[1] == nt));
++
++        // the window rows of all chunks, gathered once per layer from the ring as this layer's write left it (the view
++        // of the cpy_k result keeps the order: write, then gather) and cast back to the cache type - exact for f16,
++        // q8_0 and q4_0, as on the sparse decode path (D11)
++        ggml_tensor * ring = ggml_view_2d(ctx0, pa.ring, pa.ring->ne[0], ggml_nelements(pa.ring)/pa.ring->ne[0],
++                pa.ring->nb[1], 0);
++        GGML_ASSERT(ring->ne[0] == n_embd_head);
++        ggml_tensor * raw_rows = ggml_get_rows(ctx0, ring, inp_dsv4->p13_rows);
++        raw_rows = ggml_cast(ctx0, raw_rows, pa.ring->type);
++        cb(raw_rows, "p13_raw_rows", il);
++
++        // the chunks' slices of graph inputs are the views made once per graph (llm_graph_input_dsv4::p13_mask_c): a
++        // view of an input made here would cost its own copy and a drain of the GPU queue in every layer
++        const bool comp_is_input = pa.comp_mask != nullptr && pa.comp_mask == inp_dsv4->get_hca().kq_mask;
++        GGML_ASSERT((int64_t) inp_dsv4->p13_mask_c.size() == p13.n_chunk);
++        GGML_ASSERT((int64_t) inp_dsv4->p13_pos_c.size()  == p13.n_chunk);
++        GGML_ASSERT(!comp_is_input || (int64_t) inp_dsv4->p13_hca_c.size() == p13.n_chunk);
++
++        std::vector<ggml_tensor *> outs;
++        for (int64_t c = 0; c < p13.n_chunk; ++c) {
++            const int64_t i0 = p13.t0[c];
++            const int64_t n  = p13.t0[c + 1] - i0;
++
++            ggml_tensor * qc = ggml_view_3d(ctx0, pa.q, n_embd_head, n_hd, n, pa.q->nb[1], pa.q->nb[2],
++                    (size_t) i0*pa.q->nb[2]);
++
++            // K: the chunk's window rows, then the compressed columns up to its widest query. Both lengths are multiples
++            // of 256 - FlashAttention with the 512-wide head runs nowhere else but on the CPU
++            ggml_tensor * kc = ggml_view_4d(ctx0, raw_rows, n_embd_head, 1, p13.raw_len, 1,
++                    raw_rows->nb[1], raw_rows->nb[1], raw_rows->nb[1]*p13.raw_len,
++                    (size_t) (c*p13.raw_len)*raw_rows->nb[1]);
++            ggml_tensor * mc = inp_dsv4->p13_mask_c[c];
++            GGML_ASSERT(mc->ne[0] == p13.raw_len && mc->ne[1] == n);
++            if (pa.comp_k) {
++                const int64_t w = (*widths)[c];
++                GGML_ASSERT(w > 0 && w % 256 == 0 && w <= pa.comp_k->ne[2] && w <= pa.comp_mask->ne[0]);
++
++                ggml_tensor * ck = ggml_view_4d(ctx0, pa.comp_k, pa.comp_k->ne[0], pa.comp_k->ne[1], w, pa.comp_k->ne[3],
++                        pa.comp_k->nb[1], pa.comp_k->nb[2], pa.comp_k->nb[3], 0);
++                kc = ggml_concat(ctx0, kc, ck, 2);
++
++                // the leading columns of the chunk's rows of the full-width mask; FlashAttention wants it continuous
++                // F16, which the concatenation makes. The top-k mask is a GPU tensor of this layer, its view costs
++                // nothing; V4's HCA mask is the graph input, sliced once per graph
++                ggml_tensor * cm = nullptr;
++                if (comp_is_input) {
++                    cm = inp_dsv4->p13_hca_c[c];
++                } else if (w == pa.comp_mask->ne[0] && n == nt) {
++                    cm = pa.comp_mask;
++                } else {
++                    cm = ggml_view_2d(ctx0, pa.comp_mask, w, n, pa.comp_mask->nb[1], (size_t) i0*pa.comp_mask->nb[1]);
++                }
++                GGML_ASSERT(cm->ne[0] == w && cm->ne[1] == n);
++                mc = ggml_concat(ctx0, mc, cm, 0);
++                cb(mc, "p13_kq_mask", il); // only this layer's own tensor: the raw layers' mask is the shared view
++            }
++            cb(kc, "p13_k", il);
++
++            ggml_tensor * oc = build_attn_mha(qc, kc, kc, nullptr, mc, sinks, nullptr, kq_scale, il);
++            if (pa.k_rot) {
++                oc = llama_mul_mat_hadamard(ctx0, oc, pa.k_rot);
++            }
++            cb(oc, "attn_p13", il);
++
++            // derope at the chunk's own positions, then the chunk through wo_a, group by group - as below
++            ggml_tensor * pos = inp_dsv4->p13_pos_c[c];
++            GGML_ASSERT(pos->ne[0] == n);
++            ggml_tensor * o   = ggml_reshape_3d(ctx0, oc, n_embd_head, n_hd, n);
++            ggml_tensor * on  = ggml_view_3d(ctx0, o, n_embd_head_nope, n_hd, n,
++                    ggml_row_size(o->type, n_embd_head),
++                    ggml_row_size(o->type, n_embd_head)*n_hd,
++                    0);
++            ggml_tensor * op  = ggml_view_3d(ctx0, o, n_embd_head_rope, n_hd, n,
++                    ggml_row_size(o->type, n_embd_head),
++                    ggml_row_size(o->type, n_embd_head)*n_hd,
++                    ggml_row_size(o->type, n_embd_head_nope));
++            op = ggml_rope_ext_back(ctx0, op, pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
++                    freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
++            o = ggml_concat(ctx0, on, op, 0);
++            cb(o, "attn_derope", il);
++
++            o = ggml_reshape_3d(ctx0, o, o_group_dim, n_grp, n);
++            o = ggml_permute(ctx0, o, 0, 2, 1, 3);
++            ggml_tensor * a = ggml_mul_mat(ctx0, wo_a, o);
++            cb(a, "attn_wo_a", il);
++            a = ggml_permute(ctx0, a, 0, 2, 1, 3);
++            a = ggml_cont_2d(ctx0, a, o_lora_rank*n_grp, n);
++
++            // the chunk's tail runs right after its FlashAttention call: build_attn_mha put only the call in the
++            // graph, and reached from wo_b the tails would run after all the calls, every chunk's FlashAttention
++            // output alive at once
++            ggml_build_forward_expand(gf, a);
++            outs.push_back(a);
++        }
++
++        // the chunks' results in token order, joined pairwise: each level copies the result once, where a running
++        // concatenation would copy its growing prefix again for every chunk
++        while (outs.size() > 1) {
++            std::vector<ggml_tensor *> next;
++            for (size_t k = 0; k + 1 < outs.size(); k += 2) {
++                next.push_back(ggml_concat(ctx0, outs[k], outs[k + 1], 1));
++            }
++            if (outs.size() % 2 == 1) {
++                next.push_back(outs.back());
++            }
++            outs = std::move(next);
++        }
++        ggml_tensor * oa = outs[0];
++        GGML_ASSERT(oa->ne[1] == nt);
++
++        ggml_tensor * res_out = build_lora_mm(wo_b, oa);
++        cb(res_out, "attn_out", il);
++        return res_out;
++    }
++
+     // SiegeLadder P7: at a big ubatch the attention's own tensors fill the compute buffer - wq_b's output, q after RoPE,
+     // the FlashAttention output and the derope concat are each [64 heads * 512, n_tokens] f32, 256 MiB at 2048 tokens
+     // (runs.md 4.44), and that caps the ubatch of a 32K prompt at 1536. Split into S runs of head groups, each run
+@@ -1984,7 +2174,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+-    ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
++    // SiegeLadder P13: with the attention in chunks of queries nothing reads the whole-ring mask ([ring, n_tokens] f16,
++    // 78 MB of pinned input at -ub 6144): it stays out of the graph, unallocated and unfilled (its set_input and
++    // can_reuse look at the buffer first)
++    if (inp_dsv4->p13.n_chunk == 0) {
++        ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
++    }
++    // and the chunks' positions for the inverse RoPE, views of inp_pos made once per graph and shared by every layer
++    // (see llm_graph_input_dsv4::p13_mask_c); with one chunk, inp_pos itself
++    for (int64_t c = 0; c < inp_dsv4->p13.n_chunk; ++c) {
++        const int64_t i0 = inp_dsv4->p13.t0[c];
++        const int64_t n  = inp_dsv4->p13.t0[c + 1] - i0;
++        inp_dsv4->p13_pos_c.push_back(inp_dsv4->p13.n_chunk == 1 ? inp_pos :
++                ggml_view_1d(ctx0, inp_pos, n, (size_t) i0*ggml_element_size(inp_pos)));
++    }
+ 
+     llm_graph_input_engram * inp_engram = nullptr;
+     if (hparams.engram_n_layer > 0) {
+diff --git a/src/models/models.h b/src/models/models.h
+index ec54f30..2c70535 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1118,6 +1118,17 @@ struct dsv4_attn_kv {
+     ggml_tensor * k_rot = nullptr;
+ };
+ 
++// SiegeLadder P13: what an attention flavour of DeepSeek V4 prepared up to its FlashAttention call, without the K / mask
++// concatenations and without the call - the chunks of queries of a big ubatch make their own from these. The indexer,
++// the cache write and the full-width top-k mask are made once, by the flavour
++struct dsv4_attn_parts {
++    ggml_tensor * q         = nullptr; // q after the K rotation, [n_embd_head, n_head, n_tokens]
++    ggml_tensor * ring      = nullptr; // the window ring as this layer's write left it (the cpy_k result)
++    ggml_tensor * comp_k    = nullptr; // the compressed K, full width [n_embd_head, 1, n_comp, 1]; null on raw layers
++    ggml_tensor * comp_mask = nullptr; // its mask, full width, F16 [n_comp, n_tokens]; null on raw layers
++    ggml_tensor * k_rot     = nullptr;
++};
++
+ struct llama_model_deepseek4 : public llama_model_base {
+     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+@@ -1260,9 +1271,12 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 int il,
+                 ggml_tensor ** topk_carry,
+                 ggml_tensor ** cand_carry,
+-                dsv4_attn_kv * kv_out = nullptr) const;
++                dsv4_attn_kv * kv_out = nullptr,
++                dsv4_attn_parts * parts = nullptr) const;
+ 
+         // kv_out (P7): when given, what the FlashAttention call used is left there for the other head groups
++        // parts (P13): when given, the flavour stops before its concatenations and its FlashAttention call, leaves what
++        // it prepared there and returns null
+         ggml_tensor * build_hca_attention(
+                 llm_graph_input_dsv4 * inp_dsv4,
+                 llm_graph_input_dsv4_raw * inp_attn,
+@@ -1271,7 +1285,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * sinks,
+                 float kq_scale,
+                 int il,
+-                dsv4_attn_kv * kv_out = nullptr) const;
++                dsv4_attn_kv * kv_out = nullptr,
++                dsv4_attn_parts * parts = nullptr) const;
+ 
+         ggml_tensor * build_raw_attention(
+                 llm_graph_input_dsv4_raw * inp_attn,
+@@ -1280,7 +1295,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * sinks,
+                 float kq_scale,
+                 int il,
+-                dsv4_attn_kv * kv_out = nullptr) const;
++                dsv4_attn_kv * kv_out = nullptr,
++                dsv4_attn_parts * parts = nullptr) const;
+ 
+         ggml_tensor * build_hc_pre(
+                 ggml_tensor * x,

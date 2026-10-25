@@ -1,0 +1,73 @@
+From fbba9e966372bb58a842ba4218d2846a06ea847b Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:56:00 +0000
+Subject: [PATCH 67/91] ggml-alloc : GGML_ALLOC_TRACE=2 also prints every
+ allocation, free and reset of the dynamic allocators (SiegeLadder P17)
+
+For an offline replay of the buffer's lifetimes (SiegeLadder bench/alloc_pack.py: the greedy mark, the most bytes live at
+once, a greedy-by-size packing of the same pieces). SiegeLadder runs.md 4.115: the 32K prefill buffer at -ub 6144 with P13
+- greedy 3490.7 MiB, live at most 2964.6, greedy-by-size 3467.3; at 12288 - 7267.2 / 5927.2 / 6932.5. The live set itself
+has to shrink, in several phases at once (the MoE wave, Engram, the HCA mask input).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-alloc.c | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index bfe8971..553d034 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -198,6 +198,17 @@ static void remove_allocated_tensor(struct ggml_dyn_tallocr * alloc, struct buff
+ }
+ #endif
+ 
++// SiegeLadder P17 (GGML_ALLOC_TRACE): 1 - every growth of a chunk's high-water mark; 2 - also every allocation (A),
++// free (F) and reset (R) of the dynamic allocators, for an offline replay of the buffer's lifetimes
++static int ggml_alloc_trace_level(void) {
++    static int level = -1;
++    if (level < 0) {
++        const char * e = getenv("GGML_ALLOC_TRACE");
++        level = e != NULL ? atoi(e) : 0;
++    }
++    return level;
++}
++
+ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * alloc, size_t size, const struct ggml_tensor * tensor) {
+     size = aligned_offset(NULL, size, alloc->alignment);
+ 
+@@ -303,10 +314,9 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
+     // SiegeLadder P17, step 0 (GGML_ALLOC_TRACE=1): every growth of a chunk's high-water mark - the tensor that set it, and
+     // the free space left behind the tail at that moment (holes); %p tells the allocators (one per buffer type) apart
+     {
+-        static int trace = -1;
+-        if (trace < 0) {
+-            const char * e = getenv("GGML_ALLOC_TRACE");
+-            trace = e != NULL && atoi(e) != 0;
++        const int trace = ggml_alloc_trace_level();
++        if (trace >= 2) {
++            GGML_LOG_WARN("alloc ev A %p %d %zu %zu %s\n", (const void *) alloc, addr.chunk, addr.offset, size, tensor->name);
+         }
+         if (trace && addr.offset + size > chunk->max_size) {
+             size_t holes = 0;
+@@ -330,6 +340,10 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
+ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct buffer_address addr, size_t size) {
+     size = aligned_offset(NULL, size, alloc->alignment);
+ 
++    if (ggml_alloc_trace_level() >= 2) {
++        GGML_LOG_WARN("alloc ev F %p %d %zu %zu\n", (const void *) alloc, addr.chunk, addr.offset, size);
++    }
++
+     struct tallocr_chunk * chunk = alloc->chunks[addr.chunk];
+ 
+     // see if we can merge with an existing block
+@@ -368,6 +382,9 @@ static void ggml_dyn_tallocr_free_bytes(struct ggml_dyn_tallocr * alloc, struct
+ }
+ 
+ static void ggml_dyn_tallocr_reset(struct ggml_dyn_tallocr * alloc) {
++    if (ggml_alloc_trace_level() >= 2) {
++        GGML_LOG_WARN("alloc ev R %p\n", (const void *) alloc);
++    }
+     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; i++) {
+         free(alloc->chunks[i]);
+         alloc->chunks[i] = NULL;

@@ -1,0 +1,186 @@
+From 1c5220b091c8f8d4638274d0bfa4cdd7d30689d3 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 07:26:27 +0000
+Subject: [PATCH 45/91] moe-stream : LLAMA_MOE_STREAM_HOT_DECAY=N (SiegeLadder
+ G20, halve the route hotness every N tokens instead of 64; 0 = never) and the
+ M15 counters (who took each VRAM slot - a decode miss, a runahead / predictor
+ stage, a prompt's waves - and how many tokens later a decode call missed an
+ evicted expert again, by who evicted it), printed by print_stats. Counters
+ only; the default decay stays 64
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 51 ++++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h   | 13 ++++++++++
+ 2 files changed, 62 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 07e9be0..5fe53a3 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1406,6 +1406,8 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+         sl->route_hotness.resize(n_expert, 0);
+         sl->route_total.resize(n_expert, 0);
+         sl->seen         .resize(n_expert, 0);
++        sl->evicted_at   .resize(n_expert, -1);
++        sl->evicted_why  .resize(n_expert, 0);
+         sl->keep         .resize(n_slots, 0);
+         sl->expert_pinned.resize(n_expert, 0);
+         sl->slot_pinned  .resize(n_slots, 0);
+@@ -1556,7 +1558,14 @@ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+     for (const auto & sl : layers) {
+         n_streamed += sl != nullptr;
+     }
+-    hot_decay_interval = MOE_STREAM_HOT_DECAY_TOKENS * n_streamed;
++    // LLAMA_MOE_STREAM_HOT_DECAY=N halves the hotness every N tokens instead (SiegeLadder G20: on the o17 trace
++    // cache_sim.py gave 57.30% VRAM hits at 16 tokens against 56.69% at 64); 0 never decays
++    int64_t decay_tokens = MOE_STREAM_HOT_DECAY_TOKENS;
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_HOT_DECAY")) {
++        decay_tokens = std::max<int64_t>(0, atoll(p));
++    }
++    hot_decay_interval = decay_tokens * n_streamed;
++    n_streamed_layers  = std::max<int64_t>(1, n_streamed);
+ }
+ 
+ void llama_moe_stream::cap_runahead(uint32_t n_expert_used) {
+@@ -1937,7 +1946,14 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+         if (debug) {
+             LLAMA_LOG_DEBUG("%s: layer %d: evict expert %d from slot %d\n", __func__, sl.il, sl.slot_expert[slot], slot);
+         }
+-        sl.expert_slot.erase(sl.slot_expert[slot]);
++        // M15: remember when and for whom the occupant left; a decode miss on it later is counted as regret
++        const int32_t old = sl.slot_expert[slot];
++        if (!sl.evicted_at.empty()) {
++            sl.evicted_at[old]  = stats.n_calls / n_streamed_layers;
++            sl.evicted_why[old] = bind_why;
++        }
++        stats.n_evict_why[bind_why & 3]++;
++        sl.expert_slot.erase(old);
+     }
+ 
+     sl.slot_expert[slot] = expert;
+@@ -1966,6 +1982,16 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+     sl.slot_wanted[slot]     = 0;
+ }
+ 
++// M15: a decode call misses expert e; if it was evicted from VRAM before, count how many tokens ago and for whom
++void llama_moe_stream::note_regret_locked(const llama_moe_stream_layer & sl, int32_t e) {
++    if (sl.evicted_at.empty() || sl.evicted_at[e] < 0) {
++        return;
++    }
++    const int64_t d = stats.n_calls / n_streamed_layers - sl.evicted_at[e];
++    const int     b = d <= 1 ? 0 : d <= 4 ? 1 : d <= 16 ? 2 : 3;
++    stats.n_regret[sl.evicted_why[e] & 3][b]++;
++}
++
+ static int moe_dt_bucket(int64_t us) {
+     static const int64_t edge[7] = { 250, 500, 1000, 2000, 4000, 8000, 16000 };
+     int b = 0;
+@@ -2224,6 +2250,7 @@ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const i
+         }
+         // where its bytes come from (M12): has() counts and marks nothing, so the tier's own numbers stay as they were
+         const bool from_drive = on_drive_locked(sf, e);
++        bind_why = 2;
+         reserve_slot_locked(sf, e, v);
+         sf.slot_staged[v] = from_drive ? 2 : 1;
+         sf.slot_src[v]    = (from_drive ? 1 : 0) | 2 | 4;
+@@ -2464,6 +2491,20 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 stats.n_stage_waste_drive, stats.n_stage_ready - stats.n_stage_ready_drive,
+                 stats.n_stage_late - stats.n_stage_late_drive, stats.n_stage_waste - stats.n_stage_waste_drive);
+     }
++    {
++        // M15 (SiegeLadder): who took the slots, and how soon a decode call missed an evicted expert again
++        const int64_t * ev = stats.n_evict_why;
++        const int64_t (*rg)[4] = stats.n_regret;
++        LLAMA_LOG_WARN("%s: %smoe stream: M15 VRAM evictions by who took the slot - a decode miss %" PRId64
++                ", a runahead / predictor stage %" PRId64 ", a prompt's waves %" PRId64 ", other %" PRId64
++                "; decode misses on an expert evicted <=1 / 2-4 / 5-16 / >16 tokens before, by who evicted it - "
++                "miss %" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64 ", stage %" PRId64 "/%" PRId64 "/%" PRId64
++                "/%" PRId64 ", prompt %" PRId64 "/%" PRId64 "/%" PRId64 "/%" PRId64 ", other %" PRId64 "/%" PRId64
++                "/%" PRId64 "/%" PRId64 "\n",
++                __func__, pfx, ev[1], ev[2], ev[3], ev[0],
++                rg[1][0], rg[1][1], rg[1][2], rg[1][3], rg[2][0], rg[2][1], rg[2][2], rg[2][3],
++                rg[3][0], rg[3][1], rg[3][2], rg[3][3], rg[0][0], rg[0][1], rg[0][2], rg[0][3]);
++    }
+     if (stats.n_wait_calls_drive + stats.n_wait_calls_tier > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: decode waits by source: %" PRId64 " calls waited with a drive read in flight, "
+                 "%.1f s (%" PRId64 " of them on a drive read of their own, a miss not staged ahead, %.1f s); %" PRId64
+@@ -3764,6 +3805,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                 mgr->stats.n_miss_cold++;
+             }
+             const bool from_drive = mgr->on_drive_locked(*sl, e);
++            mgr->note_regret_locked(*sl, e);
++            mgr->bind_why = 1;
+             mgr->reserve_slot_locked(*sl, e, v);
+             sl->slot_src[v] = (from_drive ? 1 : 0) | 4;
+             mgr->enqueue_slot_locked(*sl, e, v);
+@@ -3955,6 +3998,8 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+                 v = mgr->pick_victim_locked(*sl, sl->keep.data());
+             }
+             const bool from_drive = mgr->on_drive_locked(*sl, e);
++            mgr->note_regret_locked(*sl, e);
++            mgr->bind_why = 1;
+             mgr->reserve_slot_locked(*sl, e, v);
+             sl->slot_src[v] = (from_drive ? 1 : 0) | 4;
+             mgr->enqueue_slot_locked(*sl, e, v);
+@@ -4202,6 +4247,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+                 if (!sl.seen[e]) {
+                     stats.n_miss_cold++;
+                 }
++                bind_why = 3;
+                 reserve_slot_locked(sl, e, v);
+                 enqueue_slot_locked(sl, e, v);
+                 stats.n_miss++;
+@@ -4227,6 +4273,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
+             if (!sl.seen[e]) {
+                 stats.n_miss_cold++;
+             }
++            bind_why = 3;
+             reserve_slot_locked(sl, e, v);
+             sl.keep[v] = 1;
+             enqueue_slot_locked(sl, e, v);
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 81b2577..f909982 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -103,6 +103,10 @@ struct llama_moe_stream_layer {
+     // expert, which is right for eviction and wrong for a histogram.
+     std::vector<uint64_t> route_total;
+     std::vector<uint8_t>  seen;          // [n_expert] for cold-miss attribution
++    // SiegeLadder M15: [n_expert] the token of this expert's last eviction from VRAM (-1 = never) and who took its
++    // slot (the manager's bind_why at that moment)
++    std::vector<int64_t> evicted_at;
++    std::vector<uint8_t> evicted_why;
+     int64_t use_counter = 0;
+ 
+     // scratch for the remap callback
+@@ -588,6 +592,10 @@ struct llama_moe_stream {
+ 
+     size_t  max_nb_expert      = 0;
+     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
++    // SiegeLadder M15: remap calls per token (the streamed layers), and who reserves slots right now: 0 other,
++    // 1 a decode call's own miss, 2 a runahead / predictor stage, 3 a prompt's waves
++    int64_t n_streamed_layers = 1;
++    uint8_t bind_why          = 0;
+ 
+     // A4, prefetch. How many remap calls ahead the oracle looks, and the ceiling on the
+     // speculative queue. ahead = 0 turns the whole thing off, which is the default: this path
+@@ -895,6 +903,10 @@ struct llama_moe_stream {
+         int64_t n_stage_ready_drive = 0;
+         int64_t n_stage_late_drive  = 0;
+         int64_t n_stage_waste_drive = 0;
++        // M15: VRAM evictions by who took the slot (bind_why), and decode misses on an expert evicted <= 1 / 2-4 /
++        // 5-16 / > 16 tokens before, by who evicted it
++        int64_t n_evict_why[4] = {};
++        int64_t n_regret[4][4] = {};
+         // M12, when a decode call starts to wait (the remap, or runahead's second half): its loads still in flight, by
+         // source (slot_src), and the calls that waited, split by whether any of those loads comes from the drive
+         int64_t n_wait_slots_drive  = 0;
+@@ -969,6 +981,7 @@ struct llama_moe_stream {
+     void worker_loop(int worker_id);
+     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
+     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
++    void note_regret_locked(const llama_moe_stream_layer & sl, int32_t expert);
+     // M12: is some slab of this expert missing from the host tier, so that its load reads the drive? Counts and marks
+     // nothing in the tier (l2::has)
+     bool on_drive_locked(const llama_moe_stream_layer & sl, int32_t expert);

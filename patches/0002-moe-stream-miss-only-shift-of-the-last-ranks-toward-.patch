@@ -1,0 +1,226 @@
+From a0a9447ed335c978a6930166ee35f05aaeb23d43 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 15:26:39 +0000
+Subject: [PATCH 02/91] moe-stream : miss-only shift of the last ranks toward
+ cached experts
+
+LLAMA_MOE_STREAM_SHIFT_TAU / LLAMA_MOE_STREAM_SHIFT_RANKS, off by default: at tau 0 the
+hook is not built and the default path is unchanged (KL against the previous build 0.00000).
+When one of the last N experts of the top-k is not in VRAM, it is swapped for the
+best-scoring expert the cache holds (VRAM first, then the host tier) if that one trails it
+by less than tau * (top-1 - median score); the top ranks are never touched. The substitute
+takes the replaced expert's place in the ranking and keeps its own routing weight. A
+switchable lossy mode for measurement, like LLAMA_MOE_STREAM_ROUTE_BIAS, whose hook it shares.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |   4 +-
+ src/llama-moe-stream.cpp | 126 +++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-stream.h   |  11 ++++
+ 3 files changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b76b0d8..7c35fbd 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2210,10 +2210,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //   built at all, so the default path stays bit-identical. This deliberately changes which
+     //   experts are selected - it is a measurement instrument for trading routing fidelity against
+     //   residency, not a default.
++    //   The miss-only shift (LLAMA_MOE_STREAM_SHIFT_TAU) rides the same hook.
+     if (mstream) {
+         llama_moe_stream_layer * msl_bias = mstream->layer(il);
+         if (msl_bias && msl_bias->matches(gate_exps, up_exps, down_exps, gate_up_exps) &&
+-                mstream->route_bias != 0.0f) {
++                (mstream->route_bias != 0.0f || mstream->shift_tau > 0.0f)) {
++            msl_bias->n_used = (int32_t) n_expert_used;
+             selection_probs = ggml_map_custom1(ctx0, ggml_cont(ctx0, selection_probs),
+                     llama_moe_stream_route_bias, 1, msl_bias); // [n_expert, n_tokens]
+             cb(selection_probs, "ffn_moe_probs_cache_biased", il);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index f2d7b5d..3b24922 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -407,6 +407,17 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         l2_gib = v > 0 ? (size_t) v : 0;
+     }
+ 
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SHIFT_TAU")) {
++        shift_tau = std::max(0.0f, std::strtof(s, nullptr));
++    }
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_SHIFT_RANKS")) {
++        shift_ranks = std::max(1, atoi(s));
++    }
++    if (shift_tau > 0.0f) {
++        LLAMA_LOG_INFO("%s: MoE expert streaming: miss-only shift of the last %d rank(s), tau %.4f of the score spread\n",
++                __func__, shift_ranks, shift_tau);
++    }
++
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_ROUTE_BIAS")) {
+         route_bias = std::strtof(s, nullptr);
+         if (route_bias != 0.0f) {
+@@ -1095,6 +1106,10 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_spec_queued, stats.n_spec_filled,
+                 stats.n_spec_queued > 0 ? 100.0*(stats.n_spec_queued - stats.n_spec_filled)/stats.n_spec_queued : 0.0);
+     }
++    if (n_shift > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: miss-only shift swapped %" PRId64 " experts (%" PRId64 " from the host tier)\n",
++                __func__, pfx, n_shift, n_shift_l2);
++    }
+     if (stats.n_hit_pin > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: JigSaw pinned hits = %" PRId64 " (%.2f%% dos hits)\n",
+                 __func__, pfx, stats.n_hit_pin,
+@@ -1209,6 +1224,114 @@ void llama_moe_stream::print_locality(const char * pfx) const {
+ // then rewrite each id to its cache slot. this only relabels ids, so the same experts are computed
+ // in the same order; the result matches a non-streamed run (bit-exact when both paths use the same
+ // kernels, as on CUDA; a CPU build that repacks the non-streamed weights can differ in the last bits).
++// Miss-only shift: for each token, the last shift_ranks experts of the top-k that are NOT in VRAM may
++// be swapped for the best-scoring held expert outside the top-k whose score is within
++// shift_tau * (top-1 - median) of theirs - first among the experts VRAM holds, then among those whose
++// every slab the host tier holds. The substitute takes the score of the expert it replaces, which
++// drops out (-inf), so top-k picks it in that place; its routing weight is computed later from its
++// own unbiased probability, as for any selected expert. VRAM residency is read under mgr->mtx, the
++// host tier through has() with mgr->mtx released, as the I/O workers do.
++static void llama_moe_stream_shift(llama_moe_stream_layer * sl, float * out, int64_t n_expert, int64_t n_tokens) {
++    auto * mgr = sl->mgr;
++    const int32_t K = std::min<int32_t>(sl->n_used, (int32_t) n_expert);
++    const int32_t R = std::min<int32_t>(mgr->shift_ranks, K);
++    const float   tau = mgr->shift_tau;
++
++    std::vector<int32_t> idx((size_t) n_expert);
++    std::vector<float>   tmp((size_t) n_expert);
++    std::vector<int32_t> need_l2;
++    int64_t n_vram = 0;
++    int64_t n_l2   = 0;
++
++    for (int64_t t = 0; t < n_tokens; t++) {
++        float * row = out + t*n_expert;
++        for (int32_t i = 0; i < (int32_t) n_expert; i++) {
++            idx[i] = i;
++        }
++        std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
++                [row](int32_t x, int32_t y) { return row[x] > row[y]; });
++        std::copy(row, row + n_expert, tmp.begin());
++        std::nth_element(tmp.begin(), tmp.begin() + n_expert/2, tmp.end());
++        const float spread = row[idx[0]] - tmp[n_expert/2];
++        if (!(spread > 0.0f) || !std::isfinite(spread)) {
++            continue;
++        }
++        auto in_top = [&](int32_t c) {
++            for (int32_t j = 0; j < K; j++) {
++                if (idx[j] == c) {
++                    return true;
++                }
++            }
++            return false;
++        };
++        auto swap_in = [&](int32_t r, int32_t c) {
++            row[c] = row[idx[r]];
++            row[idx[r]] = -INFINITY;
++            idx[r] = c;
++        };
++
++        need_l2.clear();
++        {
++            std::unique_lock<std::mutex> lk(mgr->mtx);
++            for (int32_t r = K - 1; r >= K - R; r--) {
++                const int32_t e = idx[r];
++                if (sl->expert_slot.count(e)) {
++                    continue; // held (resident or loading): not a miss
++                }
++                const float thr = row[e] - tau*spread;
++                int32_t sub  = -1;
++                float   best = -INFINITY;
++                for (const auto & kv : sl->expert_slot) {
++                    const int32_t c = kv.first;
++                    if (c >= 0 && c < n_expert && row[c] >= thr && row[c] > best && !in_top(c)) {
++                        best = row[c];
++                        sub  = c;
++                    }
++                }
++                if (sub >= 0) {
++                    swap_in(r, sub);
++                    n_vram++;
++                } else {
++                    need_l2.push_back(r);
++                }
++            }
++        }
++        if (mgr->l2) {
++            for (const int32_t r : need_l2) {
++                const int32_t e = idx[r];
++                const float thr = row[e] - tau*spread;
++                int32_t sub  = -1;
++                float   best = -INFINITY;
++                for (int32_t c = 0; c < (int32_t) n_expert; c++) {
++                    if (!(row[c] >= thr) || row[c] <= best || in_top(c)) {
++                        continue;
++                    }
++                    bool held = true;
++                    for (const auto & wt : sl->weights) {
++                        if (!mgr->l2->has(wt.file_idx, wt.offs + (size_t) c*wt.nb_expert, wt.nb_expert)) {
++                            held = false;
++                            break;
++                        }
++                    }
++                    if (held) {
++                        best = row[c];
++                        sub  = c;
++                    }
++                }
++                if (sub >= 0) {
++                    swap_in(r, sub);
++                    n_l2++;
++                }
++            }
++        }
++    }
++    if (n_vram + n_l2 > 0) {
++        std::unique_lock<std::mutex> lk(mgr->mtx);
++        mgr->n_shift    += n_vram + n_l2;
++        mgr->n_shift_l2 += n_l2;
++    }
++}
++
+ // Adds mgr->route_bias to the selection logits of the experts this layer currently holds. Runs on
+ // the CPU right before top-k, under the same lock the remap takes, so the residency it reads is the
+ // one the remap acts on a moment later.
+@@ -1234,6 +1357,9 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+     memcpy(dst->data, a->data, ggml_nbytes(a));
+ 
+     const float bias = mgr->route_bias;
++    if (mgr->shift_tau > 0.0f && sl->n_used > 0) {
++        llama_moe_stream_shift(sl, (float *) dst->data, a->ne[0], ggml_nelements(a) / a->ne[0]);
++    }
+     if (bias == 0.0f) {
+         return;
+     }
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index b65d9f4..2c2642e 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -63,6 +63,7 @@ struct llama_moe_stream_layer {
+     int32_t  il       = -1;
+     uint32_t n_expert = 0;
+     uint32_t n_slots  = 0;
++    int32_t  n_used   = 0; // n_expert_used of the graph that built the route hook (shift rule)
+ 
+     std::vector<llama_moe_stream_weight> weights; // 2 (fused gate_up + down) or 3 entries
+ 
+@@ -361,6 +362,16 @@ struct llama_moe_stream {
+     // and is a measurement instrument, not a default.
+     float route_bias = 0.0f;
+ 
++    // Miss-only shift (LLAMA_MOE_STREAM_SHIFT_TAU / _RANKS). Only the last shift_ranks experts of the
++    // top-k are eligible, and only when they are not in VRAM: such an expert is swapped for the
++    // best-scoring expert the cache holds (VRAM first, then the host tier) if that one trails it by
++    // less than shift_tau * (top-1 score - median score). The top ranks are never touched. Like the
++    // bias above, a switchable lossy mode for measurement; at tau 0 the hook is not built.
++    float   shift_tau   = 0.0f;
++    int32_t shift_ranks = 1;
++    int64_t n_shift     = 0; // swaps made, guarded by mtx
++    int64_t n_shift_l2  = 0; // of those, substitutes found in the host tier
++
+     llama_files files; // privately reopened GGUF files, same indices as the loader's
+ 
+     // Host-RAM tier below the VRAM slots. Off unless LLAMA_MOE_STREAM_L2_GIB is set; sized in

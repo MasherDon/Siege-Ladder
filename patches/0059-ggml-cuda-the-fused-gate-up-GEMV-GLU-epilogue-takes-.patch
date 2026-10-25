@@ -1,0 +1,213 @@
+From fe7e9d698acb636fa5fe54ca1f9211713026e0b3 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 16:51:34 +0000
+Subject: [PATCH 59/91] ggml-cuda : the fused gate/up GEMV + GLU epilogue takes
+ GGML_GLU_OP_SWIGLU_LIM (SiegeLadder G8, decode half)
+
+With V4's clamps folded into one GLU op (70fc66d) the pattern MUL_MAT(_ID) gate, MUL_MAT(_ID) up, GLU matches the
+fused mmvq / mmvf path: the epilogue applies ggml_cuda_op_swiglu_lim_single with the GLU's limit (op_params[2], carried
+as glu_param in the fusion args). A wave's ids variant (src[2]) stays unfused. test-backend-ops: MUL_MAT_VEC_FUSION
+with SWIGLU_LIM (144 cases), 504 / 504.
+
+SiegeLadder (o35, o36): bitwise - decode exact path against the 17.10 KL base KLD 0.00000, PPL x1.0000; exact
+without runahead text = trace and o32's counters to the unit. Speed: the default mode 14.856 vs 14.867 tok/s (ABBA x2,
+sd 0.39; the time outside the drive wait 40.22 vs 40.41 ms), exact runahead 14.16 vs 14.31 - within noise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/common.cuh   |  2 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 ++++++++++++-
+ ggml/src/ggml-cuda/mmvf.cu      |  6 ++++++
+ ggml/src/ggml-cuda/mmvq.cu      |  6 ++++++
+ tests/test-backend-ops.cpp      |  4 +++-
+ 5 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 0159d0d..8b2e3d7 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1536,6 +1536,7 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
+     ggml_glu_op glu_op;
++    float glu_param = 0.0f; // SiegeLadder: GGML_GLU_OP_SWIGLU_LIM's limit (op_params[2] of the GLU)
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+@@ -1544,6 +1545,7 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
+     ggml_glu_op glu_op;
++    float glu_param = 0.0f; // SiegeLadder: GGML_GLU_OP_SWIGLU_LIM's limit
+ };
+ 
+ struct ggml_cuda_kernel_launch_params {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 890199f..c1b6a19 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1790,12 +1790,17 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+         return false;
+     }
+ 
+-    static constexpr std::array<ggml_glu_op, 3> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI };
++    static constexpr std::array<ggml_glu_op, 4> valid_glu_ops = { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_OAI, GGML_GLU_OP_SWIGLU_LIM };
+ 
+     if (std::find(valid_glu_ops.begin(), valid_glu_ops.end(), ggml_get_glu_op(glu)) == valid_glu_ops.end()) {
+         return false;
+     }
+ 
++    // SiegeLadder G8: the fused epilogue knows the limit, not a prefill wave's ids (ggml_swiglu_lim_split_ids)
++    if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_LIM && glu->src[2] != nullptr) {
++        return false;
++    }
++
+     if (const bool swapped = ggml_get_op_params_i32(glu, 1); swapped) {
+         return false;
+     }
+@@ -3555,6 +3560,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.x_scale    = up_scale;
+                 fusion_data.gate_scale = gate_scale;
+                 fusion_data.glu_op     = ggml_get_glu_op(glu);
++                fusion_data.glu_param  = ggml_get_op_params_f32(glu, 2);
+ 
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+@@ -3648,6 +3654,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.x_scale    = up_scale;
+                 fusion_data.gate_scale = gate_scale;
+                 fusion_data.glu_op     = ggml_get_glu_op(glu);
++                fusion_data.glu_param  = ggml_get_op_params_f32(glu, 2);
+ 
+                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
+@@ -3704,6 +3711,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.x_bias    = up_bias_tensor;
+                 fusion_data.gate_bias = gate_bias_tensor;
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
++                fusion_data.glu_param = ggml_get_op_params_f32(glu, 2);
+ 
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -3717,6 +3725,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 fusion_data.x_bias    = up_bias_tensor;
+                 fusion_data.gate_bias = gate_bias_tensor;
+                 fusion_data.glu_op    = ggml_get_glu_op(glu);
++                fusion_data.glu_param = ggml_get_op_params_f32(glu, 2);
+ 
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -3743,6 +3752,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate   = gate->src[0];
+                 fusion_data.glu_op = ggml_get_glu_op(glu);
++                fusion_data.glu_param = ggml_get_op_params_f32(glu, 2);
+ 
+                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+@@ -3754,6 +3764,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.gate   = gate->src[0];
+                 fusion_data.glu_op = ggml_get_glu_op(glu);
++                fusion_data.glu_param = ggml_get_op_params_f32(glu, 2);
+ 
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                 fused_mul_mat_vec = true;
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b..90ee330 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -56,6 +56,7 @@ static __global__ void mul_mat_vec_f(
+     bool use_bias = false;
+     bool use_gate_bias = false;
+     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
++    [[maybe_unused]] float glu_param = 0.0f;
+     const T * gate_x = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
+@@ -65,6 +66,7 @@ static __global__ void mul_mat_vec_f(
+         use_bias = fusion.x_bias != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr;
+         glu_op = fusion.glu_op;
++        glu_param = fusion.glu_param;
+ 
+         if (use_gate) {
+             gate_x = static_cast<const T *>(fusion.gate);
+@@ -365,6 +367,9 @@ static __global__ void mul_mat_vec_f(
+                     value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                     break;
+                 }
++                case GGML_GLU_OP_SWIGLU_LIM: // SiegeLadder G8
++                    value = ggml_cuda_op_swiglu_lim_single(gate_value, value, glu_param);
++                    break;
+                 default:
+                     break;
+             }
+@@ -675,6 +680,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        fusion_local.glu_param = fusion->glu_param;
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index cced12c..18a9092 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -538,6 +538,7 @@ static __global__ void mul_mat_vec_q(
+     const float * x_scale = nullptr;
+     const float * gate_scale = nullptr;
+     ggml_glu_op active_glu;
++    [[maybe_unused]] float glu_param = 0.0f;
+ 
+     if constexpr (has_fusion) {
+         use_gate      = fusion.gate      != nullptr;
+@@ -547,6 +548,7 @@ static __global__ void mul_mat_vec_q(
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
+         active_glu    = fusion.glu_op;
++        glu_param     = fusion.glu_param;
+         if constexpr (type == GGML_TYPE_NVFP4) {
+             use_scale      = fusion.x_scale    != nullptr;
+             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+@@ -688,6 +690,9 @@ static __global__ void mul_mat_vec_q(
+                             case GGML_GLU_OP_SWIGLU_OAI:
+                                 result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                 break;
++                            case GGML_GLU_OP_SWIGLU_LIM: // SiegeLadder G8
++                                result = ggml_cuda_op_swiglu_lim_single(gate_value, result, glu_param);
++                                break;
+                             default:
+                                 result = result * gate_value;
+                                 break;
+@@ -1226,6 +1231,7 @@ void ggml_cuda_mul_mat_vec_q(
+             fusion_local.gate_scale = fusion->gate_scale->data;
+         }
+         fusion_local.glu_op = fusion->glu_op;
++        fusion_local.glu_param = fusion->glu_param;
+     }
+ 
+     // If src0 is a temporary compute buffer, clear any potential padding.
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index fed6335..1fcc027 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6186,6 +6186,8 @@ struct test_mul_mat_vec_fusion : public test_case {
+                 constexpr float alpha = 1.702f;
+                 constexpr float limit = 7.0f;
+                 out = ggml_swiglu_oai(ctx, ffn_gate, ffn_up, alpha, limit);
++            } else if (glu_op == GGML_GLU_OP_SWIGLU_LIM) {
++                out = ggml_swiglu_lim_split(ctx, ffn_gate, ffn_up, 2.0f); // SiegeLadder G8: low enough to clamp
+             } else {
+                 out = ggml_glu_split(ctx, ffn_gate, ffn_up, glu_op);
+             }
+@@ -9703,7 +9705,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                         if (!with_gate && !with_bias) {
+                             continue;
+                         }
+-                        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
++                        for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_SWIGLU_LIM}) {
+                             if (!with_bias && glu_op == GGML_GLU_OP_SWIGLU_OAI) {
+                                 continue;
+                             }

@@ -1,0 +1,52 @@
+From 9104370e1e80b09ef3549f2d7db51d9ead441a2d Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:31:46 +0000
+Subject: [PATCH 47/91] moe-stream : the L2 tier cut to the WDDM shared budget
+ minus a margin before it is laid out (SiegeLadder M9) - pinned memory counts
+ against that budget, and the context pins more after the tier (the CUDA_Host
+ compute buffers of P1's start-up probe: 476-542 MiB at 64K / 128K; the output
+ buffer; the mailbox records); a 46 GiB tier left too little in the daytime
+ and the output head could not come back at load (SiegeLadder runs.md 4.72).
+ Default margin 640 MiB (46 GiB -> 45.67 on this box),
+ LLAMA_MOE_STREAM_L2_MARGIN=MiB, 0 - no cut. 64K at 46 GiB loads again
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 6b3435e..40c6540 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -501,7 +501,29 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+     // class the model has: every expert brings all its weights, so the pools fill at the rate of their size and
+     // their CLOCK hands go round together. Pools still cannot fragment, and each slot stays aligned for direct I/O.
+     const size_t A    = MOE_STREAM_DIRECT_ALIGN;
+-    const size_t want = l2_gib * 1024ull * 1024ull * 1024ull;
++    size_t       want = l2_gib * 1024ull * 1024ull * 1024ull;
++
++    // M9 (SiegeLadder runs.md 4.72): pinned memory counts against the shared WDDM budget, and the context pins more
++    // after the tier - the CUDA_Host compute buffers (P1's start-up probe at -ub 1536 / 1024 on 64K / 128K: 476-542 MiB),
++    // the output buffer, the mailbox records. A tier that left less than that made the head's return fail at load (64K
++    // and 128K at 46 GiB, in the daytime). So the tier is cut to the budget minus a margin before it is laid out;
++    // LLAMA_MOE_STREAM_L2_MARGIN=MiB sets the margin (default 640), 0 turns the cut off
++    if (host_buft != nullptr) {
++        size_t margin = 640ull << 20;
++        if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_MARGIN")) {
++            margin = (size_t) std::max(0LL, atoll(s)) << 20;
++        }
++        const llama_wddm_budget wb = llama_wddm_query_budget();
++        if (margin > 0 && wb.ok && wb.nonlocal_budget > wb.nonlocal_usage + margin) {
++            const size_t room = (size_t) (wb.nonlocal_budget - wb.nonlocal_usage) - margin;
++            if (want > room) {
++                LLAMA_LOG_WARN("%s: M9: the L2 tier asked %.2f GiB, the WDDM shared budget leaves %.2f GiB after %.0f MiB "
++                        "kept for later pinned buffers - cut to that (LLAMA_MOE_STREAM_L2_MARGIN=0: no cut)\n", __func__,
++                        want/1073741824.0, room/1073741824.0, margin/1048576.0);
++                want = room;
++            }
++        }
++    }
+ 
+     bool classes = true;
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_CLASSES")) {

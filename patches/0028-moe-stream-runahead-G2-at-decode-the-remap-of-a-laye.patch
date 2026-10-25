@@ -1,0 +1,642 @@
+From a497d4e53160921777408aa6623ba74437822777 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:29:59 +0000
+Subject: [PATCH 28/91] moe-stream : runahead (G2) - at decode the remap of a
+ layer is split in two, and between the halves the next layer's experts are
+ predicted from an approximate pass over the resident ones
+
+LLAMA_MOE_STREAM_RUNAHEAD=K (0 = off, the default). The first half (llama_moe_stream_remap_issue) does what the remap
+does up to its wait - count, trace, classify, reserve and queue the call's loads - and returns at once with the slots
+of the experts resident when the call came; a pair whose expert is not gets a resident slot of its token (or of the
+layer) at weight 0 (llama_moe_stream_drop_mask). Those slots are kept and fenced. On the GPU the graph then computes
+FFN L from them plus the shared expert (computed once, reused by the exact sum), carries the hyper-connection streams
+into L+1, runs L+1's attention (its cache writes are written again by the real attention before anything reads them;
+off with rollback snapshots, n_rs_seq > 0) and L+1's router. The second half (llama_moe_stream_remap_wait) stages the
+top K of that prediction into L+1 through predict_locked and the stage dispatcher, waits for L's loads and hands the
+exact expert GEMMs their slots. The exact layer is unchanged: text = trace.
+
+Two fixes on the way:
+- llama-context: resolve_fused_ops skips a fused node that is not in the graph. A dead fused node (built, consumed by
+  nothing) has no backend, counted as a device mismatch, and turned the fused DSV4 hc comb off for the whole graph;
+  the non-fused comb moved the output by KL 0.006.
+- the pass collapses FFN L+1's input with the carried mix instead of building FFN L+1's own mix, whose post and comb
+  were those dead nodes.
+- graph_max_nodes doubles while runahead is on.
+
+LLAMA_MOE_STREAM_RA_DEBUG (bits) are the measurement modes that located the dead node.
+
+SiegeLadder runs.md 4.42: main mode (46 GiB, PASSIVE), first run 13.45 tok/s against 12.34 without, text = trace;
+the prediction caught ~91% of the misses with ~0.1 false guesses per call.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    |  12 ++-
+ src/llama-graph.cpp      |  64 +++++++++++-
+ src/llama-moe-stream.cpp | 204 ++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   |  39 ++++++++
+ src/models/deepseek4.cpp | 104 ++++++++++++++++++--
+ 5 files changed, 411 insertions(+), 12 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 67fc98c..8ef7565 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -556,7 +556,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+             GGML_ASSERT(node.il >= 0);
+ 
+             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
+-            ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
++            if (backend_fused == nullptr) {
++                // built but not in the graph (nothing consumes it): it never runs, so it says nothing about support.
++                // Counting it as a mismatch turned the fused op off for the whole graph (SiegeLadder runs.md 4.42).
++                continue;
++            }
++            ggml_backend_dev_t device_fused = ggml_backend_get_device(backend_fused);
+ 
+             // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
+             // but is still wrong for cases like --no-kv-offload.
+@@ -2416,6 +2421,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+             }
+         }
+         res += 24u*wb.n_waves*n_streamed;
++        // G2 runahead: a decode graph also builds, per streamed layer, an approximate FFN and the next layer's
++        //   attention and router - at most another copy of the layer stack
++        if (mstream->runahead_k > 0) {
++            res *= 2;
++        }
+     }
+     return res;
+ }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5287fa9..62004aa 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2279,9 +2279,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // 3a: the model graph may have left a prediction of the next layer's experts for this layer's remap;
+     //   taken (and cleared) here whatever happens to it, so it cannot leak into another build
+     ggml_tensor * pred_next = nullptr;
++    std::function<ggml_tensor * (ggml_tensor *)> moe_runahead; // G2 runahead: the same, for the approximate pass
+     if (msl) {
+         pred_next = msl->graph_pred_next;
+         msl->graph_pred_next = nullptr;
++        moe_runahead.swap(msl->graph_runahead);
+     }
+     if (msl && !msl->matches(gate_exps, up_exps, down_exps, gate_up_exps)) {
+         msl = nullptr; // a different expert group of the same layer (e.g. grovemoe chexps), not streamed
+@@ -2315,9 +2317,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     ggml_tensor * ids_gemm  = selected_experts;
+     ggml_tensor * drop_mask = nullptr;
++    // G2 runahead (decode; moe_runahead set by the model graph): the first half's slots and weight multipliers
++    ggml_tensor * ra_ids    = nullptr;
++    ggml_tensor * ra_mask   = nullptr;
+     if (msl && n_stream_waves == 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+-        if (msl->mgr->drop_w > 0.0f && !weight_before_ffn) {
++        if (moe_runahead && msl->mgr->runahead_k > 0 && n_tokens == 1 && !weight_before_ffn && pred_next == nullptr &&
++                msl->mgr->drop_w <= 0.0f && n_expert_used == (int64_t) hparams.n_expert_used) {
++            // the remap in two halves: the first queues the call's loads and returns at once with the slots of its
++            // resident experts; their weight multipliers come out of a second op expanded right after it, so both
++            // stay on one host split. The approximate pass and the second half follow the expert GEMMs' definition.
++            ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, &ids_cont, 1,
++                    llama_moe_stream_remap_issue, 1, msl);
++            cb(ra_ids, "ffn_moe_topk_issue", il);
++            ggml_build_forward_expand(gf, ra_ids);
++            ra_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ids_cont->ne[0], ids_cont->ne[1], 1, &ra_ids, 1,
++                    llama_moe_stream_drop_mask, 1, msl);
++            cb(ra_mask, "ffn_moe_runahead_mask", il);
++            ggml_build_forward_expand(gf, ra_mask);
++        } else if (msl->mgr->drop_w > 0.0f && !weight_before_ffn) {
+             // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, off by default): the remap also needs this call's
+             // routing weights to tell the low-weight experts; the prediction, when there is one, rides along.
+             // Its weight multipliers come out of a second op right after it, on the same host split.
+@@ -2337,7 +2355,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         } else {
+             ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
+         }
+-        cb(ids_gemm, "ffn_moe_topk_stream", il);
++        if (ra_ids == nullptr) {
++            cb(ids_gemm, "ffn_moe_topk_stream", il); // runahead: the second half, built below, is the stream's ids
++        }
+     }
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+@@ -2553,6 +2573,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             ggml_build_forward_expand(gf, experts);
+         }
+     } else {
++        if (ra_ids != nullptr) {
++            // G2 runahead: the approximate routed output - the experts resident when the call came, the others at
++            // weight 0 - summed like the exact one below; the model graph turns it into a prediction of the next
++            // layer's experts, and the second half stages that, waits for this call's loads and gives the exact
++            // GEMMs their slots
++            ggml_tensor * pred = nullptr;
++            if (msl->mgr->ra_debug & 4) {
++                pred = ggml_cont(ctx0, selected_experts); // measurement: the split remap alone, no approximate pass
++            } else {
++                ggml_tensor * moe_a = nullptr;
++                if (msl->mgr->ra_debug & 32) {
++                    // measurement: no expert GEMMs in the approximate pass, its routed output taken as zero
++                    moe_a = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f);
++                } else {
++                    ggml_tensor * e_a = build_expert_gemms(cur, ra_ids, nullptr);
++                    e_a = ggml_mul(ctx0, e_a, ggml_mul(ctx0, weights, ra_mask));
++                    cb(e_a, "ffn_moe_weighted_approx", il);
++                    moe_a = ggml_view_2d(ctx0, e_a, n_embd, n_tokens, e_a->nb[2], 0);
++                    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
++                        moe_a = ggml_add(ctx0, moe_a, ggml_view_2d(ctx0, e_a, n_embd, n_tokens, e_a->nb[2], i*e_a->nb[1]));
++                    }
++                }
++                cb(moe_a, "ffn_moe_out_approx", il);
++                if (msl->mgr->ra_debug & 16) {
++                    // measurement: the approximate routed output is computed but nothing is built on it
++                    ggml_build_forward_expand(gf, moe_a);
++                    pred = ggml_cont(ctx0, selected_experts);
++                } else {
++                    pred = moe_runahead(moe_a);
++                    if (pred == nullptr) {
++                        pred = ggml_cont(ctx0, selected_experts); // measurement: the pass stopped early
++                    }
++                }
++            }
++            GGML_ASSERT(pred != nullptr && pred->type == GGML_TYPE_I32 && pred->ne[1] == n_tokens);
++            ggml_tensor * wargs[2] = { ra_ids, ggml_cont(ctx0, pred) };
++            ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, wargs, 2,
++                    llama_moe_stream_remap_wait, 1, msl);
++            cb(ids_gemm, "ffn_moe_topk_stream", il);
++        }
+         experts = build_expert_gemms(cur, ids_gemm, nullptr);
+     }
+ 
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 15e654e..bb179c7 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -535,6 +535,29 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ONLY_LAYER")) {
+         drop_only_layer = atoi(p);
+     }
++    // G2 runahead; see runahead_k in the header. It stages through predict_locked, so it takes pred_vram over.
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RUNAHEAD")) {
++        runahead_k = (uint32_t) std::max(0, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_DEBUG")) {
++        ra_debug = atoi(p);
++    }
++    if (runahead_k > 0 && drop_w > 0.0f) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_RUNAHEAD is ignored while the drop rule is on\n", __func__);
++        runahead_k = 0;
++    }
++    if (runahead_k > 0) {
++        if (pred_vram > 0 || pred_ram > 0 || pred_stage != 0) {
++            LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_RUNAHEAD replaces A' (PRED_VRAM / PRED_RAM / PRED_STAGE ignored)\n",
++                    __func__);
++        }
++        pred_vram  = runahead_k;
++        pred_ram   = 0;
++        pred_stage = 0;
++        LLAMA_LOG_WARN("%s: moe stream: runahead on: at decode each streamed layer's remap is split in two; between "
++                "the halves the next layer's experts are predicted from an approximate pass over the resident ones, "
++                "and its top %u staged into VRAM\n", __func__, runahead_k);
++    }
+     if (drop_w > 0.0f) {
+         LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy): an expert held in neither VRAM nor the host tier with "
+                        "less than %.3f of the routing weight is not waited for%s%s\n", __func__, drop_w,
+@@ -1946,6 +1969,13 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_pred_calls, pred_vram, pred_ram, stats.n_stage, stats.n_stage_ready,
+                 stats.n_stage_late, stats.n_stage_waste, stats.n_stage_skip, stats.n_pred_spec);
+     }
++    if (stats.n_ra_calls > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: runahead: %" PRId64 " calls split in two, the prediction above made between "
++                "the halves; the approximate pass kept %.1f%% of their pairs (%" PRId64 " calls had no resident slot); "
++                "%.3f ms between the halves on average; %" PRId64 " experts loaded again\n",
++                __func__, pfx, stats.n_ra_calls, stats.n_ra_pairs > 0 ? 100.0*stats.n_ra_kept/stats.n_ra_pairs : 0.0,
++                stats.n_ra_invalid, 1e-3*stats.t_ra_gap_us/stats.n_ra_calls, stats.n_ra_redo);
++    }
+     if (oracle_recall < 1.0f || pred_stage != 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: measurement: the oracle's staging and read-ahead keep %.2f of each call's "
+                 "experts; the prediction stages %s\n", __func__, pfx, oracle_recall,
+@@ -2266,7 +2296,7 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+ }
+ 
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+-        const ggml_tensor * wts, void * userdata);
++        const ggml_tensor * wts, void * userdata, bool issue_only = false);
+ 
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+@@ -2318,8 +2348,77 @@ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * user
+     }
+ }
+ 
++void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    moe_stream_remap_impl(dst, dst->src[0], nullptr, nullptr, userdata, /*issue_only =*/ true);
++}
++
++// G2 runahead, the end of the first half: the slots the approximate pass may read. A pair whose expert is resident
++// now - it was when the call came, or all its copies were enqueued since - reads its own slot; any other pair reads
++// a resident slot of its token, or else of the layer, at weight 0 (drop_mask, copied out by llama_moe_stream_drop_mask).
++// Those slots are kept, so no victim is taken from them before the next call of this layer, and fenced, so the pass
++// waits on the device for their copies. With no resident slot in the layer at all (cold start) the pass reads a slot
++// that may be loading: it still runs, but its prediction is not staged (ra_valid).
++static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_stream_layer & sl, const int32_t * ids,
++        int64_t n, int64_t k, int32_t * out) {
++    sl.ra_ids.assign(ids, ids + n);
++    sl.ra_pending = true;
++    sl.ra_valid   = true;
++    sl.drop_mask.assign((size_t) n, 1.0f);
++
++    int64_t n_kept = 0;
++    for (int64_t i = 0; i < n; i++) {
++        const int32_t s = sl.expert_slot.at(ids[i]);
++        if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++            out[i] = s;
++            n_kept++;
++        } else {
++            out[i] = -1;
++            sl.drop_mask[i] = 0.0f;
++        }
++    }
++    int32_t any_resident = -1;
++    for (int64_t i = 0; i < n; i++) {
++        if (out[i] >= 0) {
++            continue;
++        }
++        const int64_t t0 = (i/k)*k;
++        for (int64_t j = t0; j < t0 + k; j++) {
++            if (sl.drop_mask[j] != 0.0f) {
++                out[i] = out[j];
++                break;
++            }
++        }
++        if (out[i] < 0) {
++            for (uint32_t s = 0; any_resident < 0 && s < sl.n_slots; s++) {
++                if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                    any_resident = (int32_t) s;
++                }
++            }
++            if (any_resident >= 0) {
++                out[i] = any_resident;
++                sl.keep[any_resident] = 1;
++            } else {
++                out[i] = 0;
++                sl.ra_valid = false;
++            }
++        }
++    }
++    mgr.stats.n_ra_calls++;
++    mgr.stats.n_ra_pairs += n;
++    mgr.stats.n_ra_kept  += n_kept;
++    if (!sl.ra_valid) {
++        mgr.stats.n_ra_invalid++;
++    }
++    mgr.fence_slots_locked(sl, out, (size_t) n);
++    sl.ra_t_issue = ggml_time_us();
++}
++
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+-        const ggml_tensor * wts, void * userdata) {
++        const ggml_tensor * wts, void * userdata, bool issue_only) {
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
+@@ -2638,6 +2737,14 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         mgr->predict_locked(*sl, (const int32_t *) pred->data, pred->ne[0], pred->ne[1]);
+     }
+ 
++    if (issue_only) {
++        // G2 runahead: counted, classified, its loads queued; llama_moe_stream_remap_wait waits for them once the
++        // graph has computed the approximate pass on what is resident
++        GGML_ASSERT(sl->dropped.empty());
++        moe_stream_runahead_issue_locked(*mgr, *sl, ids, n, a->ne[0], out);
++        return;
++    }
++
+     if (waited) {
+         moe_nvtx_range r_stall("stall", sl->il);
+         const int64_t t0 = ggml_time_us();
+@@ -2703,6 +2810,99 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     mgr->fence_slots_locked(*sl, out, (size_t) n);
+ }
+ 
++// G2 runahead, second half: the prediction of the next layer is staged as A' stages its own (predict_locked) - after
++// this call's loads, which the first half queued, so they stay first in line - then the call waits for its loads and
++// hands its slots to the exact expert GEMMs, as the remap does. Its experts were kept since the first half and
++// nothing stages into this layer in between, so each still holds the slot it was given; one that does not is
++// loaded again (counted in n_ra_redo).
++void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * sl  = (llama_moe_stream_layer *) userdata;
++    auto * mgr = sl->mgr;
++    const ggml_tensor * pred = dst->src[1];
++
++    moe_nvtx_range r_wait("remap_wait", sl->il);
++
++    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
++    GGML_ASSERT(pred != nullptr && pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred) && pred->ne[1] == dst->ne[1]);
++
++    const int64_t n   = ggml_nelements(dst);
++    int32_t     * out = (int32_t *) dst->data;
++
++    std::unique_lock<std::mutex> lk(mgr->mtx);
++
++    if (mgr->load_failed) {
++        GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++    }
++    GGML_ASSERT(sl->ra_pending && (int64_t) sl->ra_ids.size() == n && "runahead: the second half of a remap without its first");
++    sl->ra_pending = false;
++    mgr->stats.t_ra_gap_us += ggml_time_us() - sl->ra_t_issue;
++
++    if (sl->ra_valid && (mgr->ra_debug & 1) == 0) {
++        moe_nvtx_range r_pred("predict", sl->il);
++        mgr->predict_locked(*sl, (const int32_t *) pred->data, pred->ne[0], pred->ne[1]);
++    }
++
++    sl->demand_slots.clear();
++    bool waited = false;
++    for (const int32_t e : sl->uniq) {
++        const auto it = sl->expert_slot.find(e);
++        int32_t s = -1;
++        if (it != sl->expert_slot.end()) {
++            s = it->second;
++        } else {
++            int32_t v = mgr->pick_victim_locked(*sl, sl->keep.data());
++            while (v < 0) {
++                mgr->cv_done.wait(lk);
++                if (mgr->load_failed) {
++                    GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++                }
++                v = mgr->pick_victim_locked(*sl, sl->keep.data());
++            }
++            mgr->reserve_slot_locked(*sl, e, v);
++            mgr->enqueue_slot_locked(*sl, e, v);
++            sl->keep[v] = 1;
++            mgr->stats.n_ra_redo++;
++            s = v;
++        }
++        if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++            waited = true;
++        }
++        sl->demand_slots.push_back(s);
++    }
++
++    if (waited) {
++        moe_nvtx_range r_stall("stall", sl->il);
++        const int64_t t0 = ggml_time_us();
++        mgr->cv_done.wait(lk, [&]{
++            if (mgr->load_failed) {
++                return true;
++            }
++            for (const int32_t s : sl->demand_slots) {
++                if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                    return false;
++                }
++            }
++            return true;
++        });
++        if (mgr->load_failed) {
++            GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++        }
++        mgr->stats.t_stall_us += ggml_time_us() - t0;
++    }
++
++    const int32_t * ids = sl->ra_ids.data();
++    for (int64_t i = 0; i < n; i++) {
++        const int32_t s = sl->expert_slot.at(ids[i]);
++        sl->slot_last_use[s] = ++sl->use_counter;
++        out[i] = s;
++    }
++    mgr->fence_slots_locked(*sl, out, (size_t) n);
++}
++
+ // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
+ llama_moe_stream_wave * llama_moe_stream_layer::wave_userdata(int32_t wave, uint32_t capacity) {
+     GGML_ASSERT(capacity >= 1 && capacity <= n_slots);
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 887ba9b..8ae5f91 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -9,6 +9,7 @@
+ #include <condition_variable>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <string>
+@@ -72,6 +73,10 @@ struct llama_moe_stream_layer {
+     // model graph right before build_moe_ffn of this layer and consumed (reset) there - see 3a in
+     // llama_moe_stream_remap_pred. Not runtime state; no lock.
+     ggml_tensor * graph_pred_next = nullptr;
++    // graph build only, the same way: G2 runahead (LLAMA_MOE_STREAM_RUNAHEAD). build_moe_ffn of this layer calls it
++    // between the two halves of the remap with the layer's approximate routed output (the experts resident when the
++    // call came, the others at weight 0) and gets the predicted experts of the next layer, [k, n_tokens] I32.
++    std::function<ggml_tensor * (ggml_tensor * moe_approx)> graph_runahead;
+ 
+     // residency state, guarded by mgr->mtx
+     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
+@@ -128,6 +133,13 @@ struct llama_moe_stream_layer {
+     // the current call - 0 for a dropped pair, 1 (or the renormalising factor) for the rest - written by
+     // the remap and copied out by llama_moe_stream_drop_mask; the experts dropped; per-expert scratch
+     std::vector<float>   drop_mask;
++    // G2 runahead (guarded by mgr->mtx): the routed ids of the call between the two halves of its remap, whether
++    // the first half ran, and whether the approximate pass had a resident slot to read (if not, nothing is staged).
++    // The approximate pass takes its weight multipliers from drop_mask above.
++    std::vector<int32_t> ra_ids;
++    bool                 ra_pending = false;
++    bool                 ra_valid   = false;
++    int64_t              ra_t_issue = 0; // ggml_time_us() at the end of the first half
+     std::vector<int32_t> dropped;
+     std::vector<float>   drop_share; // [n_expert] the largest share of a token's routing weight it has
+     // with a trace on: where each routed expert of the current call was when the call came, before it
+@@ -487,6 +499,20 @@ struct llama_moe_stream {
+     // says the next call will NOT use - its false positives, on top of the oracle's own staging; 2 nothing,
+     // the graph still computes it. 1 and 2 are measurement apparatus, like oracle_recall below.
+     int32_t pred_stage = 0;
++    // G2 runahead (SiegeLadder theory G2, runs.md 4.30 and 4.42; LLAMA_MOE_STREAM_RUNAHEAD=K, 0 = off, the default).
++    // At decode the remap of a layer is split in two (llama_moe_stream_remap_issue / _wait). Between them the graph
++    // computes an approximate FFN of the layer from the experts resident when the call came (the others at weight
++    // 0), then the next layer's attention and router on it; the second half stages the top K of that prediction
++    // into the next layer as A' does (predict_locked: runahead drives it through pred_vram, so the two exclude each
++    // other), then waits for this layer's loads. The exact layer runs after it unchanged: the output is the same.
++    uint32_t runahead_k = 0;
++    // measurement (LLAMA_MOE_STREAM_RA_DEBUG, bits; how runs.md 4.42 found the dead fused node): 1 - the second half
++    // stages nothing; 2 - the approximate pass skips the next layer's attention (its output taken as zero, as A'
++    // does); 4 - the split remap alone, no approximate pass; 8 - the exact sum gets its own shared expert, in the
++    // usual place; 16 - the approximate routed output is computed and nothing is built on it; 32 - no expert GEMMs
++    // in the pass (routed output zero); 64 / 128 / 192 - stop the pass after l_last / after the attention input of
++    // the next layer / after its FFN input (nothing staged then)
++    int32_t  ra_debug   = 0;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+     // probability, by a deterministic hash of the call and the expert (LLAMA_MOE_STREAM_ORACLE_RECALL, 1 = all).
+     // Since 17.10 the oracle's read-ahead into L2 (LLAMA_MOE_STREAM_AHEAD) drops the same experts: a predictor
+@@ -689,6 +715,12 @@ struct llama_moe_stream {
+         int64_t n_stage_waste = 0; // staged for a call that did not ask for the expert after all
+         int64_t n_pred_calls  = 0; // remap calls that acted on a prediction of the next layer (3a)
+         int64_t n_pred_spec   = 0; // predicted experts queued to read ahead into the host tier
++        int64_t n_ra_calls    = 0; // G2 runahead: remap calls split in two
++        int64_t n_ra_pairs    = 0; // their routed pairs
++        int64_t n_ra_kept     = 0; // of those, resident when the first half ended (weight kept in the approximate pass)
++        int64_t n_ra_invalid  = 0; // calls with no resident slot in the layer: approximate pass not trusted, nothing staged
++        int64_t n_ra_redo     = 0; // experts the second half found evicted and loaded again (expected 0)
++        int64_t t_ra_gap_us   = 0; // time from the end of the first half to the start of the second (the approximate pass)
+         int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
+         int64_t n_drop_exp    = 0; // experts not loaded for their call because of it
+         int64_t n_drop_calls  = 0; // remap calls that dropped at least one expert
+@@ -777,6 +809,13 @@ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userda
+ // the drop rule's weight multipliers for the call its src[0] (the remap's output) has just handled,
+ // F32 [1, k, n_tokens]
+ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
++// G2 runahead (decode; see runahead_k): the remap in two halves, both ggml_custom_4d ops. _issue: src[0] = the ids
++// [k, n_tokens]; it does everything the remap does up to its wait and returns the slots the approximate pass may
++// read (a pair whose expert is not resident gets a resident slot, and weight 0 from llama_moe_stream_drop_mask on
++// its output). _wait: src[0] = the issue's output (it orders the two), src[1] = the predicted experts of the next
++// layer [k', n_tokens]; it stages those, waits for the call's loads and returns its slots, as the remap does.
++void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * userdata);
+ 
+ // Adds mgr->route_bias to the selection logits of every expert this layer currently holds
+ // (resident or loading), leaving masked-out entries at -inf untouched. Runs before top-k, so it
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 6542e7e..de48975 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1788,7 +1788,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     //   attention L carried past FFN L and attention L+1 as if both returned zero, collapsed with the mix
+     //   attention L+1 computes from them, then the router of L+1. Hash-routed layers route by token: exact.
+     //   Only the remap reads it, so a graph whose remap does not (prefill waves) never computes it.
+-    const uint32_t pred_k = (mstream != nullptr && hparams.dsv4_v41) ? mstream->pred_k() : 0;
++    //   Runahead (below) stages through the same path and owns pred_vram while on, so A' is not built then.
++    const uint32_t pred_k = (mstream != nullptr && hparams.dsv4_v41 && mstream->runahead_k == 0) ? mstream->pred_k() : 0;
+     auto build_pred_next = [&](ggml_tensor * residual, ggml_tensor * post, ggml_tensor * comb, int il) -> ggml_tensor * {
+         const int    iln = il + 1;
+         const auto & ln  = model.layers[iln];
+@@ -1821,6 +1822,76 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     // the block mask the candidate source published, applied by every layer after it
+     ggml_tensor * cand_carry_v = nullptr;
+ 
++    // G2 runahead (SiegeLadder theory G2; LLAMA_MOE_STREAM_RUNAHEAD): at decode, between the two halves of layer L's
++    //   remap (llama_moe_stream_remap_issue / _wait), FFN L is computed from the experts resident when the call came
++    //   (the others at weight 0), then attention and router of L+1 on that, and the second half stages the predicted
++    //   experts of L+1 while L still waits for its own. Exact layer L and the real L+1 follow unchanged. The pass
++    //   copies the carries, and every cache row its attention writes (position t of L+1's caches, a ring row, at a
++    //   block boundary a compressed row) the real attention writes again before anything reads it; with rollback
++    //   snapshots (n_rs_seq > 0) a second build would shift them twice, so runahead stays off there. V4.1 only.
++    const bool runahead = mstream != nullptr && hparams.dsv4_v41 && mstream->runahead_k > 0 && n_tokens == 1 &&
++                          cparams.n_rs_seq == 0;
++    auto build_runahead_next = [&](ggml_tensor * moe_approx, ggml_tensor * shexp, ggml_tensor * residual,
++            ggml_tensor * post, ggml_tensor * comb, int il) -> ggml_tensor * {
++        const int    iln = il + 1;
++        const auto & ln  = model.layers[iln];
++        if ((uint32_t) iln < hparams.dsv4_hash_layer_count) {
++            return ggml_get_rows(ctx0, ln.ffn_gate_tid2eid, res->t_inp_tokens);
++        }
++        ggml_tensor * x = ggml_add(ctx0, moe_approx, shexp);
++        x = build_hc_post(x, residual, post, comb, il);
++        x = build_cvec(x, il);
++        cb(x, "l_last_approx", il);
++        if (inp_engram) {
++            for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++                if ((int) hparams.engram_layer_ids[e] == iln) {
++                    x = dsv4_engram(ctx0, hparams.f_norm_rms_eps, ln, inp_engram->kv[e], x);
++                }
++            }
++        }
++        const int ra_stop = mstream->ra_debug & 192; // measurement: stop the pass early, no prediction
++        if (ra_stop == 64) {
++            ggml_build_forward_expand(gf, x);
++            return (ggml_tensor *) nullptr;
++        }
++        ggml_tensor * carry  = hc_carry_v;   // the mix FFN L computed: L+1's attention input collapses with it
++        ggml_tensor * topk_c = topk_carry_v;
++        ggml_tensor * cand_c = cand_carry_v;
++        ggml_tensor * res_a  = x;
++        ggml_tensor * post_a = nullptr;
++        ggml_tensor * comb_a = nullptr;
++        ggml_tensor * cur_a  = build_hc_pre(x, ln.hc_attn_fn, ln.hc_attn_scale, ln.hc_attn_base, &post_a, &comb_a, iln, &carry);
++        cur_a = build_norm(cur_a, ln.attn_norm, nullptr, LLM_NORM_RMS, iln);
++        if (ra_stop == 128) {
++            ggml_build_forward_expand(gf, cur_a);
++            return (ggml_tensor *) nullptr;
++        }
++        if (mstream->ra_debug & 2) {
++            cur_a = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f); // measurement
++        } else {
++            cur_a = build_attention(model, inp_dsv4, cur_a, inp_pos, iln, &topk_c, &cand_c);
++        }
++        x = build_hc_post(cur_a, res_a, post_a, comb_a, iln);
++        // FFN L+1's input collapses with the mix attention L+1 computed (the carry), as A' does. FFN L+1's own mix
++        // only feeds what comes after it, so it is not built: its post and comb would be dead fused nodes, and one
++        // dead fused node made resolve_fused_ops turn the fused hc comb off for the whole graph (runs.md 4.42)
++        ggml_tensor * u = build_hc_pre(x, carry, iln);
++        u = build_norm(u, ln.ffn_norm, nullptr, LLM_NORM_RMS, iln);
++        if (ra_stop == 192) {
++            ggml_build_forward_expand(gf, u);
++            return (ggml_tensor *) nullptr;
++        }
++        ggml_tensor * logits = ggml_mul_mat(ctx0, ln.ffn_gate_inp, u);
++        ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
++        ggml_tensor * probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits));
++        if (ln.ffn_exp_probs_b) {
++            probs = ggml_add(ctx0, probs, ln.ffn_exp_probs_b);
++        }
++        ggml_tensor * pred = ggml_argsort_top_k(ctx0, probs, (int) hparams.n_expert_used);
++        cb(pred, "moe_pred_runahead", il);
++        return pred;
++    };
++
+     const int64_t hc = hparams.dsv4_hc_mult;
+     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+@@ -1894,6 +1965,23 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             exp_probs_b = nullptr;
+         }
+ 
++        // G2 runahead: the shared expert first, so the approximate pass can add it; the exact sum below reuses it
++        ggml_tensor * ffn_shexp = nullptr;
++        if (runahead && il + 1 < n_layer && mstream->layer(il) != nullptr && mstream->layer(il + 1) != nullptr) {
++            ggml_tensor * shexp_a = build_ffn(cur,
++                    layer.ffn_up_shexp, nullptr, nullptr,
++                    layer.ffn_gate_shexp, nullptr, nullptr,
++                    layer.ffn_down_shexp, nullptr, nullptr,
++                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(shexp_a, "ffn_shexp", il);
++            if ((mstream->ra_debug & 8) == 0) {
++                ffn_shexp = shexp_a; // measurement 8: the exact sum gets its own shared expert, in the usual place
++            }
++            mstream->layer(il)->graph_runahead = [&build_runahead_next, shexp_a, residual, post, comb, il](ggml_tensor * moe_approx) {
++                return build_runahead_next(moe_approx, shexp_a, residual, post, comb, il);
++            };
++        }
++
+         ggml_tensor * moe_out = build_moe_ffn(cur,
+                 layer.ffn_gate_inp,
+                 layer.ffn_up_exps,
+@@ -1913,12 +2001,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                 selected_experts);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+-        ggml_tensor * ffn_shexp = build_ffn(cur,
+-                layer.ffn_up_shexp, nullptr, nullptr,
+-                layer.ffn_gate_shexp, nullptr, nullptr,
+-                layer.ffn_down_shexp, nullptr, nullptr,
+-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+-        cb(ffn_shexp, "ffn_shexp", il);
++        if (ffn_shexp == nullptr) {
++            ffn_shexp = build_ffn(cur,
++                    layer.ffn_up_shexp, nullptr, nullptr,
++                    layer.ffn_gate_shexp, nullptr, nullptr,
++                    layer.ffn_down_shexp, nullptr, nullptr,
++                    nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++            cb(ffn_shexp, "ffn_shexp", il);
++        }
+ 
+         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+         cb(cur, "ffn_out", il);

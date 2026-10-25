@@ -1,0 +1,132 @@
+From 84fa981271d3139e62e455f4332ea026edbd5333 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 09:07:30 +0000
+Subject: [PATCH 82/91] moe-stream : G35 v4 - LLAMA_MOE_STREAM_G35_LAZY=2: a
+ layer's first half takes its own lens if the post is in already, else the
+ next layer's first half does (never a wait; v3 =1 always the next layer).
+ Server check of v2 / v3 (SiegeLadder twentieth session): answers +3.7% (v2),
+ after a 30K document +21% (v3)
+
+---
+ src/llama-moe-stream.cpp | 54 +++++++++++++++++++++++++++++-----------
+ src/llama-moe-stream.h   |  8 ++++--
+ 2 files changed, 46 insertions(+), 16 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 91c3b0d..91aeb77 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1045,12 +1045,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         g35_h = std::max(0.0f, (float) std::strtod(p, nullptr));
+     }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
+-        g35_lazy = atoi(p) != 0;
++        g35_lazy = std::max(0, std::min(2, atoi(p)));
+     }
+     if (g35_depth > 0) {
+         LLAMA_LOG_WARN("%s: moe stream: G35 (heavy-ahead, a measurement): the router lens %d calls ahead, its %d best, "
+                 "read ahead into the host tier from a share of %.3f (on G31's split at decode)%s\n", __func__, g35_depth,
+-                g35_m, g35_h, g35_lazy ? "; lazy: each lens read by the next layer" : "");
++                g35_m, g35_h, g35_lazy == 1 ? "; lazy: each lens read by the next layer" :
++                g35_lazy == 2 ? "; lazy 2: by its own layer if in, else by the next" : "");
+     }
+     // SiegeLadder C14, probe E1; see c14_q in the header. C14 proper (c14_real) takes the same keys but C14 for C14_Q
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_Q")) {
+@@ -3515,9 +3516,10 @@ void llama_moe_stream::print_stats(const char * role) const {
+     }
+     if (stats.n_g35_posts > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: G35: %" PRId64 " lenses read, %" PRId64 " experts heavy by the lens (%.2f a lens), "
+-                "%" PRId64 " of them queued for the host tier (%.2f a lens)\n", __func__, pfx, stats.n_g35_posts,
++                "%" PRId64 " of them queued for the host tier (%.2f a lens); %" PRId64 " lenses taken by their own layer "
++                "without a wait (lazy 2)\n", __func__, pfx, stats.n_g35_posts,
+                 stats.n_g35_cand, (double) stats.n_g35_cand/stats.n_g35_posts, stats.n_g35_spec,
+-                (double) stats.n_g35_spec/stats.n_g35_posts);
++                (double) stats.n_g35_spec/stats.n_g35_posts, stats.n_g35_now);
+     }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+@@ -5985,17 +5987,41 @@ void llama_moe_stream_remap_issue_g31_mb(ggml_tensor * dst, int ith, int nth, vo
+     moe_stream_remap_issue_half(&d2, userdata, /*half =*/ 2);
+     // SiegeLadder G35: the lens of layer g35_target rides in record [1], posted after record [0] and the shared expert (the
+     // card computed it while this half ran) - after this call's own loads are queued, its heavy experts are read ahead.
+-    // G35_LAZY (v3): the lens of the layer before is read here instead - posted a whole layer ago, so nobody waits for
+-    // it (one layer of lead is lost: G35=3 then reads ahead as early as G35=2 does without it)
++    // G35_LAZY=1 (v3): the lens of the layer before is read here instead - posted a whole layer ago, so nobody waits for
++    // it (one layer of lead is lost: G35=3 then reads ahead as early as G35=2 does without it). G35_LAZY=2 (v4): this
++    // layer's own lens if its post is in already, else the next layer takes it (never a wait, the lead of v2 when the
++    // card was quick enough)
+     llama_moe_stream & mgr = *sl->mgr;
+-    llama_moe_stream_layer * owner = sl;
+-    if (mgr.g35_lazy) {
+-        owner = sl->il > 0 && (size_t) sl->il <= mgr.layers.size() ? mgr.layers[(size_t) sl->il - 1].get() : nullptr;
+-    }
+-    if (owner != nullptr && owner->g35_on && owner->mb_ne[1][0] > 0) {
+-        moe_mb_wait(mgr, *owner, 1);
+-        const ggml_tensor lens = moe_mb_tensor(*owner, 1);
+-        mgr.g35_speculate(*owner, lens);
++    llama_moe_stream_layer * prev = sl->il > 0 && (size_t) sl->il <= mgr.layers.size() ?
++            mgr.layers[(size_t) sl->il - 1].get() : nullptr;
++    auto take = [&](llama_moe_stream_layer & owner) {
++        moe_mb_wait(mgr, owner, 1);
++        const ggml_tensor lens = moe_mb_tensor(owner, 1);
++        mgr.g35_speculate(owner, lens);
++        owner.g35_pending = false;
++    };
++    const bool own = sl->g35_on && sl->mb_ne[1][0] > 0;
++    if (mgr.g35_lazy == 0) {
++        if (own) {
++            take(*sl);
++        }
++    } else if (mgr.g35_lazy == 1) {
++        if (prev != nullptr && prev->g35_on && prev->mb_ne[1][0] > 0) {
++            take(*prev);
++        }
++    } else {
++        if (prev != nullptr && prev->g35_pending) {
++            take(*prev);
++        }
++        if (own) {
++            volatile uint32_t * seq = (volatile uint32_t *) sl->mb_rec[1];
++            if ((int32_t) (*seq - (sl->mb_seen[1] + 1u)) >= 0) {
++                take(*sl);
++                mgr.stats.n_g35_now++;
++            } else {
++                sl->g35_pending = true;
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index e1c9223..afe2dd5 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -95,6 +95,8 @@ struct llama_moe_stream_layer {
+     ggml_tensor * graph_g35  = nullptr;
+     bool          g35_on     = false;
+     int32_t       g35_target = -1;
++    // G35_LAZY=2: this layer's lens was not in yet when its first half ended - the next layer's first half takes it
++    bool          g35_pending = false;
+     // graph build only, the same way (SiegeLadder C14, probe E1; c14_q in llama_moe_stream): the routed sum of the pairs
+     // this layer's remap deferred ([n_embd, n_tokens]), left out of build_moe_ffn's output; the model graph adds
+     // post_F (x) it to the residual of the next layer's attention and resets it. c14_ok: set by the model graph at build
+@@ -837,8 +839,9 @@ struct llama_moe_stream {
+     float    g35_h           = 0.14f;
+     // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer
+     // before, it never makes the host wait (a lens exists only for L + d < the last layer + 1, so L + 1 always exists);
+-    // the read-ahead starts a layer later, so G35=3 with it leads as G35=2 without it
+-    bool     g35_lazy        = false;
++    // the read-ahead starts a layer later, so G35=3 with it leads as G35=2 without it. =2 (v4): layer L's own first half
++    // takes its lens if the post is in already, else layer L + 1's does - never a wait, v2's lead whenever it can
++    int32_t  g35_lazy        = 0;
+     // the first half of G31 with a lens in record [1]: the shares and the read-ahead (takes mtx)
+     void g35_speculate(llama_moe_stream_layer & sl, const ggml_tensor & lens);
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
+@@ -1192,6 +1195,7 @@ struct llama_moe_stream {
+         int64_t n_g35_posts   = 0; // SiegeLadder G35: lenses read by G31's first half
+         int64_t n_g35_cand    = 0; // their experts with a share >= G35_H (heavy by the lens)
+         int64_t n_g35_spec    = 0; // of those, queued for the host tier (not in a VRAM slot, the queue not full)
++        int64_t n_g35_now     = 0; // G35_LAZY=2: lenses taken by their own layer (the others by the next one)
+         int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)
+         int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
+         int64_t n_drop_exp    = 0; // experts not loaded for their call because of it

@@ -1,0 +1,64 @@
+From 7e4067ea6853bdf0df4f689f851361ffd5573303 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:32:48 +0000
+Subject: [PATCH 63/91] deepseek4 : D11's sparse decode views the CSA / HCA
+ mask input once per graph and group (SiegeLadder G29, on by default;
+ LLAMA_DSV4_SPARSE_MASK_VIEW=0 - a view per layer as before)
+
+build_csa_lid_attention took ggml_view_2d(inp_csa.kq_mask, 1, n_csa) on every compressed layer of a long-context decode
+graph. A view of an input carries no input flag, and with one copy per graph (n_copies == 1, no events) the scheduler
+copied each distinct view in its own split after ggml_backend_synchronize of the card, by a synchronous
+ggml_backend_tensor_copy (ggml-backend.cpp, the non-input branch of the split inputs). One view per graph and group
+(llm_graph_input_dsv4::sparse_mask_col, made by the first layer that needs it) is copied once. The sparse path runs at
+n_csa > 512 (positions past ~2K). SiegeLadder runs.md 4.110: kl_run at 4096 context, KV q8_0, against the same build
+with LLAMA_DSV4_SPARSE_MASK_VIEW=0 - PPL x1.0000, KLD 0, same top-1 100% (a pass 324.5 -> 307.5 s, single runs); the
+30K consultant (exact runahead), ABBA: answers 12.86 / 13.75 / 14.78 -> 13.49 / 14.28 / 15.05 tok/s (+3.5% on average),
+the document's prefill unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.h        |  5 +++++
+ src/models/deepseek4.cpp | 14 +++++++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 12fd2eb..80c2a62 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -652,6 +652,11 @@ public:
+     std::vector<ggml_tensor *> p13_hca_c;  // [w_hca, n_c]: the chunk's block of inp_hca.kq_mask (V4's HCA flavour)
+     std::vector<ggml_tensor *> p13_pos_c;  // [n_c]: the chunk's positions, views of inp_pos (made by the model graph)
+ 
++    // SiegeLadder G29: D11's sparse decode reads the compressed mask input as a column view - one view per graph and
++    // group (0 csa, 1 hca), made by the first layer that needs it, so the scheduler copies it once per token, not once
++    // per compressed layer (a view of an input is not an input: each distinct one got its own synchronous copy)
++    ggml_tensor * sparse_mask_col[2] = { nullptr, nullptr };
++
+     const llama_cparams cparams;
+ 
+     const llama_kv_cache_dsv4_context * mctx;
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 2a00cbe..2a2a572 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1252,7 +1252,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         ggml_tensor * k_sp = ggml_concat(ctx0, raw_k, k_sel, 2);
+         cb(k_sp, "csa_k_sparse", il);
+ 
+-        ggml_tensor * m_rows = ggml_view_2d(ctx0, inp_csa.kq_mask, 1, n_csa, ggml_element_size(inp_csa.kq_mask), 0);
++        // SiegeLadder G29: one view of the mask input per graph and group, shared by every layer (see sparse_mask_col);
++        // LLAMA_DSV4_SPARSE_MASK_VIEW=0 - a view per layer as before
++        static const bool shared_view = [] {
++            const char * s = std::getenv("LLAMA_DSV4_SPARSE_MASK_VIEW");
++            return s == nullptr || atoi(s) != 0;
++        }();
++        ggml_tensor *& m_cached = inp_dsv4->sparse_mask_col[use_hca ? 1 : 0];
++        ggml_tensor * m_rows = shared_view && m_cached != nullptr && m_cached->view_src == inp_csa.kq_mask &&
++                m_cached->ne[1] == n_csa ? m_cached :
++                ggml_view_2d(ctx0, inp_csa.kq_mask, 1, n_csa, ggml_element_size(inp_csa.kq_mask), 0);
++        if (shared_view) {
++            m_cached = m_rows;
++        }
+         ggml_tensor * m_sel  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, m_rows, idx), n_sel, 1);
+         if (n_pad > 0) {
+             ggml_tensor * m_tail = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pad, 1), -INFINITY);

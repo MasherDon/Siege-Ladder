@@ -1,0 +1,34 @@
+From 26c4289a0505a3734013e44c5258635244abe850 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:45:03 +0000
+Subject: [PATCH 52/91] ggml-cuda : the VMM pool's destructor skips the unmap
+ of a trimmed pool - P1's p1_leave trims the pool (ggml_backend_cuda_trim
+ unmaps it and leaves the address range reserved with pool_size = 0), and the
+ destructor then called cuMemUnmap(pool_addr, 0): an invalid argument, so a
+ llama-completion run with a long prompt (head yield on) died at exit, after
+ its timings and before the model was freed - LLAMA_MOE_STREAM_TRACE, written
+ in the manager's destructor, was lost (SiegeLadder runs.md 4.83, the 30K
+ trace for P2). Exact: only the teardown changes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1e0bf5b..baa6690 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -574,7 +574,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
+                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+             }
+ #else
+-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
++            // trim() (SiegeLadder P1) unmaps the whole pool and leaves the address range reserved with pool_size = 0;
++            // cuMemUnmap of 0 bytes is an invalid argument, and the process died at exit after a long prompt
++            if (pool_size > 0) {
++                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
++            }
+ #endif
+             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
+         }

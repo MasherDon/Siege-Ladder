@@ -1,0 +1,506 @@
+From a5fc255e223b01c8ce7ab5dae3ea9db80bad049f Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:01:05 +0000
+Subject: [PATCH 39/91] moe-stream : the host tier holds what a running prompt
+ touched (SiegeLadder P9), on by default - a long prompt's ubatches walk
+ layers 0..39 again and again and each touches about twice what the tier
+ holds, so CLOCK, an LRU on a loop, evicted exactly what the next ubatch
+ needed (a 23 454-token prompt at -ub 1536: 3.42% hits, every slot refilled
+ ~29 times, 1.47 TB read from the drive in 164 s). While a prompt runs, a slab
+ it fills or hits is held - never evicted for another - up to an even share of
+ each pool per layer of that pool (so the decode after the prompt finds some
+ of every layer), and what is past the share streams through a ring at the end
+ of each pool (1/32 of it, FIFO, never held). The holding follows whole decode
+ calls (llama_moe_stream::batch_begin from llama_context::decode): a call of
+ at least LLAMA_MOE_STREAM_L2_SCAN_MIN tokens (64) begins it, anew from
+ position 0, and more than two shorter calls in a row end it, so a lone short
+ chunk inside a prompt does not and decode with several sequences does.
+ SiegeLadder runs.md 4.62: the same prompt 159.0 / 159.9 -> 126.6 / 127.7 s
+ (+25.5%), drive reads 1 473 -> 745 GB, tier hits 3.4 -> 51.2%, the 64 answer
+ positions' logprobs identical to the bit in every pair; test4 prefill at -ub
+ 2048 2.2K +15.6%, 8.9K +20.3% (162-164 -> 195-196 tok/s), the decode right
+ after +10%, answers identical. LLAMA_MOE_STREAM_L2_SCAN=0 = CLOCK throughout,
+ as before. A review agent found no output, counter, lock or hand-arithmetic
+ defect; its two speed findings (holding not ended by multi-token decode
+ calls; the quota divided by every layer instead of the layers using the pool)
+ are fixed here
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    |  11 ++
+ src/llama-moe-stream.cpp | 233 +++++++++++++++++++++++++++++++++------
+ src/llama-moe-stream.h   |  52 ++++++++-
+ 3 files changed, 258 insertions(+), 38 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7aa5e71..b2ea4df 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2050,6 +2050,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+     const uint32_t n_outputs_all = balloc->get_n_outputs();
+ 
++    // SiegeLadder P9: the expert stream's host tier holds what a prompt touches while it runs; a long call begins the
++    // holding (anew from position 0), a few short calls in a row end it - llama_moe_stream::batch_begin
++    if (auto * ms = model.moe_stream()) {
++        const llama_batch & b = balloc->get_batch();
++        bool from_start = false;
++        for (int32_t i = 0; i < b.n_tokens && !from_start; ++i) {
++            from_start = b.pos[i] == 0;
++        }
++        ms->batch_begin(n_tokens_all, from_start);
++    }
++
+     if (output_all) {
+         // require that all tokens are output
+         if (n_outputs_all != n_tokens_all) {
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 9283961..63a469c 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -210,7 +210,60 @@ llama_moe_stream_l2::~llama_moe_stream_l2() {
+     }
+ }
+ 
+-const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
++// P9: hold / unhold a slot for the running prompt (see scan in the header); under the tier's lock
++void llama_moe_stream_l2::hold_locked(size_t s, int32_t il) {
++    entry & e = entries[s];
++    if (!scan || e.gen == scan_gen || il < 0 || (uint32_t) il >= scan_layers) {
++        return;
++    }
++    pool & p = pool_of(s);
++    if (s >= p.ring_first || p.held_by_layer[il] >= p.quota) {
++        return; // the ring is never held, and a layer holds its share at most
++    }
++    e.gen = scan_gen;
++    e.il  = (int16_t) il;
++    p.held_by_layer[il]++;
++    p.n_held++;
++    size_t held = 0;
++    for (const pool & q : pools) {
++        held += q.n_held;
++    }
++    n_scan_held_max = std::max(n_scan_held_max, held);
++}
++
++void llama_moe_stream_l2::unhold_locked(size_t s) {
++    entry & e = entries[s];
++    if (scan && e.gen == scan_gen && e.il >= 0) {
++        pool & p = pool_of(s);
++        p.held_by_layer[e.il]--;
++        p.n_held--;
++    }
++    e.gen = 0;
++    e.il  = -1;
++}
++
++void llama_moe_stream_l2::begin_scan() {
++    L2_LOCK(*this);
++    if (!scan_on || scan || scan_layers == 0) {
++        return;
++    }
++    scan = true;
++    if (++scan_gen == 0) {
++        scan_gen = 1; // 0 means held by none
++    }
++    for (pool & p : pools) {
++        p.n_held = 0;
++        std::fill(p.held_by_layer.begin(), p.held_by_layer.end(), 0u);
++    }
++    n_scan_prompts++;
++}
++
++void llama_moe_stream_l2::end_scan() {
++    L2_LOCK(*this);
++    scan = false;
++}
++
++const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, int32_t il) {
+     if (base == nullptr) {
+         return nullptr;
+     }
+@@ -232,11 +285,15 @@ const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t
+     e.pins++;
+     e.ref = 1;
+     n_hit++;
++    if (scan) {
++        n_scan_held_hits += e.gen == scan_gen;
++        hold_locked(it->second, il);
++    }
+     *out_slot = it->second;
+     return slot_ptr(it->second) + e.head;
+ }
+ 
+-const uint8_t * llama_moe_stream_l2::find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
++const uint8_t * llama_moe_stream_l2::find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, int32_t il) {
+     if (base == nullptr) {
+         return nullptr;
+     }
+@@ -259,6 +316,10 @@ const uint8_t * llama_moe_stream_l2::find_wait(uint16_t file_idx, size_t offs, s
+             e.pins++;
+             e.ref = 1;
+             n_hit++;
++            if (scan) {
++                n_scan_held_hits += e.gen == scan_gen;
++                hold_locked(it->second, il);
++            }
+             if (t_wait0 >= 0) {
+                 n_wait_hit++;
+                 t_wait_us += ggml_time_us() - t_wait0;
+@@ -292,7 +353,7 @@ void llama_moe_stream_l2::release(size_t slot) {
+     }
+ }
+ 
+-uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
++uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, int32_t il) {
+     if (base == nullptr) {
+         return nullptr;
+     }
+@@ -314,39 +375,69 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
+         return nullptr; // resident, or another worker is already filling it
+     }
+ 
+-    // CLOCK (second chance): a slab hit since the hand last passed it survives one sweep. Two
+-    // sweeps at most, because the first clears every reference bit it walks over.
+-    const size_t start = p->next_victim - p->first;
+-    const size_t sweep = clock ? 2*p->n : p->n;
+-    for (size_t i = 0; i < sweep; i++) {
+-        const size_t s = p->first + (start + i) % p->n;
+-        entry & e = entries[s];
+-        if (e.st == LOADING || e.pins > 0) {
+-            // LOADING: a worker is filling it. pins > 0: a worker is uploading OUT of it. Both are
+-            // reads in flight against this memory, and taking it would corrupt one of them.
+-            continue;
+-        }
+-        if (e.st == RESIDENT) {
+-            if (clock && e.ref) {
+-                e.ref = 0;
++    // one sweep over the slots [lo, lo + cnt) from hand: CLOCK (second chance) - a slab hit since the hand last passed
++    // it survives one sweep, two sweeps at most because the first clears every reference bit it walks over - or FIFO.
++    // While a prompt runs (P9), what it holds is passed over like a slot in flight.
++    auto take = [&](size_t lo, size_t cnt, size_t & hand, bool second_chance) -> size_t {
++        const size_t start = hand - lo;
++        const size_t sweep = second_chance ? 2*cnt : cnt;
++        for (size_t i = 0; i < sweep; i++) {
++            const size_t s = lo + (start + i) % cnt;
++            entry & e = entries[s];
++            if (e.st == LOADING || e.pins > 0) {
++                // LOADING: a worker is filling it. pins > 0: a worker is uploading OUT of it. Both are
++                // reads in flight against this memory, and taking it would corrupt one of them.
+                 continue;
+             }
+-            index.erase(e.key);
+-            n_evict++;
+-            p->n_evict++;
++            if (e.st == RESIDENT) {
++                if (scan && e.gen == scan_gen) {
++                    continue;
++                }
++                if (second_chance && e.ref) {
++                    e.ref = 0;
++                    continue;
++                }
++                index.erase(e.key);
++                n_evict++;
++                p->n_evict++;
++            }
++            e.key  = key;
++            e.len  = (uint32_t) len;
++            e.head = 0;
++            e.pins = 0;
++            e.ref  = 0;
++            e.gen  = 0;
++            e.il   = -1;
++            e.st   = LOADING;
++            index[key] = s;
++            hand       = lo + (s - lo + 1) % cnt;
++            return s;
+         }
+-        e.key  = key;
+-        e.len  = (uint32_t) len;
+-        e.head = 0;
+-        e.pins = 0;
+-        e.ref  = 0;
+-        e.st   = LOADING;
+-        index[key]     = s;
+-        p->next_victim = p->first + (s - p->first + 1) % p->n;
+-        *out_slot      = s;
+-        return slot_ptr(s);
++        return SIZE_MAX;
++    };
++
++    size_t s = SIZE_MAX;
++    if (!scan) {
++        s = take(p->first, p->n, p->next_victim, clock);
++    } else {
++        // the held part, while this slab's layer has room there: the slab is held once it is in
++        if (il >= 0 && (uint32_t) il < scan_layers && p->held_by_layer[il] < p->quota && p->ring_first > p->first) {
++            s = take(p->first, p->ring_first - p->first, p->next_victim, clock);
++            if (s != SIZE_MAX) {
++                hold_locked(s, il);
++            }
++        }
++        // else the ring: plain FIFO, never held
++        if (s == SIZE_MAX && p->first + p->n > p->ring_first) {
++            s = take(p->ring_first, p->first + p->n - p->ring_first, p->ring_hand, false);
++            n_scan_ring += s != SIZE_MAX;
++        }
++    }
++    if (s == SIZE_MAX) {
++        return nullptr; // every slot of the pool is in flight (or held)
+     }
+-    return nullptr; // every slot of the pool is in flight
++    *out_slot = s;
++    return slot_ptr(s);
+ }
+ 
+ bool llama_moe_stream_l2::has(uint16_t file_idx, size_t offs, size_t len) {
+@@ -389,6 +480,7 @@ void llama_moe_stream_l2::abandon(size_t slot) {
+     L2_LOCK(*this);
+     entry & e = entries[slot];
+     index.erase(e.key);
++    unhold_locked(slot); // P9: a failed fill gives its layer's share back
+     e.key = UINT64_MAX;
+     e.st  = FREE;
+     cv.notify_all(); // the waiters fall back to reading the slab themselves
+@@ -479,6 +571,42 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+         tier->wait_loading = std::strtol(s, nullptr, 10) != 0;
+     }
+ 
++    // P9: a ring at the end of each pool (1/32 of it, 64 slots at least) for what a prompt reads past its holding, and
++    // a layer's share of the rest
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_SCAN")) {
++        tier->scan_on = std::strtol(s, nullptr, 10) != 0;
++    }
++    // a pool's share is split between the streamed layers with a weight in it (the pool reserve() picks for its slabs)
++    std::vector<uint32_t> n_layers_in(tier->pools.size(), 0u);
++    uint32_t n_streamed = 0;
++    for (const auto & sl : layers) {
++        if (!sl) {
++            continue;
++        }
++        n_streamed++;
++        std::vector<bool> uses(tier->pools.size(), false);
++        for (const auto & wt : sl->weights) {
++            for (size_t ip = 0; ip < tier->pools.size(); ip++) {
++                if (wt.nb_expert <= tier->pools[ip].max_len) {
++                    uses[ip] = true;
++                    break;
++                }
++            }
++        }
++        for (size_t ip = 0; ip < uses.size(); ip++) {
++            n_layers_in[ip] += uses[ip];
++        }
++    }
++    tier->scan_layers = n_streamed > 0 ? (uint32_t) layers.size() : 0;
++    for (size_t ip = 0; ip < tier->pools.size(); ip++) {
++        auto & p = tier->pools[ip];
++        const size_t ring = std::min(p.n/2, std::max<size_t>(64, p.n/32));
++        p.ring_first = p.first + p.n - ring;
++        p.ring_hand  = p.ring_first;
++        p.quota      = n_layers_in[ip] > 0 ? (p.ring_first - p.first)/n_layers_in[ip] : 0;
++        p.held_by_layer.assign(tier->scan_layers, 0u);
++    }
++
+     const size_t bytes = tier->bytes();
+ 
+     // M9: pinned memory counts against the shared (non-local) WDDM budget; past it the tier is not locked (4.36)
+@@ -543,6 +671,16 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+             tier->pools.size() > 1 ? "a pool per slab size" :
+                 classes ? "one slab size" : "one slot size, LLAMA_MOE_STREAM_L2_CLASSES=0",
+             tier->clock ? "CLOCK" : "FIFO");
++    if (tier->scan_on && tier->scan_layers > 0) {
++        std::string rings, shares;
++        for (const auto & p : tier->pools) {
++            rings  += format("%s%zu", rings.empty() ? "" : " + ", p.first + p.n - p.ring_first);
++            shares += format("%s%zu", shares.empty() ? "" : " / ", p.quota);
++        }
++        LLAMA_LOG_WARN("%s: MoE L2 host tier while a prompt runs: what it fills or hits is held, %s slots per layer "
++                "at most, the rest streams through a ring of %s slots (SiegeLadder P9; LLAMA_MOE_STREAM_L2_SCAN=0 off)\n",
++                __func__, shares.c_str(), rings.c_str());
++    }
+ 
+     l2 = std::move(tier);
+ }
+@@ -664,6 +802,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_SKIP")) {
+         ra_skip = atoi(p) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_L2_SCAN_MIN")) {
++        scan_min_tokens = std::max<int64_t>(2, atoll(p));
++    }
+     // the drop rule runs inside runahead's first half when both are asked for (SiegeLadder 17.10, the fast preset);
+     // its VRAM_ONLY / ONLY_LAYER measurement modes stay without runahead: VRAM_ONLY=2 may leave a token no kept pair
+     if (runahead_k > 0 && drop_w > 0.0f && (drop_vram_only != 0 || drop_only_layer >= 0)) {
+@@ -1517,7 +1658,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 // already there: nothing to do
+             } else {
+                 size_t    slot_l2 = 0;
+-                uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2);
++                uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2, sl.il);
+                 if (dst != nullptr) {
+                     const int64_t t_io = ggml_time_us();
+                     const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], dst,
+@@ -1576,7 +1717,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+             // 1. host tier. A hit skips the drive entirely and uploads from page-locked memory. A slab
+             //    still LOADING (a speculative read, usually) is waited for rather than read twice.
+             moe_nvtx_push("l2", sl.il);
+-            const uint8_t * data = l2 ? l2->find_wait(wt.file_idx, offs, wt.nb_expert, &pinned_slot) : nullptr;
++            const uint8_t * data = l2 ? l2->find_wait(wt.file_idx, offs, wt.nb_expert, &pinned_slot, sl.il) : nullptr;
+             moe_nvtx_pop();
+ 
+             if (data == nullptr) {
+@@ -1585,7 +1726,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                 //    back to this worker's own staging buffer when the tier is off, already owns
+                 //    the slab, or has every slot in flight.
+                 size_t    slot_l2 = 0;
+-                uint8_t * dst     = l2 ? l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2) : nullptr;
++                uint8_t * dst     = l2 ? l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2, sl.il) : nullptr;
+ 
+                 moe_nvtx_push("read", sl.il);
+                 const int64_t t_io = ggml_time_us();
+@@ -2218,6 +2359,23 @@ static void llama_moe_stream_write_profile(const char * path,
+             path, (unsigned long long) n_lines);
+ }
+ 
++void llama_moe_stream::batch_begin(int64_t n_tokens, bool from_start) {
++    if (!l2 || !l2->scan_on || l2->scan_layers == 0) {
++        return;
++    }
++    if (n_tokens >= scan_min_tokens) {
++        scan_small_run = 0;
++        if (l2->scan && from_start) {
++            l2->end_scan(); // a new sequence from position 0: a new prompt, even with no decode call between (scoring)
++        }
++        if (!l2->scan) {
++            l2->begin_scan();
++        }
++    } else if (l2->scan && ++scan_small_run > scan_end_calls) {
++        l2->end_scan();
++    }
++}
++
+ void llama_moe_stream::print_stats(const char * role) const {
+     if (const char * out = std::getenv("LLAMA_MOE_STREAM_PROFILE_OUT")) {
+         llama_moe_stream_write_profile(out, layers);
+@@ -2415,6 +2573,11 @@ void llama_moe_stream::print_stats(const char * role) const {
+         LLAMA_LOG_WARN("%s: moe stream: L2 demand waits on a slab in flight = %" PRId64 " (%" PRId64 " served from it, %.2f ms waited)%s\n",
+                 __func__, l2->n_wait, l2->n_wait_hit, l2->t_wait_us/1000.0,
+                 l2->wait_loading ? "" : " - waiting OFF (LLAMA_MOE_STREAM_L2_WAIT=0)");
++        if (l2->n_scan_prompts > 0) {
++            LLAMA_LOG_WARN("%s: moe stream: L2 while prompts ran (P9): %" PRId64 " prompts, %zu slabs held at most, %" PRId64
++                    " hits on held slabs, %" PRId64 " slabs through the ring\n", __func__, l2->n_scan_prompts,
++                    l2->n_scan_held_max, l2->n_scan_held_hits, l2->n_scan_ring);
++        }
+     }
+     LLAMA_LOG_WARN("%s: %smoe stream: slab uploads %s: %" PRIu64 " enqueued, %" PRId64 " fences\n", __func__, pfx,
+             compute_backend == nullptr ? "synchronous per slab" :
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index a7eb09e..c666631 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -324,6 +324,8 @@ struct llama_moe_stream_l2 {
+         uint32_t head = 0;          // payload start inside the slot (direct-I/O head padding)
+         uint32_t len  = 0;
+         uint32_t pins = 0;          // readers currently uploading OUT of this slot
++        uint32_t gen  = 0;          // P9: the prompt (scan_gen) that holds this slab, 0 = none
++        int16_t  il   = -1;         // P9: its layer, while held
+         uint8_t  st   = FREE;
+         uint8_t  ref  = 0;          // CLOCK reference bit: set on a hit, cleared by the hand
+     };
+@@ -341,8 +343,30 @@ struct llama_moe_stream_l2 {
+         size_t offs        = 0; // byte offset of its first slot in base
+         size_t next_victim = 0; // CLOCK hand, a slot index in [first, first + n)
+         int64_t n_evict    = 0;
++        // P9 (below): slots [ring_first, first + n) are the pool's ring - never held, they carry the slabs a prompt
++        // reads past what it holds; held: slabs the current prompt holds, in total and per layer
++        size_t ring_first  = 0;
++        size_t ring_hand   = 0;
++        size_t quota       = 0; // a layer's share of the held part: (ring_first - first) / streamed layers
++        size_t n_held      = 0;
++        std::vector<uint32_t> held_by_layer;
+     };
+ 
++    // SiegeLadder P9: a long prompt's ubatches go through layers 0..39 again and again, and each touches about twice
++    // what the tier holds - CLOCK then evicts exactly what the next ubatch needs (an LRU on a loop: 3.4% hits at 23.5K,
++    // every slot refilled ~29 times). While a prompt runs (scan: from its first multi-pass wave to the next decode call)
++    // a slab it filled or hit is held - never evicted for another - up to an even share of each pool per layer, so the
++    // decode after the prompt still finds some of every layer; past that the slabs stream through the ring at the end
++    // of each pool. The next ubatches then find what is held. LLAMA_MOE_STREAM_L2_SCAN=0: CLOCK throughout, as before.
++    bool     scan_on     = true;  // the switch
++    bool     scan        = false; // a prompt is running
++    uint32_t scan_gen    = 0;     // its number
++    uint32_t scan_layers = 0;     // layer slots in held_by_layer
++    int64_t  n_scan_prompts = 0, n_scan_ring = 0, n_scan_held_hits = 0;
++    size_t   n_scan_held_max = 0; // most slabs held at once
++    void begin_scan(); // a prompt starts (under mgr->mtx, takes this tier's lock)
++    void end_scan();
++
+     uint8_t * base        = nullptr; // bytes() of memory
+     size_t    n_entries   = 0;       // the slots of all pools
+     bool      pinned      = false;
+@@ -398,6 +422,17 @@ struct llama_moe_stream_l2 {
+     size_t bytes() const {
+         return pools.empty() ? 0 : pools.back().offs + pools.back().n*pools.back().stride;
+     }
++    pool & pool_of(size_t s) {
++        for (pool & p : pools) {
++            if (s < p.first + p.n) {
++                return p;
++            }
++        }
++        GGML_ABORT("L2 slot %zu out of range", s);
++    }
++    // P9, under the lock: the current prompt takes this resident slot - hold it, when its pool and its layer have room
++    void hold_locked(size_t s, int32_t il);
++    void unhold_locked(size_t s);
+ 
+     // Resident payload for this slab, or nullptr. A LOADING entry returns nullptr on purpose: the
+     // caller then reads it itself rather than waiting, which keeps this tier off the critical path
+@@ -409,7 +444,8 @@ struct llama_moe_stream_l2 {
+     // from the drive, and the first worker uploads half of each. Measured 2026-08-09: the model
+     // emitted 8,191 characters of "<<<<<<<<" instead of an answer. Nothing about that failure is
+     // visible in a throughput number - it looks like a fast run.
+-    const uint8_t * find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
++    // il: the slab's layer, for P9's per-layer share while a prompt runs (-1: not held)
++    const uint8_t * find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, int32_t il = -1);
+     // The demand path's lookup: find(), except that a LOADING entry is WAITED for instead of read a
+     // second time. The fill under way is a read already in flight (a speculative read commits right
+     // after it, a demand fill right after its upload), so the wait is at most what is left of that
+@@ -418,7 +454,7 @@ struct llama_moe_stream_l2 {
+     // still loading and the run came out 6% slower than with no prefetch at all. nullptr when the
+     // slab is absent, its fill was abandoned, or the wait passed a 2 s safety bound - the caller
+     // then reads it itself, exactly as with find(). Same pin/release contract as find().
+-    const uint8_t * find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
++    const uint8_t * find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, int32_t il = -1);
+     // Is this slab resident? Unlike find(), this counts nothing and marks nothing: a
+     // speculative probe that bumped n_hit would inflate the tier's own hit rate, and one
+     // that set the reference bit would protect a slab from eviction on the strength of a
+@@ -430,7 +466,8 @@ struct llama_moe_stream_l2 {
+     // slab, or every slot is in flight. LOADING is itself the protection while the drive read and
+     // the upload run; commit() is what ENDS that protection, so it must be called AFTER the
+     // upload, never before.
+-    uint8_t * reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
++    // While a prompt runs (P9) the slab is held when its layer il has room, or else it streams through the ring
++    uint8_t * reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot, int32_t il = -1);
+     void      commit(size_t slot, size_t head);
+     // commit() and a pin in one step, for an asynchronous upload still reading OUT of the slot: the
+     // slab becomes a hit for everyone at once, but cannot be evicted until release() (async_upload)
+@@ -480,6 +517,15 @@ struct llama_moe_stream {
+     uint32_t pin_budget = 0;
+ 
+     void print_stats(const char * role) const;
++
++    // SiegeLadder P9: the host tier's prompt holding follows whole decode calls (llama_context::decode): a call of at
++    // least scan_min_tokens tokens (LLAMA_MOE_STREAM_L2_SCAN_MIN, default 64) begins it - anew when its first position is
++    // 0, a new prompt from the start - and calls with fewer tokens end it once more than scan_end_calls (2) came in a row,
++    // so a lone short chunk inside a prompt does not, and decode with any number of sequences does
++    void batch_begin(int64_t n_tokens, bool from_start);
++    int64_t scan_min_tokens = 64;
++    int32_t scan_end_calls  = 2;
++    int32_t scan_small_run  = 0;
+     void print_locality(const char * pfx) const; // expert selection concentration; called from print_stats
+ 
+     bool use_direct_io = false; // O_DIRECT streaming reads (LLAMA_MOE_STREAM_DIRECT), no page cache

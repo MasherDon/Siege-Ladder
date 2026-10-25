@@ -1,0 +1,628 @@
+From c799839e764049504a022a5dc51051fbdd9ec3d0 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:47:37 +0000
+Subject: [PATCH 36/91] moe-stream : where decode loads come from and how long
+ they take (SiegeLadder M12), the late drop, and the drop masks on the remap's
+ host split - counters: every slot remembers its load's source (the host tier
+ or the drive, from l2::has, which counts and marks nothing) and when it was
+ reserved; print_stats splits the staged experts by source (ready / still
+ loading / not asked for), the decode waits by what was in flight when they
+ began (a drive read of the call's own, drive reads staged ahead only,
+ host-tier copies only: calls and seconds), and prints delivery times
+ (reservation to the last copy enqueued) and the time left once a call waited,
+ as histograms per class; the remap halves time their wait for mgr->mtx (G21).
+ SiegeLadder runs.md 4.53-4.54: with runahead every remaining wait is the
+ drive, 70% of it stages ahead from the drive that arrive late (2.5-2.6 ms
+ against a lead of ~1.9), 30% misses runahead did not predict; the lock costs
+ 0.001-0.002 ms per call. LLAMA_MOE_STREAM_DROP_LATE=1 (lossy, next to the
+ plain drop rule and runahead): at the wait the call waits for its heavy
+ experts only and drops the light ones still loading, whose loads go on for
+ later calls - KL 0.011-0.016, +1..+4% over runahead, so not for the fast
+ preset. The drop rule's mask (drop_mask, and exact_mask next to runahead) is
+ expanded right after its remap: left to the final weighting's expansion it
+ came after the expert GEMMs in node order, a host split of its own and one
+ more card-host-card hand-off per layer; drop 0.14 14.06 -> 14.44 tok/s, and
+ the deterministic DROP_VRAM_ONLY=3 gives the same logits in both orders (PPL,
+ KL, max KLD, top-1, 92 633 drops identical);
+ LLAMA_MOE_STREAM_MASK_LATE_SPLIT=1 keeps the old order for A/B
+
+---
+ src/llama-graph.cpp      |  20 ++-
+ src/llama-moe-stream.cpp | 264 +++++++++++++++++++++++++++++++++++++--
+ src/llama-moe-stream.h   |  54 +++++++-
+ 3 files changed, 328 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 659f585..bc0f4dd 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2356,6 +2356,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ids_cont->ne[0], ids_cont->ne[1], 1, &ids_gemm, 1,
+                     llama_moe_stream_drop_mask, 1, msl);
+             cb(drop_mask, "ffn_moe_drop_mask", il);
++            // expanded here, right after the remap: left to the final weighting's expansion, the mask came after the
++            // expert GEMMs in node order, a host split of its own - one more card -> host -> card hand-off per layer
++            // (SiegeLadder 17.10, sixth session: drop 0.14 14.06 -> 14.44 tok/s). LLAMA_MOE_STREAM_MASK_LATE_SPLIT=1
++            // keeps the old order, for A/B
++            static const bool mask_late_split = getenv("LLAMA_MOE_STREAM_MASK_LATE_SPLIT") != nullptr &&
++                    atoi(getenv("LLAMA_MOE_STREAM_MASK_LATE_SPLIT")) != 0;
++            if (!mask_late_split) {
++                ggml_build_forward_expand(gf, ids_gemm);
++                ggml_build_forward_expand(gf, drop_mask);
++            }
+         } else if (pred_next != nullptr) {
+             // the prediction rides to the host with this layer's ids: same op, same sync
+             ids_gemm = ggml_map_custom2(ctx0, ids_cont, ggml_cont(ctx0, pred_next), llama_moe_stream_remap_pred, 1, msl);
+@@ -2620,10 +2630,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     llama_moe_stream_remap_wait, 1, msl);
+             cb(ids_gemm, "ffn_moe_topk_stream", il);
+             if (msl->mgr->drop_w > 0.0f) {
+-                // the drop rule's multipliers for the exact path, decided by the first half
++                // the drop rule's multipliers for the exact path, decided by the first half (and by the late drop at
++                // the wait); expanded right after the second half, so both stay on one host split - see the plain
++                // drop rule above
+                 drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ra_ids->ne[0], ra_ids->ne[1], 1, &ids_gemm, 1,
+                         llama_moe_stream_exact_mask, 1, msl);
+                 cb(drop_mask, "ffn_moe_drop_mask", il);
++                static const bool mask_late_split = getenv("LLAMA_MOE_STREAM_MASK_LATE_SPLIT") != nullptr &&
++                        atoi(getenv("LLAMA_MOE_STREAM_MASK_LATE_SPLIT")) != 0;
++                if (!mask_late_split) {
++                    ggml_build_forward_expand(gf, ids_gemm);
++                    ggml_build_forward_expand(gf, drop_mask);
++                }
+             }
+         }
+         experts = build_expert_gemms(cur, ids_gemm, nullptr);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 3d98a94..dc81576 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -541,6 +541,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ALL")) {
+         drop_all = std::strtol(p, nullptr, 10) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_LATE")) {
++        drop_late = std::strtol(p, nullptr, 10) != 0;
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_VRAM_ONLY")) {
+         drop_vram_only = (int32_t) std::strtol(p, nullptr, 10);
+     }
+@@ -590,6 +593,15 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                        drop_all ? ", only when that frees the call from the drive" : "",
+                        drop_renorm ? ", the kept pairs renormalised" : "");
+     }
++    if (drop_late && (drop_w <= 0.0f || runahead_k == 0 || drop_vram_only != 0)) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_DROP_LATE needs the plain drop rule (DROP_W) and runahead; "
++                "ignored\n", __func__);
++        drop_late = false;
++    }
++    if (drop_late) {
++        LLAMA_LOG_WARN("%s: moe stream: LATE DROP ON (lossy, timing-dependent): at runahead's wait, a light expert still "
++                "loading once the heavy ones are in is not waited for\n", __func__);
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_VRAM")) {
+         spec_vram = std::strtol(p, nullptr, 10) != 0;
+     }
+@@ -983,7 +995,7 @@ void llama_moe_stream::enqueue_stage_copy_locked(const stage_copy & c, bool dema
+     }
+     // published as any other part: RESIDENT once the slot's last part is enqueued
+     if (sl.slot_parts_left[c.slot] > 0 && --sl.slot_parts_left[c.slot] == 0) {
+-        sl.slot_state[c.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++        slot_resident_locked(sl, c.slot);
+     }
+     cv_done.notify_all();
+ }
+@@ -1013,7 +1025,7 @@ void llama_moe_stream::flush_stage_copies_sync_locked() {
+             const auto & wt = sl.weights[c.weight];
+             ggml_backend_tensor_set(wt.cache, c.data, (size_t) c.slot*wt.nb_expert, wt.nb_expert);
+             if (sl.slot_parts_left[c.slot] > 0 && --sl.slot_parts_left[c.slot] == 0) {
+-                sl.slot_state[c.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++                slot_resident_locked(sl, c.slot);
+             }
+         }
+         if (l2) {
+@@ -1127,6 +1139,9 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+         sl->expert_pinned.resize(n_expert, 0);
+         sl->slot_pinned  .resize(n_slots, 0);
+         sl->slot_staged  .resize(n_slots, 0);
++        sl->slot_src     .resize(n_slots, 0);
++        sl->slot_t_res   .resize(n_slots, 0);
++        sl->slot_t_wait  .resize(n_slots, 0);
+         sl->slot_wanted  .resize(n_slots, 0);
+         // JigSaw (21/08): marca os N primeiros da linha desta camada como pinaveis.
+         if (pin_budget > 0) {
+@@ -1600,7 +1615,7 @@ void llama_moe_stream::worker_loop(int worker_id) {
+         } else if (sl.slot_parts_left[w.slot] > 0 && --sl.slot_parts_left[w.slot] == 0) {
+             // RESIDENT only when the LAST tensor of this slot has landed. Publishing
+             // at the first one would hand out a slot that is part garbage.
+-            sl.slot_state[w.slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++            slot_resident_locked(sl, w.slot);
+         }
+         cv_done.notify_all();
+     }
+@@ -1670,11 +1685,56 @@ void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t
+     // end of remap sees it (3a, 2026-10-15: ~9k of ~26k wasted stages went this way and were not counted)
+     if (sl.slot_staged[slot]) {
+         stats.n_stage_waste++;
++        stats.n_stage_waste_drive += sl.slot_staged[slot] == 2;
+     }
+     sl.slot_staged[slot]     = 0; // stage_ahead_locked sets it again for its own reservations
++    sl.slot_src[slot]        = 0; // the decode paths that reserve set it again (M12)
++    sl.slot_t_res[slot]      = ggml_time_us();
++    sl.slot_t_wait[slot]     = 0;
+     sl.slot_wanted[slot]     = 0;
+ }
+ 
++static int moe_dt_bucket(int64_t us) {
++    static const int64_t edge[7] = { 250, 500, 1000, 2000, 4000, 8000, 16000 };
++    int b = 0;
++    while (b < 7 && us >= edge[b]) {
++        b++;
++    }
++    return b;
++}
++
++void llama_moe_stream::slot_resident_locked(llama_moe_stream_layer & sl, int32_t slot) {
++    sl.slot_state[slot] = LLAMA_MOE_STREAM_SLOT_RESIDENT;
++    const uint8_t src = sl.slot_src[slot];
++    if ((src & 4) == 0) {
++        return; // not a decode load
++    }
++    const int64_t now    = ggml_time_us();
++    const int     drive  = src & 1;
++    const int     staged = (src >> 1) & 1;
++    const int64_t dt     = now - sl.slot_t_res[slot];
++    stats.n_dt[staged][drive][moe_dt_bucket(dt)]++;
++    stats.t_dt_us[staged][drive] += dt;
++    if (sl.slot_t_wait[slot] > 0) {
++        const int64_t left = now - sl.slot_t_wait[slot];
++        stats.n_left[staged][drive][moe_dt_bucket(left)]++;
++        stats.t_left_us[staged][drive] += left;
++        sl.slot_t_wait[slot] = 0;
++    }
++}
++
++bool llama_moe_stream::on_drive_locked(const llama_moe_stream_layer & sl, int32_t expert) {
++    if (!l2) {
++        return true;
++    }
++    for (const auto & wt : sl.weights) {
++        if (!l2->has(wt.file_idx, wt.offs + (size_t) expert*wt.nb_expert, wt.nb_expert)) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // Queue one read per weight tensor of this slot. THE POINT OF THE SPLIT: a single
+ // item per expert meant one worker read 2-3 tensors in a for loop, strictly one at
+ // a time, which is the whole reason the drive saw a queue depth of 1.6. One item
+@@ -1882,9 +1942,13 @@ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const i
+         if (!sf.seen[e]) {
+             stats.n_miss_cold++; // counted here, since the call will find the slot already reserved
+         }
++        // where its bytes come from (M12): has() counts and marks nothing, so the tier's own numbers stay as they were
++        const bool from_drive = on_drive_locked(sf, e);
+         reserve_slot_locked(sf, e, v);
+-        sf.slot_staged[v] = 1;
++        sf.slot_staged[v] = from_drive ? 2 : 1;
++        sf.slot_src[v]    = (from_drive ? 1 : 0) | 2 | 4;
+         sf.keep[v]        = 1;
++        stats.n_stage_drive += from_drive;
+         enqueue_slot_locked(sf, e, v, /*stage =*/ true);
+         stats.n_stage++;
+     }
+@@ -2094,6 +2158,59 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_pred_calls, pred_vram, pred_ram, stats.n_stage, stats.n_stage_ready,
+                 stats.n_stage_late, stats.n_stage_waste, stats.n_stage_skip, stats.n_pred_spec);
+     }
++    if (stats.n_stage > 0) {
++        // M12: the late ones a read-ahead into RAM could have saved are those staged from the drive
++        LLAMA_LOG_WARN("%s: %smoe stream: staged from the drive (some slab not in the host tier yet): %" PRId64 " of %" PRId64
++                " - %" PRId64 " ready on arrival, %" PRId64 " still loading, %" PRId64 " not asked for; from the host tier: "
++                "%" PRId64 " ready, %" PRId64 " still loading, %" PRId64 " not asked for\n",
++                __func__, pfx, stats.n_stage_drive, stats.n_stage, stats.n_stage_ready_drive, stats.n_stage_late_drive,
++                stats.n_stage_waste_drive, stats.n_stage_ready - stats.n_stage_ready_drive,
++                stats.n_stage_late - stats.n_stage_late_drive, stats.n_stage_waste - stats.n_stage_waste_drive);
++    }
++    if (stats.n_wait_calls_drive + stats.n_wait_calls_tier > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: decode waits by source: %" PRId64 " calls waited with a drive read in flight, "
++                "%.1f s (%" PRId64 " of them on a drive read of their own, a miss not staged ahead, %.1f s); %" PRId64
++                " on host-tier copies only, %.1f s; in flight when they began to wait: %" PRId64 " loads "
++                "from the drive, %" PRId64 " from the host tier, %" PRId64 " of all those staged ahead\n",
++                __func__, pfx, stats.n_wait_calls_drive, stats.t_stall_drive_us/1e6, stats.n_wait_calls_own,
++                stats.t_stall_own_us/1e6, stats.n_wait_calls_tier,
++                stats.t_stall_tier_us/1e6, stats.n_wait_slots_drive, stats.n_wait_slots_tier, stats.n_wait_slots_staged);
++    }
++    // M12: delivery times of decode loads, reservation -> last copy enqueued, and the time left once a call waited
++    {
++        auto hist = [](const int64_t * h, int64_t t_us, char * buf, size_t len) {
++            int64_t n = 0;
++            for (int b = 0; b < 8; b++) {
++                n += h[b];
++            }
++            const double f = n > 0 ? 100.0/n : 0.0;
++            snprintf(buf, len, "%" PRId64 ", mean %.2f ms, <0.25/0.5/1/2/4/8/16/more ms: %.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0f/%.0f%%",
++                    n, n > 0 ? t_us/1e3/n : 0.0, h[0]*f, h[1]*f, h[2]*f, h[3]*f, h[4]*f, h[5]*f, h[6]*f, h[7]*f);
++            return n;
++        };
++        char b[4][192];
++        const int64_t n_all = hist(stats.n_dt[0][0], stats.t_dt_us[0][0], b[0], sizeof(b[0])) +
++                              hist(stats.n_dt[0][1], stats.t_dt_us[0][1], b[1], sizeof(b[1])) +
++                              hist(stats.n_dt[1][0], stats.t_dt_us[1][0], b[2], sizeof(b[2])) +
++                              hist(stats.n_dt[1][1], stats.t_dt_us[1][1], b[3], sizeof(b[3]));
++        if (n_all > 0) {
++            LLAMA_LOG_WARN("%s: %smoe stream: decode loads, reservation to the last copy enqueued: demand from the host "
++                    "tier %s; demand from the drive %s; staged from the host tier %s; staged from the drive %s\n",
++                    __func__, pfx, b[0], b[1], b[2], b[3]);
++            int64_t lt[8];
++            int64_t ld[8];
++            for (int i = 0; i < 8; i++) {
++                lt[i] = stats.n_left[0][0][i] + stats.n_left[1][0][i];
++                ld[i] = stats.n_left[0][1][i] + stats.n_left[1][1][i];
++            }
++            hist(lt, stats.t_left_us[0][0] + stats.t_left_us[1][0], b[0], sizeof(b[0]));
++            hist(ld, stats.t_left_us[0][1] + stats.t_left_us[1][1], b[1], sizeof(b[1]));
++            hist(stats.n_left[1][1], stats.t_left_us[1][1], b[2], sizeof(b[2]));
++            hist(stats.n_left[0][1], stats.t_left_us[0][1], b[3], sizeof(b[3]));
++            LLAMA_LOG_WARN("%s: %smoe stream: loads a call began to wait on, time left from then: from the host tier %s; "
++                    "from the drive %s - staged ahead %s, misses of the call %s\n", __func__, pfx, b[0], b[1], b[2], b[3]);
++        }
++    }
+     if (stats.n_ra_calls > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: runahead: %" PRId64 " calls split in two, the prediction above made between "
+                 "the halves; the approximate pass kept %.1f%% of their pairs (%" PRId64 " calls had no resident slot); "
+@@ -2101,6 +2218,17 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_ra_calls, stats.n_ra_pairs > 0 ? 100.0*stats.n_ra_kept/stats.n_ra_pairs : 0.0,
+                 stats.n_ra_invalid, 1e-3*stats.t_ra_gap_us/stats.n_ra_calls, stats.n_ra_redo);
+     }
++    if (stats.n_calls > 0) {
++        // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
++        // critical path, and so does runahead's second half (counted in the gap between the halves above)
++        char ra[96] = "";
++        if (stats.n_ra_calls > 0) {
++            snprintf(ra, sizeof(ra), "; %.3f ms per call at runahead's second half (%.2f s)",
++                    1e-3*stats.t_ra_lock_us/stats.n_ra_calls, stats.t_ra_lock_us/1e6);
++        }
++        LLAMA_LOG_WARN("%s: %smoe stream: remap lock waits: %.3f ms per remap call at its start (%.2f s)%s\n",
++                __func__, pfx, 1e-3*stats.t_remap_lock_us/stats.n_calls, stats.t_remap_lock_us/1e6, ra);
++    }
+     if (oracle_recall < 1.0f || pred_stage != 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: measurement: the oracle's staging and read-ahead keep %.2f of each call's "
+                 "experts; the prediction stages %s\n", __func__, pfx, oracle_recall,
+@@ -2111,6 +2239,11 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 PRId64 " experts dropped, in %" PRId64 " of %" PRId64 " calls\n", __func__, pfx, drop_w,
+                 drop_renorm ? ", kept pairs renormalised" : "", stats.n_drop_pairs, stats.n_drop_exp,
+                 stats.n_drop_calls, stats.n_calls);
++        if (drop_late) {
++            LLAMA_LOG_WARN("%s: %smoe stream: late drop (lossy; light experts still loading once the heavy ones are in): "
++                    "%" PRId64 " pairs of %" PRId64 " experts not waited for, in %" PRId64 " calls\n", __func__, pfx,
++                    stats.n_drop_late_pairs, stats.n_drop_late_exp, stats.n_drop_late_calls);
++        }
+     }
+     if (n_shift > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: miss-only shift swapped %" PRId64 " experts (%" PRId64 " from the host tier)\n",
+@@ -2423,6 +2556,44 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+         const ggml_tensor * wts, void * userdata, bool issue_only = false);
+ 
++// M12: what a decode call is about to wait for - its loads still in flight, by where their bytes come from (slot_src).
++// 3 = a drive read of its own (a miss nobody staged ahead), 2 = drive reads staged ahead only, 1 = all from the host
++// tier, 0 = nothing in flight any more
++static int moe_wait_sources_locked(llama_moe_stream & mgr, llama_moe_stream_layer & sl) {
++    int64_t n_drive = 0;
++    int64_t n_tier  = 0;
++    int64_t n_own   = 0;
++    const int64_t now = ggml_time_us();
++    for (const int32_t s : sl.demand_slots) {
++        if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++            continue;
++        }
++        (sl.slot_src[s] & 1 ? n_drive : n_tier)++;
++        n_own += (sl.slot_src[s] & 3) == 1;
++        mgr.stats.n_wait_slots_staged += (sl.slot_src[s] & 2) != 0;
++        if (sl.slot_t_wait[s] == 0) {
++            sl.slot_t_wait[s] = now; // its time left is read when it turns RESIDENT (slot_resident_locked)
++        }
++    }
++    mgr.stats.n_wait_slots_drive += n_drive;
++    mgr.stats.n_wait_slots_tier  += n_tier;
++    return n_own > 0 ? 3 : n_drive > 0 ? 2 : n_tier > 0 ? 1 : 0;
++}
++
++static void moe_wait_account_locked(llama_moe_stream & mgr, int kind, int64_t dt_us) {
++    if (kind >= 2) {
++        mgr.stats.n_wait_calls_drive++;
++        mgr.stats.t_stall_drive_us += dt_us;
++        if (kind == 3) {
++            mgr.stats.n_wait_calls_own++;
++            mgr.stats.t_stall_own_us += dt_us;
++        }
++    } else if (kind == 1) {
++        mgr.stats.n_wait_calls_tier++;
++        mgr.stats.t_stall_tier_us += dt_us;
++    }
++}
++
+ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith != 0) {
+@@ -2579,7 +2750,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     const int32_t * ids = (const int32_t *) a->data;
+           int32_t * out = (int32_t *) dst->data;
+ 
++    const int64_t t_lk = ggml_time_us();
+     std::unique_lock<std::mutex> lk(mgr->mtx);
++    mgr->stats.t_remap_lock_us += ggml_time_us() - t_lk; // G21: waiting for the lock the I/O workers hold
+ 
+     if (mgr->load_failed) {
+         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+@@ -2652,6 +2825,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // routed. A token's top pair has at least 1/k of its weight, so with the threshold capped under that,
+     // every token keeps at least one pair.
+     sl->dropped.clear();
++    sl->drop_thr = 0.0f;
+     size_t n_masked = 0; // VRAM_ONLY >= 3: experts with weight 0 that still load (touched = 3)
+     if (wts != nullptr) {
+         const int64_t k     = a->ne[0];
+@@ -2661,6 +2835,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         const float   thr   = (mgr->drop_only_layer >= 0 && sl->il != mgr->drop_only_layer) ? 0.0f :
+                               mgr->drop_vram_only ? mgr->drop_w : std::min(mgr->drop_w, 0.99f/(float) k);
+         const float * w     = (const float *) wts->data;
++        sl->drop_thr = thr;
+         if (thr > 0.0f) {
+             sl->drop_share.assign(sl->n_expert, 0.0f);
+             // VRAM_ONLY=2 lets the top pair go as well, but a token left with no pair needs some resident slot
+@@ -2807,6 +2982,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             if (sl->slot_staged[s]) {
+                 // staged ahead for this very call (A4b): still a miss of the cache as it stood, so the
+                 // hit rate stays comparable with runs without staging; what changed is when it loaded
++                if (sl->slot_staged[s] == 2) {
++                    (loading ? mgr->stats.n_stage_late_drive : mgr->stats.n_stage_ready_drive)++;
++                }
+                 sl->slot_staged[s] = 0;
+                 mgr->stats.n_miss++;
+                 (loading ? mgr->stats.n_stage_late : mgr->stats.n_stage_ready)++;
+@@ -2839,7 +3017,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             if (!sl->seen[e]) {
+                 mgr->stats.n_miss_cold++;
+             }
++            const bool from_drive = mgr->on_drive_locked(*sl, e);
+             mgr->reserve_slot_locked(*sl, e, v);
++            sl->slot_src[v] = (from_drive ? 1 : 0) | 4;
+             mgr->enqueue_slot_locked(*sl, e, v);
+             mgr->stats.n_miss++;
+             waited = true;
+@@ -2852,6 +3032,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // its misses here; the oracle never has any). Cleared so it cannot be counted again.
+     for (uint32_t s = 0; s < sl->n_slots; s++) {
+         if (sl->slot_staged[s]) {
++            mgr->stats.n_stage_waste_drive += sl->slot_staged[s] == 2;
+             sl->slot_staged[s] = 0;
+             mgr->stats.n_stage_waste++;
+         }
+@@ -2898,7 +3079,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+ 
+     if (waited) {
+         moe_nvtx_range r_stall("stall", sl->il);
+-        const int64_t t0 = ggml_time_us();
++        const int     kind = moe_wait_sources_locked(*mgr, *sl);
++        const int64_t t0   = ggml_time_us();
+         mgr->cv_done.wait(lk, [&]{
+             if (mgr->load_failed) {
+                 return true;
+@@ -2913,7 +3095,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         if (mgr->load_failed) {
+             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+         }
+-        mgr->stats.t_stall_us += ggml_time_us() - t0;
++        const int64_t dt = ggml_time_us() - t0;
++        mgr->stats.t_stall_us += dt;
++        moe_wait_account_locked(*mgr, kind, dt);
+     }
+ 
+     for (int64_t i = 0; i < n; i++) {
+@@ -2983,7 +3167,9 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+     const int64_t n   = ggml_nelements(dst);
+     int32_t     * out = (int32_t *) dst->data;
+ 
++    const int64_t t_lk = ggml_time_us();
+     std::unique_lock<std::mutex> lk(mgr->mtx);
++    mgr->stats.t_ra_lock_us += ggml_time_us() - t_lk; // G21: how much of the gap is this lock, held by the I/O workers
+ 
+     if (mgr->load_failed) {
+         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+@@ -3014,7 +3200,9 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+                 }
+                 v = mgr->pick_victim_locked(*sl, sl->keep.data());
+             }
++            const bool from_drive = mgr->on_drive_locked(*sl, e);
+             mgr->reserve_slot_locked(*sl, e, v);
++            sl->slot_src[v] = (from_drive ? 1 : 0) | 4;
+             mgr->enqueue_slot_locked(*sl, e, v);
+             sl->keep[v] = 1;
+             mgr->stats.n_ra_redo++;
+@@ -3026,9 +3214,67 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+         sl->demand_slots.push_back(s);
+     }
+ 
++    // DROP_LATE (see drop_late in the header): the call waits for its heavy experts only, and the light ones still
++    // loading after that are dropped. Only next to the plain rule, whose threshold sits under 1/k, so a token's top
++    // pair is heavy and every token keeps a resident pair to map its dropped ones onto. demand_slots[i] is uniq[i]'s.
++    if (waited && mgr->drop_late && sl->drop_thr > 0.0f && mgr->drop_vram_only == 0 &&
++            (int64_t) sl->exact_mask.size() == n) {
++        auto heavy_loading = [&]{
++            for (size_t i = 0; i < sl->uniq.size(); i++) {
++                if (sl->drop_share[sl->uniq[i]] >= sl->drop_thr &&
++                        sl->slot_state[sl->demand_slots[i]] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                    return true;
++                }
++            }
++            return false;
++        };
++        if (heavy_loading()) {
++            moe_nvtx_range r_stall("stall", sl->il);
++            const int     kind = moe_wait_sources_locked(*mgr, *sl);
++            const int64_t t0   = ggml_time_us();
++            mgr->cv_done.wait(lk, [&]{ return mgr->load_failed || !heavy_loading(); });
++            if (mgr->load_failed) {
++                GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++            }
++            const int64_t dt = ggml_time_us() - t0;
++            mgr->stats.t_stall_us += dt;
++            moe_wait_account_locked(*mgr, kind, dt);
++        }
++        size_t  n_keep = 0;
++        int64_t n_late = 0;
++        for (size_t i = 0; i < sl->uniq.size(); i++) {
++            const int32_t e = sl->uniq[i];
++            const int32_t s = sl->demand_slots[i];
++            if (sl->slot_state[s] != LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                sl->touched[e] = 2; // light, not arrived: its load goes on, for the calls after this one
++                sl->dropped.push_back(e);
++                n_late++;
++                continue;
++            }
++            sl->uniq[n_keep]         = e;
++            sl->demand_slots[n_keep] = s;
++            n_keep++;
++        }
++        sl->uniq.resize(n_keep);
++        sl->demand_slots.resize(n_keep);
++        if (n_late > 0) {
++            const int32_t * rids = sl->ra_ids.data();
++            for (int64_t i = 0; i < n; i++) {
++                if (sl->touched[rids[i]] == 2 && sl->exact_mask[i] != 0.0f) {
++                    sl->exact_mask[i] = 0.0f;
++                    mgr->stats.n_drop_late_pairs++;
++                }
++            }
++            mgr->stats.n_drop_late_exp += n_late;
++            mgr->stats.n_drop_late_calls++;
++        }
++        waited = false; // every kept expert is resident now
++    }
++
+     if (waited) {
+         moe_nvtx_range r_stall("stall", sl->il);
+-        const int64_t t0 = ggml_time_us();
++        const int     kind = moe_wait_sources_locked(*mgr, *sl);
++        const int64_t t0   = ggml_time_us();
+         mgr->cv_done.wait(lk, [&]{
+             if (mgr->load_failed) {
+                 return true;
+@@ -3043,7 +3289,9 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+         if (mgr->load_failed) {
+             GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+         }
+-        mgr->stats.t_stall_us += ggml_time_us() - t0;
++        const int64_t dt = ggml_time_us() - t0;
++        mgr->stats.t_stall_us += dt;
++        moe_wait_account_locked(*mgr, kind, dt);
+     }
+ 
+     const int32_t * ids = sl->ra_ids.data();
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 6c390cd..b172ab1 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -118,8 +118,18 @@ struct llama_moe_stream_layer {
+     std::vector<uint8_t> expert_pinned; // [n_expert] 1 = pinar quando carregar
+     std::vector<uint8_t> slot_pinned;   // [n_slots]  1 = nunca despejar
+     // [n_slots] reserved by stage-ahead (A4b) for a call that has not run yet; cleared when that call
+-    // finds it, and by any new reservation of the slot
++    // finds it, and by any new reservation of the slot. 1 = every slab of the expert was in the host tier
++    // when it was staged, 2 = some slab had to come from the drive (SiegeLadder M12: which of the late ones
++    // a read-ahead into RAM could have saved)
+     std::vector<uint8_t> slot_staged;
++    // [n_slots] the current occupant's load, kept until the slot is reserved again (M12): bit 0 = some slab was not
++    // in the host tier when the slot was reserved (it is read from the drive), bit 1 = staged ahead, bit 2 = a decode
++    // path reserved it (only those are timed below; prefill waves are not)
++    std::vector<uint8_t> slot_src;
++    // [n_slots] M12 delivery times: ggml_time_us() at the reservation, and when a call began to wait on the slot
++    // (0 = it did not); read when the slot turns RESIDENT, i.e. when its last copy is enqueued
++    std::vector<int64_t> slot_t_res;
++    std::vector<int64_t> slot_t_wait;
+     std::vector<int32_t> demand_slots; // slots the current call waits on
+     // async_upload with per-slot fences (guarded by mgr->upload_mtx, not mgr->mtx): an event recorded on the
+     // upload stream right after every slab copy into the slot, and that copy's sequence number - see
+@@ -145,6 +155,7 @@ struct llama_moe_stream_layer {
+     int64_t              ra_t_issue = 0; // ggml_time_us() at the end of the first half
+     std::vector<int32_t> dropped;
+     std::vector<float>   drop_share; // [n_expert] the largest share of a token's routing weight it has
++    float                drop_thr = 0.0f; // the threshold the first half applied (late drop reuses it and drop_share)
+     // with a trace on: where each routed expert of the current call was when the call came, before it
+     // loaded anything - 'v' resident in VRAM, 'l' in VRAM but still loading (staged or speculated), 'r' not
+     // in VRAM but whole in the host tier, 'd' on the drive. Written into the trace after the experts.
+@@ -554,6 +565,13 @@ struct llama_moe_stream {
+     // with one heavy drive miss waits for the drive anyway, and its light ones load in parallel at no extra
+     // time, so dropping them there costs quality and buys nothing.
+     bool    drop_all    = false;
++    // LLAMA_MOE_STREAM_DROP_LATE=1 (SiegeLadder 4.51, for the fast preset; lossy and timing-dependent, so not
++    // reproducible run to run): next to runahead the rule acts once more at the wait, on the experts still loading
++    // there. The call waits for its heavy experts (share >= the threshold in some pair), then the light ones that
++    // have not arrived are dropped as above - weight 0, a kept slot of their token - while their loads go on for
++    // the calls after it. With runahead the experts get their slots a layer early, so the first half finds few on
++    // the drive (4.51: the rule fired 7x less); what the call waits for is the late arrival, which this addresses.
++    bool    drop_late   = false;
+     // LLAMA_MOE_STREAM_DROP_VRAM_ONLY=1 (measurement, 2026-10-15): an expert counts as missing unless it is on the
+     // card, the threshold is not capped, and each token keeps its top pair - "compute with what the card has",
+     // to see how far an approximate pass's routing drifts from the exact one (runahead as a predictor).
+@@ -736,6 +754,30 @@ struct llama_moe_stream {
+         int64_t n_stage_late  = 0; // of those, still LOADING when their call came
+         int64_t n_stage_skip  = 0; // not staged: no evictable slot in the target layer
+         int64_t n_stage_waste = 0; // staged for a call that did not ask for the expert after all
++        // the same four for the experts staged from the drive (slot_staged 2); the rest came from the host tier
++        int64_t n_stage_drive       = 0;
++        int64_t n_stage_ready_drive = 0;
++        int64_t n_stage_late_drive  = 0;
++        int64_t n_stage_waste_drive = 0;
++        // M12, when a decode call starts to wait (the remap, or runahead's second half): its loads still in flight, by
++        // source (slot_src), and the calls that waited, split by whether any of those loads comes from the drive
++        int64_t n_wait_slots_drive  = 0;
++        int64_t n_wait_slots_tier   = 0;
++        int64_t n_wait_slots_staged = 0; // of both, staged ahead
++        int64_t n_wait_calls_drive  = 0;
++        int64_t n_wait_calls_tier   = 0;
++        int64_t t_stall_drive_us    = 0; // their share of t_stall_us
++        int64_t t_stall_tier_us     = 0;
++        int64_t n_wait_calls_own    = 0; // of the drive calls, those with a drive read of their own (not staged ahead)
++        int64_t t_stall_own_us      = 0;
++        // M12: how long a decode load takes from its reservation until it is RESIDENT (its last copy enqueued; the copy
++        // itself then lands in ~0.1 ms per slab), by [staged][from the drive]; and, for the loads a call began to wait
++        // on, the time left from that moment, by the same [staged][from the drive]. Buckets: < 0.25, 0.5, 1, 2, 4, 8,
++        // 16 ms, more
++        int64_t n_dt[2][2][8]   = {};
++        int64_t t_dt_us[2][2]   = {};
++        int64_t n_left[2][2][8] = {};
++        int64_t t_left_us[2][2] = {};
+         int64_t n_pred_calls  = 0; // remap calls that acted on a prediction of the next layer (3a)
+         int64_t n_pred_spec   = 0; // predicted experts queued to read ahead into the host tier
+         int64_t n_ra_calls    = 0; // G2 runahead: remap calls split in two
+@@ -744,9 +786,14 @@ struct llama_moe_stream {
+         int64_t n_ra_invalid  = 0; // calls with no resident slot in the layer: approximate pass not trusted, nothing staged
+         int64_t n_ra_redo     = 0; // experts the second half found evicted and loaded again (expected 0)
+         int64_t t_ra_gap_us   = 0; // time from the end of the first half to the start of the second (the approximate pass)
++        int64_t t_ra_lock_us  = 0; // of that, waiting for mgr->mtx at the start of the second half (G21)
++        int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)
+         int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
+         int64_t n_drop_exp    = 0; // experts not loaded for their call because of it
+         int64_t n_drop_calls  = 0; // remap calls that dropped at least one expert
++        int64_t n_drop_late_exp   = 0; // DROP_LATE: experts not waited for at the wait, still loading there
++        int64_t n_drop_late_pairs = 0; // their pairs
++        int64_t n_drop_late_calls = 0; // calls with at least one
+         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
+ 
+         // wait for a free slot, which t_stall_us cannot see: it starts only once all demand loads
+@@ -772,6 +819,11 @@ struct llama_moe_stream {
+     void worker_loop(int worker_id);
+     int32_t pick_victim_locked(llama_moe_stream_layer & sl, const uint8_t * keep) const;
+     void reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
++    // M12: is some slab of this expert missing from the host tier, so that its load reads the drive? Counts and marks
++    // nothing in the tier (l2::has)
++    bool on_drive_locked(const llama_moe_stream_layer & sl, int32_t expert);
++    // marks the slot RESIDENT and records its delivery time (M12)
++    void slot_resident_locked(llama_moe_stream_layer & sl, int32_t slot);
+     // queues one read per weight tensor and wakes the pool; see the .cpp for why
+     // the split is what raises queue depth on a single stream. stage = onto q_stage instead of q_demand
+     void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage = false);

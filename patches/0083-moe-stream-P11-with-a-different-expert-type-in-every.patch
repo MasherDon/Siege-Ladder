@@ -1,0 +1,69 @@
+From 2bd28b6f7d719448b482783ecba3e299183a6cf9 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:55:33 +0000
+Subject: [PATCH 83/91] moe-stream : P11 with a different expert type in every
+ layer - each weight's pool is sized by its widest layer (one layer holds the
+ pool at a time, so a narrower layer's slots take the front of it); the
+ equal-types test is gone. For the ISTA-DASLab GSQ-RCO builds of 1017
+ (SiegeLadder twenty-third session); uniform builds get the same pool as
+ before
+
+---
+ src/llama-moe-stream.cpp | 21 ++++++++++++---------
+ 1 file changed, 12 insertions(+), 9 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 91aeb77..c6b742a 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -2172,9 +2172,12 @@ bool llama_moe_stream::p11_enter() {
+     const int64_t t0 = ggml_time_us();
+     std::unique_lock<std::mutex> lk(mtx);
+ 
+-    // one pool serves every streamed layer: the same weights in each (types, shapes, bytes per expert), one CUDA buffer
+-    // type, skipping waves, no JigSaw pins. P1's start-up probe comes here before the context attaches its backend
+-    // (attach_backend is the constructor's last step): no uploads then, and no slot events to extend
++    // one pool serves every streamed layer: the same weights in each, one CUDA buffer type, skipping waves, no JigSaw
++    // pins. P1's start-up probe comes here before the context attaches its backend (attach_backend is the constructor's
++    // last step): no uploads then, and no slot events to extend. The layers' expert types may differ (SiegeLadder
++    // 24.10: the ISTA-DASLab builds give each layer its own): one layer holds the pool at a time (its first wave waits
++    // for every load and the compute stream), so each weight's pool is sized by its widest layer and a narrower layer's
++    // slots, laid out with its own stride, take the front of it
+     const llama_moe_stream_layer * ref = nullptr;
+     for (const auto & sl : layers) {
+         if (sl) {
+@@ -2193,6 +2196,7 @@ bool llama_moe_stream::p11_enter() {
+                p11_slots >= ref->n_expert) {
+         why = "the pool must hold at least the per-layer cache and fewer slots than a layer has experts";
+     }
++    std::vector<const ggml_tensor *> widest; // per weight: the layers' cache tensor with the most bytes per slot
+     for (const auto & sl : layers) {
+         if (why != nullptr || !sl) {
+             continue;
+@@ -2201,12 +2205,11 @@ bool llama_moe_stream::p11_enter() {
+             why = "the layers' caches differ";
+             continue;
+         }
++        widest.resize(sl->weights.size(), nullptr);
+         for (size_t w = 0; w < sl->weights.size(); w++) {
+             const ggml_tensor * a = sl->weights[w].cache;
+-            const ggml_tensor * b = ref->weights[w].cache;
+-            if (a->type != b->type || a->ne[0] != b->ne[0] || a->ne[1] != b->ne[1] ||
+-                    sl->weights[w].nb_expert != ref->weights[w].nb_expert) {
+-                why = "the layers' expert tensors differ";
++            if (widest[w] == nullptr || a->nb[2] > widest[w]->nb[2]) {
++                widest[w] = a;
+             }
+         }
+     }
+@@ -2231,8 +2234,8 @@ bool llama_moe_stream::p11_enter() {
+     };
+     p11_ctx.reset(ggml_init(params));
+     std::vector<ggml_tensor *> pool;
+-    for (const auto & wt : ref->weights) {
+-        ggml_tensor * t = ggml_new_tensor_3d(p11_ctx.get(), wt.cache->type, wt.cache->ne[0], wt.cache->ne[1], P);
++    for (const ggml_tensor * c : widest) {
++        ggml_tensor * t = ggml_new_tensor_3d(p11_ctx.get(), c->type, c->ne[0], c->ne[1], P);
+         ggml_format_name(t, "p11_pool.%d", (int) pool.size());
+         pool.push_back(t);
+     }

@@ -1,0 +1,572 @@
+From 70fc66d4cc2abeced10ea48e5e005a10c6db142d Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 16:15:28 +0000
+Subject: [PATCH 58/91] ggml, llama : V4's clamped SwiGLU as one op
+ (GGML_GLU_OP_SWIGLU_LIM), a prefill wave computes only its own pairs
+ (SiegeLadder G8 / P5, on by default)
+
+DeepSeek V4 / V4.1 clamp the experts' up projection to [-limit, limit] and the gate to (-inf, limit] before SwiGLU,
+so the graph ran clamp, clamp, swiglu - three passes over [n_ff, n_used, n_tokens], and the fused gate/up + GLU
+kernels never matched the pattern. In a prefill wave all three ran over the whole ubatch while the wave computes
+only its own pairs (a twelfth of them at P11's waves of 32): SiegeLadder runs.md 4.83 / 4.94 put these passes at
+more than the expert GEMMs at -ub 1536 and at 0.45 of 4.76 s of compute with P11 at 6144. Strata's GU_SWIGLU
+(SiegeLadder runs.md 4.97) pointed at it.
+
+- ggml_swiglu_lim_split(a, b, limit): silu(min(a, limit)) * clamp(b, -limit, limit) in one pass - the same
+  expressions as op_clamp + op_clamp + the gated op_silu kernel, so the result is bitwise the same;
+- ggml_swiglu_lim_split_ids(..., ids, skip_id): rows whose id is skip_id are neither read nor written (their
+  output is undefined, as the gate / up GEMMs' rows of those pairs are; the down GEMM leaves them out the same way);
+- CPU and CUDA kernels (CUDA: element-wise without ids, a block per row with them); test-backend-ops cases
+  (decode and wave shapes, with and without ids - the skipped rows are gathered out before the comparison);
+- llama-graph: the routed experts (with the wave's ids when the wave skips other waves' pairs) and the shared
+  expert of DSV4 / DSV41 (and DFlash with hc) take it; LLAMA_DSV4_SWIGLU_FUSED=0 restores the separate ops.
+
+SiegeLadder (bench/results/p2/swl, o34): decode exact path against the 17.10 KL base PPL 2.0990 (x1.0000), KLD
+0.00000, top-1 100%, and o32's counters to the unit with text = trace; P11 at -ub 6144 on the 30K document: the
+answer's top-20 log-probabilities KL 0.000000 over all 128 positions, document 110.1 -> 103.7 s (-5.8%); test4
+2.2K / 8.9K prompts +1.1% / +2.4% (ABBA), the 30K consultant 269.8 -> 276.5 tok/s; decode within noise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h             | 21 +++++++++
+ ggml/src/ggml-cpu/ggml-cpu.c    |  1 +
+ ggml/src/ggml-cpu/ops.cpp       | 79 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  6 +++
+ ggml/src/ggml-cuda/unary.cu     | 76 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/unary.cuh    | 11 +++++
+ ggml/src/ggml.c                 | 33 +++++++++++++-
+ src/llama-graph.cpp             | 44 +++++++++++++++++-
+ tests/test-backend-ops.cpp      | 78 +++++++++++++++++++++++++++++++-
+ 9 files changed, 344 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d983874..e3854fc 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -629,6 +629,7 @@ extern "C" {
+         GGML_GLU_OP_SWIGLU_OAI,
+         GGML_GLU_OP_GEGLU_ERF,
+         GGML_GLU_OP_GEGLU_QUICK,
++        GGML_GLU_OP_SWIGLU_LIM, // SiegeLadder: silu(min(a, limit)) * clamp(b, -limit, limit), see ggml_swiglu_lim_split
+ 
+         GGML_GLU_OP_COUNT,
+     };
+@@ -1369,6 +1370,26 @@ extern "C" {
+             float                 alpha,
+             float                 limit);
+ 
++    // SiegeLadder: DeepSeek V4's clamped SwiGLU in one pass - silu(min(a, limit)) * clamp(b, -limit, limit), the same
++    // arithmetic as ggml_clamp(b, -limit, limit), ggml_clamp(a, -INFINITY, limit), ggml_swiglu_split(a', b'), without
++    // writing the clamped tensors. a: gate, b: up, both F32 [n, rows...]
++    GGML_API struct ggml_tensor * ggml_swiglu_lim_split(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            float                 limit);
++
++    // ... with the rows of the pairs a mul_mat_id left out skipped: ids (I32 [a->ne[1], a->ne[2]], the ids the expert
++    // GEMMs ran with); a row whose id equals skip_id is neither read nor written (its output is undefined, as the
++    // GEMMs' rows of those pairs are). For prefill waves, which compute only their own pairs of the ubatch
++    GGML_API struct ggml_tensor * ggml_swiglu_lim_split_ids(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            float                 limit,
++            struct ggml_tensor  * ids,
++            int32_t               skip_id);
++
+     // normalize along rows
+     GGML_API struct ggml_tensor * ggml_norm(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 18af0b8..e2bf68b 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2360,6 +2360,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                 case GGML_GLU_OP_SWIGLU_OAI:
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
++                case GGML_GLU_OP_SWIGLU_LIM:
+                     {
+                         n_tasks = n_threads;
+                     } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 42ec809..c7abf04 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -3407,6 +3407,81 @@ static void ggml_compute_forward_swiglu_oai(
+     }
+ }
+ 
++// ggml_compute_forward_swiglu_lim (SiegeLadder): silu(min(a, limit)) * clamp(b, -limit, limit); with src[2] (ids) the
++// rows whose id is skip_id are left alone
++
++static void ggml_compute_forward_swiglu_lim_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids  = dst->src[2];
++
++    GGML_ASSERT(src1 != nullptr);
++    GGML_ASSERT(ggml_is_contiguous_1(src0));
++    GGML_ASSERT(ggml_is_contiguous_1(src1));
++    GGML_ASSERT(ggml_is_contiguous_1(dst));
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t nc = src0->ne[0];
++    const int64_t nr = ggml_nrows(src0);
++
++    GGML_ASSERT(dst->ne[0] == nc);
++    GGML_ASSERT(ggml_nrows(dst) == nr);
++
++    const float   limit   = ggml_get_op_params_f32(dst, 2);
++    const int32_t skip_id = ggml_get_op_params_i32(dst, 3);
++
++    // rows per thread
++    const int64_t dr = (nr + nth - 1)/nth;
++
++    // row range for this thread
++    const int64_t ir0 = dr*ith;
++    const int64_t ir1 = MIN(ir0 + dr, nr);
++
++    for (int64_t ir = ir0; ir < ir1; ir++) {
++        if (ids) {
++            const int64_t i1 = ir % src0->ne[1];
++            const int64_t i2 = ir / src0->ne[1];
++            const int32_t id = *(const int32_t *) ((const char *) ids->data + i1*ids->nb[0] + i2*ids->nb[1]);
++            if (id == skip_id) {
++                continue;
++            }
++        }
++        const float * x = (const float *) ((const char *) src0->data + ir*src0->nb[1]);
++        const float * g = (const float *) ((const char *) src1->data + ir*src1->nb[1]);
++        float       * y = (float       *) ((char       *) dst->data  + ir*dst->nb[1]);
++
++        for (int64_t k = 0; k < nc; k++) {
++            const float a = std::min(x[k], limit);
++            const float b = std::clamp(g[k], -limit, limit);
++            y[k] = a / (1.0f + expf(-a)) * b;
++        }
++    }
++}
++
++static void ggml_compute_forward_swiglu_lim(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++
++    switch (src0->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_swiglu_lim_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_geglu_erf
+ 
+ static void ggml_compute_forward_geglu_erf_f32(
+@@ -10113,6 +10188,10 @@ void ggml_compute_forward_glu(
+             {
+                 ggml_compute_forward_geglu_quick(params, dst);
+             } break;
++        case GGML_GLU_OP_SWIGLU_LIM:
++            {
++                ggml_compute_forward_swiglu_lim(params, dst);
++            } break;
+         default:
+             {
+                 GGML_ABORT("fatal error");
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index baa6690..890199f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2238,6 +2238,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                     ggml_cuda_op_geglu_quick(ctx, dst);
+                     break;
++                case GGML_GLU_OP_SWIGLU_LIM:
++                    ggml_cuda_op_swiglu_lim(ctx, dst);
++                    break;
+                 default:
+                     return false;
+             }
+@@ -4922,6 +4925,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                     return ggml_is_contiguous_1(op->src[0]);
++                case GGML_GLU_OP_SWIGLU_LIM:
++                    return op->src[1] != nullptr && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[0]) &&
++                           ggml_is_contiguous_1(op->src[1]) && (op->src[2] == nullptr || op->src[2]->type == GGML_TYPE_I32);
+                 default:
+                     return false;
+             }
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4cb805f..2d8bd92 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -427,6 +427,82 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     swiglu_oai_cuda(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
+ }
+ 
++// SiegeLadder: swiglu_lim - DeepSeek V4's clamped SwiGLU in one pass (ggml_swiglu_lim_split). Without ids: element-wise
++// like the gated kernels. With ids (ggml_swiglu_lim_split_ids, a prefill wave): one block per row (pair), rows whose id
++// is skip_id return at once - a wave computes only its own pairs instead of the whole ubatch
++
++static __global__ void swiglu_lim_kernel(const float * x, const float * g, float * dst, const int64_t k, const int64_t n,
++        const int64_t o0, const int64_t o1, const float limit) {
++    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
++
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t j0 = (i / n) * o0 + (i % n);
++    const int64_t j1 = (i / n) * o1 + (i % n);
++
++    dst[i] = ggml_cuda_op_swiglu_lim_single(x[j0], g[j1], limit);
++}
++
++static __global__ void swiglu_lim_ids_kernel(const float * x, const float * g, float * dst, const int64_t n,
++        const int64_t o0, const int64_t o1, const int64_t od, const char * ids, const int64_t ne1, const size_t ids_nb0,
++        const size_t ids_nb1, const int32_t skip_id, const float limit) {
++    const int64_t row = blockIdx.x;
++    const int64_t i1  = row % ne1;
++    const int64_t i2  = row / ne1;
++
++    if (*(const int32_t *) (ids + i1*ids_nb0 + i2*ids_nb1) == skip_id) {
++        return;
++    }
++
++    const float * xr = x   + row*o0;
++    const float * gr = g   + row*o1;
++          float * dr = dst + row*od;
++    for (int64_t c = threadIdx.x; c < n; c += blockDim.x) {
++        dr[c] = ggml_cuda_op_swiglu_lim_single(xr[c], gr[c], limit);
++    }
++}
++
++void ggml_cuda_op_swiglu_lim(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    const ggml_tensor * ids  = dst->src[2];
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(src1 != nullptr);
++    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous_1(src1));
++    GGML_ASSERT(src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float));
++    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst));
++
++    const float   limit   = ggml_get_op_params_f32(dst, 2);
++    const int32_t skip_id = ggml_get_op_params_i32(dst, 3);
++
++    const int64_t nc = src0->ne[0];
++    const int64_t o0 = src0->nb[1] / sizeof(float);
++    const int64_t o1 = src1->nb[1] / sizeof(float);
++
++    if (ids == nullptr) {
++        const int64_t k          = ggml_nelements(dst);
++        const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++        swiglu_lim_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
++                (const float *) src0->data, (const float *) src1->data, (float *) dst->data, k, nc, o0, o1, limit);
++        return;
++    }
++
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(ids->ne[0] == src0->ne[1] && ids->ne[1] == src0->ne[2] && src0->ne[3] == 1);
++    const int64_t nr = ggml_nrows(src0);
++    if (nr == 0) {
++        return;
++    }
++    swiglu_lim_ids_kernel<<<(unsigned int) nr, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
++            (const float *) src0->data, (const float *) src1->data, (float *) dst->data, nc, o0, o1, dst->nb[1] / sizeof(float),
++            (const char *) ids->data, src0->ne[1], ids->nb[0], ids->nb[1], skip_id, limit);
++}
++
+ /* CUDA kernel + launcher for xIELU */
+ 
+ template <typename T>
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 81ed873..dde1778 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -87,6 +87,9 @@ void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// SiegeLadder: GGML_GLU_OP_SWIGLU_LIM (ggml_swiglu_lim_split / _ids)
++void ggml_cuda_op_swiglu_lim(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+@@ -112,3 +115,11 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
+     out_glu = out_glu * (1.0f + g);
+     return out_glu;
+ }
++
++// SiegeLadder: the arithmetic of op_clamp(g, -limit, limit), op_clamp(x, -INFINITY, limit), then unary_gated op_silu -
++// the same expressions, so the result is bitwise that of the three separate kernels
++__device__ __forceinline__ float ggml_cuda_op_swiglu_lim_single(float x, float g, float limit) {
++    const float a = fminf(fmaxf(x, -INFINITY), limit);
++    const float b = fminf(fmaxf(g, -limit), limit);
++    return ggml_cuda_op_silu_single(a) * b;
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index bf8ff38..19918a9 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1257,9 +1257,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
+     "SWIGLU_OAI",
+     "GEGLU_ERF",
+     "GEGLU_QUICK",
++    "SWIGLU_LIM",
+ };
+ 
+-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
++static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+ 
+ 
+ static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
+@@ -3123,6 +3124,36 @@ struct ggml_tensor * ggml_swiglu_oai(
+     return result;
+ }
+ 
++// SiegeLadder: op_params [glu op, swapped = 0, limit (f32), skip_id], src[2] - the ids or NULL
++struct ggml_tensor * ggml_swiglu_lim_split(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        float                 limit) {
++    GGML_ASSERT(b != NULL);
++    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_LIM, false);
++    ggml_set_op_params_f32(result, 2, limit);
++    ggml_set_op_params_i32(result, 3, 0);
++
++    return result;
++}
++
++struct ggml_tensor * ggml_swiglu_lim_split_ids(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        float                 limit,
++        struct ggml_tensor  * ids,
++        int32_t               skip_id) {
++    GGML_ASSERT(ids->type == GGML_TYPE_I32);
++    GGML_ASSERT(ids->ne[0] == a->ne[1] && ids->ne[1] == a->ne[2] && a->ne[3] == 1);
++    struct ggml_tensor * result = ggml_swiglu_lim_split(ctx, a, b, limit);
++    ggml_set_op_params_i32(result, 3, skip_id);
++    result->src[2] = ids;
++
++    return result;
++}
++
+ // ggml_norm
+ 
+ static struct ggml_tensor * ggml_norm_impl(
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index e446d05..fb7c59c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1060,6 +1060,19 @@ static bool dsv4_compress_debug() {
+     return debug;
+ }
+ 
++// SiegeLadder G8 / P5 (Strata's GU_SWIGLU, runs.md 4.97): V4's clamped SwiGLU - clamp(up), clamp(gate), swiglu - as one
++// op (ggml_swiglu_lim_split, the same arithmetic, bitwise); in a prefill wave that skips the other waves' pairs, only the
++// wave's own rows (ggml_swiglu_lim_split_ids) - the three passes ran over the whole ubatch in every wave.
++// LLAMA_DSV4_SWIGLU_FUSED=0 - the separate ops of before
++static bool dsv4_swiglu_fused() {
++    static const bool on = []() {
++        const char * env = getenv("LLAMA_DSV4_SWIGLU_FUSED");
++        return env == nullptr || atoi(env) != 0;
++    }();
++
++    return on;
++}
++
+ static void dsv4_set_cand_pin(
+         ggml_tensor * dst,
+         const llama_kv_cache_dsv4_context::comp_plan & plan,
+@@ -2041,10 +2054,19 @@ ggml_tensor * llm_graph_context::build_ffn(
+                     const float limit = hparams.swiglu_clamp_shexp[il];
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
++                        const bool dsv4_glu = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
++                                (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
++                        if (dsv4_glu && dsv4_swiglu_fused()) {
++                            cur = ggml_swiglu_lim_split(ctx0, cur, tmp, limit); // see dsv4_swiglu_fused
++                            cb(cur, "ffn_swiglu_limited", il);
++                            type_gate = LLM_FFN_SEQ;
++                            break;
++                        }
++
+                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+                         cb(tmp, "ffn_up_clamped", il);
+ 
+-                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
++                        if (dsv4_glu) {
+                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                             cb(cur, "ffn_gate_clamped", il);
+                             cur = ggml_swiglu_split(ctx0, cur, tmp);
+@@ -2657,6 +2679,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         cb(cur, "ffn_moe_weighted", il);
+     }
+ 
++    // SiegeLadder: a skipping wave's ids, set around its build_expert_gemms call - V4's fused clamped SwiGLU then computes
++    //   only the wave's own pairs (see dsv4_swiglu_fused)
++    ggml_tensor * glu_wave_ids = nullptr;
++
+     // the expert GEMM pipeline: run once normally, or once per wave under multi-pass prefill;
+     //   biases and per-expert scales are always indexed by the original selected_experts.
+     //   acc: write the down GEMM in place into acc (ggml_mul_mat_id_into; skipped waves only, no bias/scale/LoRA)
+@@ -2723,10 +2749,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     const float limit = hparams.swiglu_clamp_exp[il];
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
++                        const bool dsv4_glu = arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
++                                (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
++                        if (dsv4_glu && dsv4_swiglu_fused()) {
++                            // see dsv4_swiglu_fused; a skipping wave's pairs of other waves keep undefined rows, which the
++                            // down GEMM leaves out exactly as the gate / up GEMMs did
++                            cur = glu_wave_ids != nullptr
++                                    ? ggml_swiglu_lim_split_ids(ctx0, cur, up, limit, glu_wave_ids, LLAMA_MOE_STREAM_SKIP_ID)
++                                    : ggml_swiglu_lim_split(ctx0, cur, up, limit);
++                            cb(cur, "ffn_moe_swiglu_limited", il);
++                            break;
++                        }
++
+                         up = ggml_clamp(ctx0, up, -limit, limit);
+                         cb(up, "ffn_moe_up_clamped", il);
+ 
+-                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
++                        if (dsv4_glu) {
+                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
+                             cb(cur, "ffn_moe_gate_clamped", il);
+                             cur = ggml_swiglu_split(ctx0, cur, up);
+@@ -2831,7 +2869,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             //   output: each pair belongs to exactly one wave, so the waves fill disjoint rows of one tensor
+             //   and need no sum. The sum over the whole ubatch per wave was 25% of the GPU time of a prefill
+             //   at -ub 1024 (SiegeLadder runs.md 4.25). skip_planned is wave_skip, asserted at wave 0.
++            glu_wave_ids = skip_planned ? ids_w : nullptr; // skipped pairs carry LLAMA_MOE_STREAM_SKIP_ID (emit_wave_slots)
+             ggml_tensor * e_w = build_expert_gemms(cur, ids_w, skip_planned && experts != nullptr ? experts : nullptr);
++            glu_wave_ids = nullptr;
+ 
+             if (w == 0) {
+                 // skipping needs the pipeline to end in the down mul_mat_id itself: a bias, scale or
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2c49806..fed6335 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -2183,6 +2183,72 @@ struct test_glu_split : public test_case {
+     }
+ };
+ 
++// SiegeLadder: GGML_GLU_OP_SWIGLU_LIM (ggml_swiglu_lim_split / _ids), a: gate, b: up, [n_ff, n_used, n_tokens]. With ids
++// the rows of skipped pairs are undefined, so the output compared is the gather of the rows that were computed
++struct test_swiglu_lim : public test_case {
++    const std::array<int64_t, 3> ne;
++    const bool with_ids;
++    const float limit;
++
++    std::string vars() override {
++        return VARS_TO_STR3(ne, with_ids, limit);
++    }
++
++    test_swiglu_lim(std::array<int64_t, 3> ne = { 256, 6, 5 }, bool with_ids = false, float limit = 10.0f)
++        : ne(ne), with_ids(with_ids), limit(limit) {}
++
++    // pair r = e + n_used*t is skipped when r % 3 == 1
++    int64_t n_kept() const {
++        int64_t n = 0;
++        for (int64_t r = 0; r < ne[1]*ne[2]; r++) {
++            n += r % 3 != 1;
++        }
++        return n;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
++        ggml_set_name(b, "b");
++
++        if (!with_ids) {
++            ggml_tensor * out = ggml_swiglu_lim_split(ctx, a, b, limit);
++            ggml_set_name(out, "out");
++            return out;
++        }
++
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ne[1], ne[2]);
++        ggml_set_name(ids, "ids");
++        ggml_tensor * all = ggml_swiglu_lim_split_ids(ctx, a, b, limit, ids, INT32_MAX);
++        ggml_set_name(all, "out_all");
++
++        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kept());
++        ggml_set_name(rows, "rows");
++        ggml_tensor * out = ggml_get_rows(ctx, ggml_reshape_2d(ctx, all, ne[0], ne[1]*ne[2]), rows);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                std::vector<int32_t> data;
++                for (int64_t r = 0; r < ne[1]*ne[2]; r++) {
++                    if (strcmp(t->name, "ids") == 0) {
++                        data.push_back(r % 3 == 1 ? INT32_MAX : (int32_t) (r % 7));
++                    } else if (r % 3 != 1) {
++                        data.push_back((int32_t) r);
++                    }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t, -20.0f, 20.0f); // past the limit on both sides
++            }
++        }
++    }
++};
++
+ struct test_swiglu_oai : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne_a;
+@@ -8085,8 +8151,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+         for (int v : {0, 1}) {
+             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
+-                if (op == GGML_GLU_OP_SWIGLU_OAI) {
+-                    // SWIGLU_OAI is handled separately
++                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_LIM) {
++                    // SWIGLU_OAI and SWIGLU_LIM (SiegeLadder) are handled separately
+                     continue;
+                 }
+ 
+@@ -8101,6 +8167,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // SiegeLadder: V4.1's clamped SwiGLU in one op - the routed experts' rows at decode and in a prefill wave, plain and with
++    // a wave's ids (every third pair skipped)
++    for (bool ids : {false, true}) {
++        test_cases.emplace_back(new test_swiglu_lim({ 2304, 6, 1 }, ids, 10.0f));
++        test_cases.emplace_back(new test_swiglu_lim({ 2304, 6, 37 }, ids, 10.0f));
++        test_cases.emplace_back(new test_swiglu_lim({ 128, 3, 5 }, ids, 7.0f));
++    }
++
+     for (int v : {0, 1}) {
+         for (float alpha : {.5f, 1.702f}) {
+             for (float limit : {2.0f, 7.0f}) {

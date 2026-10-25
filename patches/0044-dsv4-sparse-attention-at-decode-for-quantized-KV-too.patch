@@ -1,0 +1,89 @@
+From df824afc8aefad7268ee97d2862a8d38b335849b Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 07:05:34 +0000
+Subject: [PATCH 44/91] dsv4 : sparse attention at decode for quantized KV too
+ (SiegeLadder D11) - with -ctk q8_0 / q4_0 the decode path fell back to dense
+ attention over every compressed position (64K / 128K: 99-105 / 147-152 ms per
+ token outside the load wait, SiegeLadder runs.md 4.71); the picked rows now
+ come out of get_rows in f32 and are quantized back to the cache's type, which
+ restores every block exactly, so FA reads the same K as the dense path minus
+ the masked rows. LLAMA_DSV4_SPARSE_QUANT=0 keeps the dense path for quantized
+ caches. f16 unchanged. Also the drop rule's comments: on by default since
+ 18.10
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |  3 ++-
+ src/llama-moe-stream.cpp |  3 ++-
+ src/models/deepseek4.cpp | 17 ++++++++++++++---
+ 3 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index e1c2792..4965778 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2392,7 +2392,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             cb(ra_mask, "ffn_moe_runahead_mask", il);
+             ggml_build_forward_expand(gf, ra_mask);
+         } else if (drop_path && !weight_before_ffn) {
+-            // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, off by default): the remap also needs this call's
++            // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, on by default since 18.10: 0.14 with DROP_ALL; DROP_W=0 is the
++            // exact path): the remap also needs this call's
+             // routing weights to tell the low-weight experts; the prediction, when there is one, rides along.
+             // Its weight multipliers come out of a second op right after it, on the same host split. C13 the same way
+             ggml_tensor * args[3] = { nullptr, nullptr, nullptr };
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index af83d79..07e9be0 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -3463,7 +3463,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         }
+     }
+ 
+-    // Drop rule (LLAMA_MOE_STREAM_DROP_W; lossy, off by default; see drop_w in the header). An expert held
++    // Drop rule (LLAMA_MOE_STREAM_DROP_W; lossy, on by default since 18.10 - 0.14 with DROP_ALL, DROP_W=0 is the
++    // exact path; see drop_w in the header). An expert held
+     // neither in VRAM nor in the host tier, whose share of its token's routing weight is below the threshold
+     // in every pair it has, is taken out of this call: none of its pairs waits for the drive - they are
+     // mapped onto a kept slot of the same token and multiplied by 0 (llama_moe_stream_drop_mask) - and it is
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 224d67d..e0c4a17 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1203,14 +1203,25 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     // order: its KL against the dense path (0.0007 at 4K context) equals the dense path's own when its K rows
+     // only move inside FlashAttention's tiles (LLAMA_DSV4_DENSE_SHIFT below). On by default;
+     // LLAMA_DSV4_SPARSE_DECODE=0 turns it off.
++    //
++    // Quantized caches (-ctk q8_0 / q4_0) take the same path (SiegeLadder D11; before it they fell back to the dense
++    // one, whose cost grows with the context). get_rows hands the picked rows back in f32 and they are quantized to
++    // the cache's own type again: every block's largest element sits at +-127 (q8_0) or -8 (q4_0), so the block
++    // scale and every quant come back exactly, and FA reads the same K as the dense path minus the masked rows.
++    // LLAMA_DSV4_SPARSE_QUANT=0 sends quantized caches down the dense path as before.
+     static const bool sparse_decode = [] {
+         const char * s = std::getenv("LLAMA_DSV4_SPARSE_DECODE");
+         return s == nullptr || atoi(s) != 0;
+     }();
++    static const bool sparse_quant = [] {
++        const char * s = std::getenv("LLAMA_DSV4_SPARSE_QUANT");
++        return s == nullptr || atoi(s) != 0;
++    }();
++    const bool sparse_kv_type = raw_k->type == csa_k->type && (raw_k->type == GGML_TYPE_F16 ||
++            (sparse_quant && (raw_k->type == GGML_TYPE_Q8_0 || raw_k->type == GGML_TYPE_Q4_0)));
+     const int64_t n_sel = top_k->ne[0];
+     if (sparse_decode && cparams.flash_attn && q->ne[2] == 1 && raw_k->ne[3] == 1 && n_sel < n_csa &&
+-            raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16 &&
+-            csa_k->nb[1] == ggml_row_size(csa_k->type, csa_k->ne[0])) {
++            sparse_kv_type && csa_k->nb[1] == ggml_row_size(csa_k->type, csa_k->ne[0])) {
+         ggml_tensor * idx = ggml_view_1d(ctx0, top_k, n_sel, 0);
+ 
+         // FA with a 512-wide head reads K in strides of 256 rows: pad with zero rows masked by -inf
+@@ -1222,7 +1233,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         if (n_pad > 0) {
+             k_sel = ggml_pad(ctx0, k_sel, 0, (int) n_pad, 0, 0);
+         }
+-        k_sel = ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
++        k_sel = ggml_cast(ctx0, k_sel, raw_k->type);
+         k_sel = ggml_reshape_4d(ctx0, k_sel, csa_k->ne[0], csa_k->ne[1], n_sel + n_pad, 1);
+         ggml_tensor * k_sp = ggml_concat(ctx0, raw_k, k_sel, 2);
+         cb(k_sp, "csa_k_sparse", il);

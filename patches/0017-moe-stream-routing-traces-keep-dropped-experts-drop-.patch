@@ -1,0 +1,108 @@
+From 6c1499c9135ed00fbdc31e76a4c906b09e279d69 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 14:12:54 +0000
+Subject: [PATCH 17/91] moe-stream : routing traces keep dropped experts; drop
+ rule modes to measure a runahead predictor
+
+The trace (LLAMA_MOE_STREAM_TRACE) now records what the router chose, the experts the drop rule took
+out of the call included. Two measurement modes of the drop rule: LLAMA_MOE_STREAM_DROP_VRAM_ONLY=1
+counts every expert off the card as missing, lifts the threshold cap and keeps each token's top pair
+instead ("compute with what the card has"); LLAMA_MOE_STREAM_DROP_ONLY_LAYER=L applies the rule on
+layer L alone.
+
+DeepSeek V4.1-Flash Q2mix, ~3K tokens teacher-forced at -ub 1, routing of the approximate pass against
+the exact one (SiegeLadder runs.md 4.28): with every expert off the card dropped on one layer only, the
+next layers keep 0.89-0.98 of their experts (layers 5 / 15 / 25 / 35); A' predicts 0.68-0.69. Dropped
+on every layer: 0.75 on average, KL 0.20 - not a generation mode, a predictor.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 23 +++++++++++++++++++++--
+ src/llama-moe-stream.h   |  7 +++++++
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 3e16668..7ec85bf 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -519,6 +519,12 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ALL")) {
+         drop_all = std::strtol(p, nullptr, 10) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_VRAM_ONLY")) {
++        drop_vram_only = std::strtol(p, nullptr, 10) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ONLY_LAYER")) {
++        drop_only_layer = atoi(p);
++    }
+     if (drop_w > 0.0f) {
+         LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy): an expert held in neither VRAM nor the host tier with "
+                        "less than %.3f of the routing weight is not waited for%s%s\n", __func__, drop_w,
+@@ -1178,6 +1184,9 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+     if (!spec_trace_path.empty()) {
+         spec_trace.resize((size_t) idx + 1);
+         spec_trace[(size_t) idx] = { sl.il, sl.uniq };
++        // the drop rule took some routed experts out of uniq; the trace keeps what the router chose
++        auto & tr = spec_trace[(size_t) idx].second;
++        tr.insert(tr.end(), sl.dropped.begin(), sl.dropped.end());
+     }
+     if (spec_ahead <= 0) {
+         return;
+@@ -1910,19 +1919,29 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     if (wts != nullptr) {
+         const int64_t k     = a->ne[0];
+         const int64_t n_tok = a->ne[1];
+-        const float   thr   = std::min(mgr->drop_w, 0.99f/(float) k);
++        // VRAM_ONLY (measurement): no cap - every expert off the card may go - but each token's top pair is
++        // kept explicitly below, so every token still has a slot to map its dropped pairs onto
++        const float   thr   = (mgr->drop_only_layer >= 0 && sl->il != mgr->drop_only_layer) ? 0.0f :
++                              mgr->drop_vram_only ? mgr->drop_w : std::min(mgr->drop_w, 0.99f/(float) k);
+         const float * w     = (const float *) wts->data;
+         if (thr > 0.0f) {
+             sl->drop_share.assign(sl->n_expert, 0.0f);
+             for (int64_t t = 0; t < n_tok; t++) {
+                 float s = 0.0f;
++                int64_t j_top = 0;
+                 for (int64_t j = 0; j < k; j++) {
+                     s += w[t*k + j];
++                    if (w[t*k + j] > w[t*k + j_top]) {
++                        j_top = j;
++                    }
+                 }
+                 for (int64_t j = 0; j < k; j++) {
+                     const int32_t e = ids[t*k + j];
+                     sl->drop_share[e] = std::max(sl->drop_share[e], s > 0.0f ? w[t*k + j]/s : 1.0f);
+                 }
++                if (mgr->drop_vram_only) {
++                    sl->drop_share[ids[t*k + j_top]] = INFINITY;
++                }
+             }
+             // only on the drive: held neither in VRAM (resident or loading) nor whole in the host tier. The
+             // host tier's lock nests inside mgr->mtx here; the workers never hold mgr->mtx while they are in
+@@ -1931,7 +1950,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                 if (sl->expert_slot.find(e) != sl->expert_slot.end()) {
+                     return false;
+                 }
+-                if (!mgr->l2) {
++                if (!mgr->l2 || mgr->drop_vram_only) {
+                     return true;
+                 }
+                 for (const auto & wt : sl->weights) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 16c39dc..a2a55a8 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -485,6 +485,13 @@ struct llama_moe_stream {
+     // with one heavy drive miss waits for the drive anyway, and its light ones load in parallel at no extra
+     // time, so dropping them there costs quality and buys nothing.
+     bool    drop_all    = false;
++    // LLAMA_MOE_STREAM_DROP_VRAM_ONLY=1 (measurement, 2026-10-15): an expert counts as missing unless it is on the
++    // card, the threshold is not capped, and each token keeps its top pair - "compute with what the card has",
++    // to see how far an approximate pass's routing drifts from the exact one (runahead as a predictor)
++    bool    drop_vram_only = false;
++    // LLAMA_MOE_STREAM_DROP_ONLY_LAYER=L (measurement): the drop rule acts on layer L alone, so the routing of
++    // L+1 shows the error of ONE approximate layer - what a runahead predictor would see
++    int32_t drop_only_layer = -1;
+     // speculate experts that are in the VRAM cache too (LLAMA_MOE_STREAM_SPEC_VRAM=1); see speculate_locked
+     bool    spec_vram      = false;
+     // the remap protects every slot its call reads before picking a victim (LLAMA_MOE_STREAM_KEEP_FIRST=0: off)

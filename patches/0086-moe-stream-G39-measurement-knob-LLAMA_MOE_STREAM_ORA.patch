@@ -1,0 +1,176 @@
+From e478bbd10566f42ccb2181d23aea3afcc96d70ea Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 04:33:43 +0000
+Subject: [PATCH 86/91] moe-stream : G39 measurement knob
+ LLAMA_MOE_STREAM_ORACLE_FALSE=f - the oracle's staging of a call (VRAM_AHEAD)
+ also stages f wrong experts (floor(f), plus one with the probability of f's
+ fraction, by the ORACLE_RECALL draw) after the call's own, onto q_stage
+ behind every demand load: plausible ones, as a predictor's - used by the
+ target layer's last 8 calls, not by this call, holding no VRAM slot - then
+ any other expert without a slot. Counted in n_stage and n_stage_waste as
+ before, and on their own (n_stage_false, from the drive) in a G39 print_stats
+ line. What a wrong staging costs is measured, not estimated (SiegeLadder
+ twenty-fifth session, theories G39)
+
+---
+ src/llama-moe-stream.cpp | 80 +++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   | 17 ++++++++-
+ 2 files changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 39f7028..6597d3f 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -864,6 +864,15 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE_RECALL")) {
+         oracle_recall = std::min(1.0f, std::max(0.0f, (float) std::strtod(p, nullptr)));
+     }
++    // SiegeLadder G39; see oracle_false in the header
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE_FALSE")) {
++        oracle_false = std::min(16.0f, std::max(0.0f, (float) std::strtod(p, nullptr)));
++        if (oracle_false > 0.0f && vram_ahead <= 0) {
++            LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_ORACLE_FALSE needs the oracle's staging (VRAM_AHEAD); "
++                    "ignored\n", __func__);
++            oracle_false = 0.0f;
++        }
++    }
+     // drop rule; see drop_w in the header. Lossy: it changes the output whenever it fires. On by default (0.14 with
+     // DROP_ALL) since SiegeLadder 18.10; LLAMA_MOE_STREAM_DROP_W=0 is the exact path
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_W")) {
+@@ -3083,10 +3092,69 @@ void llama_moe_stream::stage_ahead_locked(int64_t idx, int32_t il_now) {
+         } else {
+             stage_experts_locked(*layers[il_f], experts.data(), experts.size());
+         }
++        // SiegeLadder G39: the wrong ones after the call's own (see oracle_false in the header)
++        if (oracle_false > 0.0f) {
++            const float   whole = std::floor(oracle_false);
++            const int32_t n_f   = (int32_t) whole + (moe_hash01((uint64_t) j0, 0x39) < oracle_false - whole ? 1 : 0);
++            if (n_f <= 0) {
++                continue;
++            }
++            llama_moe_stream_layer & sf = *layers[il_f];
++            auto wrong_ok = [&](int32_t e) {
++                return e >= 0 && (uint32_t) e < sf.n_expert && !sf.expert_slot.count(e) &&
++                       std::find(experts.begin(), experts.end(), e) == experts.end();
++            };
++            auto by_draw = [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
++                return a.first < b.first || (a.first == b.first && a.second < b.second);
++            };
++            oracle_false_pick.clear();
++            oracle_false_cand.clear();
++            // plausible first: what the layer's last 8 calls used (earlier tokens; a call per layer per token)
++            int32_t n_seen = 0;
++            for (int64_t j = j0 - 1; j >= 0 && j >= j0 - 1024 && n_seen < 8; j--) {
++                if (spec_oracle[(size_t) j].first != il_f) {
++                    continue;
++                }
++                n_seen++;
++                for (const int32_t e : spec_oracle[(size_t) j].second) {
++                    if (wrong_ok(e) && std::none_of(oracle_false_cand.begin(), oracle_false_cand.end(),
++                                [e](const std::pair<float, int32_t> & c) { return c.second == e; })) {
++                        oracle_false_cand.emplace_back(moe_hash01((uint64_t) j0, (uint64_t) e), e);
++                    }
++                }
++            }
++            std::sort(oracle_false_cand.begin(), oracle_false_cand.end(), by_draw);
++            for (const auto & c : oracle_false_cand) {
++                if ((int32_t) oracle_false_pick.size() >= n_f) {
++                    break;
++                }
++                oracle_false_pick.push_back(c.second);
++            }
++            if ((int32_t) oracle_false_pick.size() < n_f) {
++                // then any other expert of the layer that holds no slot, by the draw
++                oracle_false_cand.clear();
++                for (int32_t e = 0; e < (int32_t) sf.n_expert; e++) {
++                    if (wrong_ok(e) && std::find(oracle_false_pick.begin(), oracle_false_pick.end(), e) ==
++                            oracle_false_pick.end()) {
++                        oracle_false_cand.emplace_back(moe_hash01((uint64_t) j0, (uint64_t) e), e);
++                    }
++                }
++                std::sort(oracle_false_cand.begin(), oracle_false_cand.end(), by_draw);
++                for (const auto & c : oracle_false_cand) {
++                    if ((int32_t) oracle_false_pick.size() >= n_f) {
++                        break;
++                    }
++                    oracle_false_pick.push_back(c.second);
++                }
++            }
++            stage_experts_locked(sf, oracle_false_pick.data(), oracle_false_pick.size(), /*add_keep =*/ true,
++                    /*wrong =*/ true);
++        }
+     }
+ }
+ 
+-void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep) {
++void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep,
++        bool wrong) {
+     if (!add_keep) {
+         std::fill(sf.keep.begin(), sf.keep.end(), 0);
+     }
+@@ -3117,6 +3185,10 @@ void llama_moe_stream::stage_experts_locked(llama_moe_stream_layer & sf, const i
+         sf.slot_src[v]    = (from_drive ? 1 : 0) | 2 | 4;
+         sf.keep[v]        = 1;
+         stats.n_stage_drive += from_drive;
++        if (wrong) {
++            stats.n_stage_false++;
++            stats.n_stage_false_drive += from_drive;
++        }
+         enqueue_slot_locked(sf, e, v, /*stage =*/ true);
+         stats.n_stage++;
+     }
+@@ -3397,6 +3469,12 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, pfx, stats.n_stage, vram_ahead, stats.n_stage_ready, stats.n_stage_late, stats.n_stage_skip,
+                 spec_vram ? "; speculating VRAM-resident experts too" : "");
+     }
++    if (oracle_false > 0.0f) {
++        LLAMA_LOG_WARN("%s: %smoe stream: G39 (measurement): ORACLE_FALSE=%.2f - %" PRId64 " of the staged were wrong on "
++                "purpose (%.3f a call), %" PRId64 " of those from the drive\n", __func__, pfx, oracle_false,
++                stats.n_stage_false, stats.n_calls > 0 ? (double) stats.n_stage_false/stats.n_calls : 0.0,
++                stats.n_stage_false_drive);
++    }
+     if (stats.n_pred_calls > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: predicted the next layer on %" PRId64 " calls (top %u into VRAM, top %u read ahead): "
+                 "staged %" PRId64 " experts - %" PRId64 " ready on arrival, %" PRId64 " still loading, %" PRId64 " not asked for, "
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 1bb9c4d..3df07e6 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -854,6 +854,15 @@ struct llama_moe_stream {
+     // that misses an expert misses it on both paths (SiegeLadder theory G17, two layers ahead)
+     float   oracle_recall = 1.0f;
+     std::vector<int32_t> oracle_kept; // scratch of stage_ahead_locked, under mtx
++    // SiegeLadder G39 (LLAMA_MOE_STREAM_ORACLE_FALSE=f, a measurement; theories G39, 25.10): what a wrong staging costs,
++    // measured instead of estimated (runs.md 4.204 priced each at a bus copy on the path). On top of its own experts the
++    // oracle's staging of a call stages f wrong ones - floor(f), plus one more with the probability of f's fraction, by
++    // the same deterministic draw as ORACLE_RECALL - after them, onto q_stage (so behind every demand load). Wrong ones
++    // are plausible, like a predictor's: experts the target layer's last 8 calls used that this call does not and that
++    // hold no VRAM slot, by the draw; if those run out, any other expert of the layer that holds none
++    float   oracle_false  = 0.0f;
++    std::vector<int32_t> oracle_false_pick;                   // scratch of stage_ahead_locked, under mtx
++    std::vector<std::pair<float, int32_t>> oracle_false_cand; // the same
+     // Drop rule (proposed by the user 2026-10-15; lossy, so opt-in and measured by KL first). A step waits
+     // for its slowest miss, and that is often a low-weight expert on the drive. A routed expert held neither
+     // in VRAM nor in the host tier, whose share of the routing weight is below drop_w in every pair it has,
+@@ -1141,6 +1150,9 @@ struct llama_moe_stream {
+         int64_t n_stage_ready_drive = 0;
+         int64_t n_stage_late_drive  = 0;
+         int64_t n_stage_waste_drive = 0;
++        // SiegeLadder G39: of n_stage, the wrong experts ORACLE_FALSE staged on purpose, and of those the ones from the drive
++        int64_t n_stage_false       = 0;
++        int64_t n_stage_false_drive = 0;
+         // M15: VRAM evictions by who took the slot (bind_why), and decode misses on an expert evicted <= 1 / 2-4 /
+         // 5-16 / > 16 tokens before, by who evicted it
+         int64_t n_evict_why[4] = {};
+@@ -1271,8 +1283,9 @@ struct llama_moe_stream {
+     // A4b: reserve slots and queue loads for the experts of calls idx+1..idx+vram_ahead
+     void stage_ahead_locked(int64_t idx, int32_t il_now);
+     // reserve slots of layer sf and queue staged loads for these experts (the body of both staging paths);
+-    // add_keep: protect them on top of the experts a previous staging of the same call protected
+-    void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep = false);
++    // add_keep: protect them on top of the experts a previous staging of the same call protected; wrong: G39's wrong ones
++    void stage_experts_locked(llama_moe_stream_layer & sf, const int32_t * experts, size_t n, bool add_keep = false,
++            bool wrong = false);
+     // 3a: act on the prediction of the next streamed layer after sl_now; pred is [k, n_tok] I32
+     void predict_locked(const llama_moe_stream_layer & sl_now, const int32_t * pred, int64_t k, int64_t n_tok);
+ 

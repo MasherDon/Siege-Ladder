@@ -1,0 +1,735 @@
+From ec62d2c7b5c39cfd8e7ee7939ca9e57a0b36e237 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 09:26:23 +0000
+Subject: [PATCH 46/91] moe-stream : the router's mailbox (SiegeLadder G16,
+ g3-design.md step 1), on by default - at decode the remap's card inputs (the
+ ids, the drop rule's packed input, runahead's prediction) go through pinned
+ host records the card posts into with a new op, GGML_OP_MBOX_POST (CUDA: one
+ block copies the payload, a system-scope fence, then the record's sequence
+ word +1; a CPU version too), and the remap ops read them instead of the
+ scheduler's copy: their CPU split has no card input, so no synchronize and no
+ copy before it, and the shared expert (now built ahead on every path) runs on
+ the card while the host remaps. The host polls the sequence word, flushes the
+ compute stream at once and every ms (ggml_backend_cuda_stream_query, WDDM),
+ and aborts after 30 s; the records need unified addressing (checked with
+ ggml_backend_cuda_host_device_ptr). SiegeLadder runs.md 4.74: text = trace,
+ the deterministic counters equal to the unit; runahead off 12.15 -> 12.90
+ tok/s, exact runahead +3.3%, the drop default +6.2%.
+ LLAMA_MOE_STREAM_MAILBOX=0 - the scheduler's copy
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h             |  10 ++
+ ggml/src/ggml-cpu/ggml-cpu.c    |  16 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  43 ++++++++
+ ggml/src/ggml-cuda/mbox.cu      |  35 +++++++
+ ggml/src/ggml-cuda/mbox.cuh     |   5 +
+ ggml/src/ggml.c                 |  24 ++++-
+ src/llama-graph.cpp             |  85 ++++++++++++++--
+ src/llama-moe-stream.cpp        | 171 ++++++++++++++++++++++++++++++++
+ src/llama-moe-stream.h          |  36 +++++++
+ src/models/deepseek4.cpp        |  15 +++
+ 10 files changed, 429 insertions(+), 11 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/mbox.cu
+ create mode 100644 ggml/src/ggml-cuda/mbox.cuh
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index cbd8fb8..80f9b73 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -574,6 +574,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_MBOX_POST,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2649,6 +2650,15 @@ extern "C" {
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // SiegeLadder G16, a mailbox: posts a's bytes into the host-visible record rec - pinned host memory the device
++    // reaches through unified addressing - at rec + 64, then bumps the 32-bit sequence word at rec (after a
++    // system-scope fence, so a host that sees the new sequence sees the payload). The result is a 1-element I32
++    // tensor to expand; its value is unspecified. a must be contiguous, its size a multiple of 4 bytes.
++    GGML_API struct ggml_tensor * ggml_mbox_post(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            void                * rec);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 491316f..4be716e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2076,6 +2076,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_MBOX_POST:
++            {
++                // SiegeLadder G16 on the CPU: the payload, a release fence, then the sequence word
++                if (params->ith == 0) {
++                    void * rec;
++                    memcpy(&rec, tensor->op_params, sizeof(rec));
++                    memcpy((char *) rec + 64, tensor->src[0]->data, ggml_nbytes(tensor->src[0]));
++                    atomic_thread_fence(memory_order_release);
++                    volatile uint32_t * seq = (volatile uint32_t *) rec;
++                    *seq = *seq + 1;
++                }
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2262,6 +2274,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_MBOX_POST:
++            {
++                n_tasks = 1;
++            } break;
+         case GGML_OP_REPEAT:
+         case GGML_OP_REPEAT_BACK:
+         case GGML_OP_LEAKY_RELU:
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ce7ebcd..8c7994c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -59,6 +59,7 @@
+ #include "ggml-cuda/gla.cuh"
+ #include "ggml-cuda/gated_delta_net.cuh"
+ #include "ggml-cuda/dsv4-hc.cuh"
++#include "ggml-cuda/mbox.cuh"
+ #include "ggml-cuda/set.cuh"
+ #include "ggml-cuda/set-rows.cuh"
+ #include "ggml-cuda/pad_reflect_1d.cuh"
+@@ -2408,6 +2409,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_DSV4_HC_POST:
+             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+             break;
++        case GGML_OP_MBOX_POST:
++            ggml_cuda_op_mbox_post(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -4607,6 +4611,37 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
+     }
+ }
+ 
++// SiegeLadder G16: a non-blocking query of the backend's stream. Under WDDM queued work may sit in the command
++// buffer until some call flushes it; a host thread polling a mailbox the GPU has not reached yet calls this.
++// Returns 1 when the stream is idle, 0 while work is pending, -1 on an error (cleared).
++int ggml_backend_cuda_stream_query(ggml_backend_t backend) {
++    if (!ggml_backend_is_cuda(backend)) {
++        return -1;
++    }
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    const cudaError_t err = cudaStreamQuery(cuda_ctx->stream());
++    if (err == cudaSuccess) {
++        return 1;
++    }
++    if (err == cudaErrorNotReady) {
++        (void) cudaGetLastError();
++        return 0;
++    }
++    (void) cudaGetLastError();
++    return -1;
++}
++
++// SiegeLadder G16: the device address of pinned host memory (cudaHostGetDevicePointer), or nullptr. Under unified
++// addressing it is the host address itself - the mailbox records rely on that.
++void * ggml_backend_cuda_host_device_ptr(void * host) {
++    void * dev = nullptr;
++    if (cudaHostGetDevicePointer(&dev, host, 0) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return nullptr;
++    }
++    return dev;
++}
++
+ size_t ggml_backend_cuda_trim(ggml_backend_t backend) {
+     if (!ggml_backend_is_cuda(backend)) {
+         return 0;
+@@ -5248,6 +5283,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_DSV4_HC_PRE:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_MBOX_POST:
++            return ggml_is_contiguous(op->src[0]) && ggml_nbytes(op->src[0]) % 4 == 0;
+         case GGML_OP_DSV4_HC_POST:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+@@ -5449,6 +5486,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_cuda_trim") == 0) {
+         return (void *)ggml_backend_cuda_trim;
+     }
++    if (strcmp(name, "ggml_backend_cuda_stream_query") == 0) {
++        return (void *)ggml_backend_cuda_stream_query;
++    }
++    if (strcmp(name, "ggml_backend_cuda_host_device_ptr") == 0) {
++        return (void *)ggml_backend_cuda_host_device_ptr;
++    }
+     return nullptr;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mbox.cu b/ggml/src/ggml-cuda/mbox.cu
+new file mode 100644
+index 0000000..d96ec9e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mbox.cu
+@@ -0,0 +1,35 @@
++#include "mbox.cuh"
++
++// SiegeLadder G16, the router's mailbox. One block copies the payload (32-bit words, a few KB at most) into the record
++// in pinned host memory - the device reaches it through unified addressing - then a system-scope fence makes those
++// writes visible before thread 0 bumps the sequence word at the record's head. The host polls that word; once it has
++// moved, the payload is there. An increment, not a value fixed at capture, so every replay of a CUDA graph posts anew.
++static __global__ void k_mbox_post(const uint32_t * __restrict__ src, uint32_t * dst, const int n_words,
++        volatile uint32_t * seq) {
++    ggml_cuda_pdl_sync(); // the producer of src (top-k, the packed weights) must be done
++
++    for (int i = threadIdx.x; i < n_words; i += blockDim.x) {
++        dst[i] = src[i];
++    }
++    __threadfence_system();
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        *seq = *seq + 1u;
++        __threadfence_system();
++    }
++}
++
++void ggml_cuda_op_mbox_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * a = dst->src[0];
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_nbytes(a) % 4 == 0);
++
++    void * rec;
++    memcpy(&rec, dst->op_params, sizeof(rec));
++    GGML_ASSERT(rec != nullptr);
++
++    const int n_words = (int) (ggml_nbytes(a) / 4);
++    k_mbox_post<<<1, 256, 0, ctx.stream()>>>((const uint32_t *) a->data, (uint32_t *) ((char *) rec + 64), n_words,
++            (volatile uint32_t *) rec);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/mbox.cuh b/ggml/src/ggml-cuda/mbox.cuh
+new file mode 100644
+index 0000000..aa41e19
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mbox.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++#include "ggml.h"
++
++// SiegeLadder G16: ggml_mbox_post - the payload into a host-visible record, then its sequence word
++void ggml_cuda_op_mbox_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9d1fc0c..0e81eb1 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1083,6 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "MBOX_POST",
+ 
+     "UNARY",
+ 
+@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1198,6 +1199,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "mbox_post(x)",
+ 
+     "unary(x)",
+ 
+@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6503,6 +6505,24 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++// SiegeLadder G16: the record pointer rides in op_params; the payload starts 64 bytes into the record
++struct ggml_tensor * ggml_mbox_post(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        void                * rec) {
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_nbytes(a) % 4 == 0);
++    GGML_ASSERT(rec != NULL);
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
++    ggml_set_op_params(result, &rec, sizeof(rec));
++
++    result->op     = GGML_OP_MBOX_POST;
++    result->src[0] = a;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 4965778..cdb4824 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2350,6 +2350,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             msl->subst_norm = norm_w;
+         }
+         drop_path = msl->mgr->drop_w > 0.0f || c13;
++        // SiegeLadder G16 (on by default; LLAMA_MOE_STREAM_MAILBOX=0 - off): at decode the remap's card inputs go through the layer's
++        // mailbox records (ggml_mbox_post), its CPU split gets none, and the shared expert, built before by the
++        // model, is expanded right after the post - the card computes it while the host remaps. The drop rule's
++        // ids and weights must ride packed (one record)
++        msl->mb_on = msl->mgr->mailbox && msl->mgr->compute_backend != nullptr && msl->mb_rec[0] != nullptr &&
++                n_tokens == 1 && (!drop_path || drop_pack || c13);
++        msl->mb_ne[1][0] = 0;
+         auto add_ids_weights = [&](ggml_tensor ** args, int & n_args) {
+             ggml_tensor * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+             if (drop_pack || c13) {
+@@ -2369,6 +2376,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 args[n_args++] = w;
+             }
+         };
++        auto mb_post = [&](int k, ggml_tensor * t) {
++            t = ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t);
++            GGML_ASSERT(ggml_nbytes(t) + 64 <= LLAMA_MOE_STREAM_MB_REC_BYTES && "G16: the post outgrows its record");
++            msl->mb_type[k] = t->type;
++            for (int i = 0; i < GGML_MAX_DIMS; i++) {
++                msl->mb_ne[k][i] = t->ne[i];
++            }
++            ggml_build_forward_expand(gf, ggml_mbox_post(ctx0, t, msl->mb_rec[k]));
++        };
++        auto mb_shexp = [&]() {
++            if (msl->graph_shexp != nullptr) {
++                ggml_build_forward_expand(gf, msl->graph_shexp);
++            }
++        };
+         if (moe_runahead && msl->mgr->runahead_k > 0 && n_tokens == 1 && !weight_before_ffn && pred_next == nullptr &&
+                 n_expert_used == (int64_t) hparams.n_expert_used) {
+             // the remap in two halves: the first queues the call's loads and returns at once with the slots of its
+@@ -2383,8 +2404,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             } else {
+                 iargs[n_iargs++] = ids_cont;
+             }
+-            ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, iargs, n_iargs,
+-                    llama_moe_stream_remap_issue, 1, msl);
++            if (msl->mb_on) {
++                mb_post(0, iargs[0]);
++                mb_shexp();
++                ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, nullptr, 0,
++                        llama_moe_stream_remap_issue_mb, 1, msl);
++            } else {
++                ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, iargs, n_iargs,
++                        llama_moe_stream_remap_issue, 1, msl);
++            }
+             cb(ra_ids, "ffn_moe_topk_issue", il);
+             ggml_build_forward_expand(gf, ra_ids);
+             ra_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ids_cont->ne[0], ids_cont->ne[1], 1, &ra_ids, 1,
+@@ -2402,8 +2430,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             if (pred_next != nullptr) {
+                 args[n_args++] = ggml_cont(ctx0, pred_next);
+             }
+-            ids_gemm  = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, args, n_args,
+-                    llama_moe_stream_remap_v, 1, msl);
++            if (msl->mb_on) {
++                mb_post(0, args[0]);
++                if (pred_next != nullptr) {
++                    mb_post(1, args[n_args - 1]);
++                }
++                mb_shexp();
++                ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, nullptr, 0,
++                        llama_moe_stream_remap_v_mb, 1, msl);
++            } else {
++                ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, args, n_args,
++                        llama_moe_stream_remap_v, 1, msl);
++            }
+             drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ids_cont->ne[0], ids_cont->ne[1], 1, &ids_gemm, 1,
+                     llama_moe_stream_drop_mask, 1, msl);
+             cb(drop_mask, "ffn_moe_drop_mask", il);
+@@ -2419,10 +2457,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             }
+         } else if (pred_next != nullptr) {
+             // the prediction rides to the host with this layer's ids: same op, same sync
+-            ids_gemm = ggml_map_custom2(ctx0, ids_cont, ggml_cont(ctx0, pred_next), llama_moe_stream_remap_pred, 1, msl);
++            if (msl->mb_on) {
++                mb_post(0, ids_cont);
++                mb_post(1, pred_next);
++                mb_shexp();
++                ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, nullptr, 0,
++                        llama_moe_stream_remap_mb, 1, msl);
++            } else {
++                ids_gemm = ggml_map_custom2(ctx0, ids_cont, ggml_cont(ctx0, pred_next), llama_moe_stream_remap_pred, 1, msl);
++            }
+         } else {
+-            ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
++            if (msl->mb_on) {
++                mb_post(0, ids_cont);
++                mb_shexp();
++                ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, nullptr, 0,
++                        llama_moe_stream_remap_mb, 1, msl);
++            } else {
++                ids_gemm = ggml_map_custom1(ctx0, ids_cont, llama_moe_stream_remap, 1, msl);
++            }
+         }
++        msl->graph_shexp = nullptr; // graph build only, consumed
+         if (ra_ids == nullptr) {
+             cb(ids_gemm, "ffn_moe_topk_stream", il); // runahead: the second half, built below, is the stream's ids
+         }
+@@ -2683,9 +2737,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                 }
+             }
+             GGML_ASSERT(pred != nullptr && pred->type == GGML_TYPE_I32 && pred->ne[1] == n_tokens);
+-            ggml_tensor * wargs[2] = { ra_ids, ggml_cont(ctx0, pred) };
+-            ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, wargs, 2,
+-                    llama_moe_stream_remap_wait, 1, msl);
++            if (msl->mb_on) {
++                // G16: the prediction through record [1]; the first half's output is a CPU tensor already
++                ggml_tensor * pc = ggml_cont(ctx0, pred);
++                msl->mb_type[1] = pc->type;
++                for (int i = 0; i < GGML_MAX_DIMS; i++) {
++                    msl->mb_ne[1][i] = pc->ne[i];
++                }
++                GGML_ASSERT(ggml_nbytes(pc) + 64 <= LLAMA_MOE_STREAM_MB_REC_BYTES);
++                ggml_build_forward_expand(gf, ggml_mbox_post(ctx0, pc, msl->mb_rec[1]));
++                ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, &ra_ids, 1,
++                        llama_moe_stream_remap_wait_mb, 1, msl);
++            } else {
++                ggml_tensor * wargs[2] = { ra_ids, ggml_cont(ctx0, pred) };
++                ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, wargs, 2,
++                        llama_moe_stream_remap_wait, 1, msl);
++            }
+             cb(ids_gemm, "ffn_moe_topk_stream", il);
+             if (drop_path) {
+                 // the drop rule's multipliers for the exact path, decided by the first half (and by the late drop at
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 5fe53a3..6b3435e 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -16,6 +16,10 @@
+ #include <fstream>
+ #include <sstream>
+ #include <string>
++#include <atomic>
++#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
++#include <immintrin.h> // _mm_pause in the G16 mailbox poll
++#endif
+ 
+ #ifdef _WIN32
+ #include <malloc.h>
+@@ -817,6 +821,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_L2_SCAN_MIN")) {
+         scan_min_tokens = std::max<int64_t>(2, atoll(p));
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_MAILBOX")) {
++        mailbox = atoi(p) != 0; // SiegeLadder G16; the records are made in attach_backend
++    }
+     // the drop rule runs inside runahead's first half when both are asked for (SiegeLadder 17.10, the fast preset);
+     // its VRAM_ONLY / ONLY_LAYER measurement modes stay without runahead: VRAM_ONLY=2 may leave a token no kept pair
+     if (runahead_k > 0 && drop_w > 0.0f && (drop_vram_only != 0 || drop_only_layer >= 0)) {
+@@ -1134,6 +1141,44 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+     LLAMA_LOG_INFO("%s: MoE expert streaming: slab uploads are asynchronous on a stream of their own, "
+             "fenced %s (LLAMA_MOE_STREAM_ASYNC_UPLOAD=0: synchronous per slab)\n", __func__,
+             slot_fence ? "per slot (LLAMA_MOE_STREAM_SLOT_FENCE=0: once per call at the stream's tail)" : "once per call");
++    // SiegeLadder G16: the mailbox records, made once. The card writes them through unified addressing - the pinned
++    // host pointer used as is - so that is checked; and the host's poll needs a way to flush the compute stream
++    if (mailbox && mb_buf == nullptr) {
++        auto * dev_ptr = (void * (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_device_ptr");
++        stream_query   = (int (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stream_query");
++        ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
++        size_t n_layers = 0;
++        for (const auto & sl : layers) {
++            n_layers += sl != nullptr;
++        }
++        const size_t size = n_layers*2*LLAMA_MOE_STREAM_MB_REC_BYTES;
++        if (dev_ptr != nullptr && stream_query != nullptr && hbuft != nullptr && n_layers > 0) {
++            mb_buf = ggml_backend_buft_alloc_buffer(hbuft, size);
++        }
++        char * base = mb_buf != nullptr ? (char *) ggml_backend_buffer_get_base(mb_buf) : nullptr;
++        if (base == nullptr || dev_ptr(base) != (void *) base) {
++            LLAMA_LOG_WARN("%s: MoE mailbox (G16) off: %s\n", __func__,
++                    base == nullptr ? "no pinned host buffer" : "the card does not reach pinned memory at its host address");
++            if (mb_buf != nullptr) {
++                ggml_backend_buffer_free(mb_buf);
++                mb_buf = nullptr;
++            }
++            mailbox = false;
++        } else {
++            std::memset(base, 0, size);
++            size_t i = 0;
++            for (auto & sl : layers) {
++                if (sl) {
++                    sl->mb_rec[0]  = base + (i++)*LLAMA_MOE_STREAM_MB_REC_BYTES;
++                    sl->mb_rec[1]  = base + (i++)*LLAMA_MOE_STREAM_MB_REC_BYTES;
++                    sl->mb_seen[0] = 0;
++                    sl->mb_seen[1] = 0;
++                }
++            }
++            LLAMA_LOG_INFO("%s: MoE mailbox (G16): at decode the remap reads the router's ids from pinned records "
++                    "(%zu KiB; LLAMA_MOE_STREAM_MAILBOX=0: the scheduler's copy)\n", __func__, size/1024);
++        }
++    }
+ }
+ 
+ void llama_moe_stream::detach_backend(ggml_backend_t backend) {
+@@ -2505,6 +2550,11 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 rg[1][0], rg[1][1], rg[1][2], rg[1][3], rg[2][0], rg[2][1], rg[2][2], rg[2][3],
+                 rg[3][0], rg[3][1], rg[3][2], rg[3][3], rg[0][0], rg[0][1], rg[0][2], rg[0][3]);
+     }
++    if (stats.n_mb_posts > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: G16 mailbox: %" PRId64 " posts read, the host waited %.1f ms for them "
++                "(%.3f ms per post), %" PRId64 " stream flushes\n", __func__, pfx, stats.n_mb_posts,
++                stats.t_mb_wait_us/1e3, stats.t_mb_wait_us/1e3/stats.n_mb_posts, stats.n_mb_flush);
++    }
+     if (stats.n_wait_calls_drive + stats.n_wait_calls_tier > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: decode waits by source: %" PRId64 " calls waited with a drive read in flight, "
+                 "%.1f s (%" PRId64 " of them on a drive read of their own, a miss not staged ahead, %.1f s); %" PRId64
+@@ -4454,3 +4504,124 @@ void llama_moe_stream_wave_mask(ggml_tensor * dst, int ith, int nth, void * user
+         out[i] = sl->expert_wave[ids[i]] == (uint8_t) w ? 1.0f : 0.0f;
+     }
+ }
++
++// ------------------------------------------------------------------------------------------------------------------
++// SiegeLadder G16, the router's mailbox (theories G16, g3-design.md step 1). The card posts the remap's inputs into a
++// pinned record (ggml_mbox_post: the payload, a system-scope fence, then the sequence word +1); the remap's CPU split
++// has no card input, so the scheduler neither synchronizes nor copies before it, and the card goes on - the shared
++// expert - while the host remaps. The host polls the sequence word. Under WDDM the queued card work may sit in the
++// command buffer until some call flushes it, so the poll flushes the compute stream at once and every millisecond.
++
++static void moe_mb_wait(llama_moe_stream & mgr, llama_moe_stream_layer & sl, int k) {
++    volatile uint32_t * seq  = (volatile uint32_t *) sl.mb_rec[k];
++    const uint32_t      want = sl.mb_seen[k] + 1u;
++    if ((int32_t) (*seq - want) < 0) {
++        const int64_t t0      = ggml_time_us();
++        int64_t       t_flush = t0;
++        if (mgr.stream_query != nullptr && mgr.compute_backend != nullptr) {
++            mgr.stream_query(mgr.compute_backend);
++            mgr.stats.n_mb_flush++;
++        }
++        while ((int32_t) (*seq - want) < 0) {
++            const int64_t now = ggml_time_us();
++            if (now - t_flush > 1000 && mgr.stream_query != nullptr && mgr.compute_backend != nullptr) {
++                mgr.stream_query(mgr.compute_backend);
++                mgr.stats.n_mb_flush++;
++                t_flush = now;
++            }
++            if (now - t0 > 30*1000*1000) {
++                GGML_ABORT("MoE mailbox (G16): layer %d, record %d: post %u never came (the record holds %u)",
++                        sl.il, k, want, *seq);
++            }
++#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
++            _mm_pause();
++#endif
++        }
++        mgr.stats.t_mb_wait_us += ggml_time_us() - t0;
++    }
++    std::atomic_thread_fence(std::memory_order_acquire);
++    sl.mb_seen[k] = want;
++    mgr.stats.n_mb_posts++;
++}
++
++// a tensor header over record k's payload, shaped like the tensor the graph posted
++static ggml_tensor moe_mb_tensor(const llama_moe_stream_layer & sl, int k) {
++    ggml_tensor t;
++    std::memset(&t, 0, sizeof(t));
++    t.type = sl.mb_type[k];
++    for (int i = 0; i < GGML_MAX_DIMS; i++) {
++        t.ne[i] = sl.mb_ne[k][i];
++    }
++    t.nb[0] = ggml_type_size(t.type);
++    for (int i = 1; i < GGML_MAX_DIMS; i++) {
++        t.nb[i] = t.nb[i - 1]*t.ne[i - 1];
++    }
++    t.data = (char *) sl.mb_rec[k] + 64;
++    return t;
++}
++
++void llama_moe_stream_remap_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    GGML_UNUSED(nth);
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    moe_mb_wait(*sl->mgr, *sl, 0);
++    ggml_tensor a = moe_mb_tensor(*sl, 0);
++    ggml_tensor b;
++    const bool pred = sl->mb_ne[1][0] > 0;
++    if (pred) {
++        moe_mb_wait(*sl->mgr, *sl, 1);
++        b = moe_mb_tensor(*sl, 1);
++    }
++    moe_stream_remap_impl(dst, &a, pred ? &b : nullptr, nullptr, userdata);
++}
++
++// the CPU entry points read their inputs from dst->src; a copy of the header with the records in place of them
++void llama_moe_stream_remap_v_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    moe_mb_wait(*sl->mgr, *sl, 0);
++    ggml_tensor in0 = moe_mb_tensor(*sl, 0);
++    ggml_tensor in1;
++    ggml_tensor d2  = *dst;
++    for (auto & s : d2.src) {
++        s = nullptr;
++    }
++    d2.src[0] = &in0;
++    if (sl->mb_ne[1][0] > 0) {
++        moe_mb_wait(*sl->mgr, *sl, 1);
++        in1 = moe_mb_tensor(*sl, 1);
++        d2.src[1] = &in1;
++    }
++    llama_moe_stream_remap_v(&d2, ith, nth, userdata);
++}
++
++void llama_moe_stream_remap_issue_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    moe_mb_wait(*sl->mgr, *sl, 0);
++    ggml_tensor in0 = moe_mb_tensor(*sl, 0);
++    ggml_tensor d2  = *dst;
++    for (auto & s : d2.src) {
++        s = nullptr;
++    }
++    d2.src[0] = &in0;
++    llama_moe_stream_remap_issue(&d2, ith, nth, userdata);
++}
++
++void llama_moe_stream_remap_wait_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
++    if (ith != 0) {
++        return;
++    }
++    auto * sl = (llama_moe_stream_layer *) userdata;
++    moe_mb_wait(*sl->mgr, *sl, 1);
++    ggml_tensor in1 = moe_mb_tensor(*sl, 1);
++    ggml_tensor d2  = *dst;
++    d2.src[1] = &in1; // src[0], the first half's output, is a CPU tensor already
++    llama_moe_stream_remap_wait(&d2, ith, nth, userdata);
++}
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index f909982..7ccd7a8 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -59,6 +59,10 @@ struct llama_moe_stream_wave {
+ };
+ 
+ // per-layer streaming state - also the userdata of the id-remapping custom op
++// SiegeLadder G16, the router's mailbox: the size of one record - the 32-bit sequence word at its head, the payload
++// 64 bytes in (ggml_mbox_post). Two per streamed layer, in pinned host memory
++static constexpr size_t LLAMA_MOE_STREAM_MB_REC_BYTES = 8192;
++
+ struct llama_moe_stream_layer {
+     llama_moe_stream * mgr = nullptr;
+ 
+@@ -77,6 +81,19 @@ struct llama_moe_stream_layer {
+     // between the two halves of the remap with the layer's approximate routed output (the experts resident when the
+     // call came, the others at weight 0) and gets the predicted experts of the next layer, [k, n_tokens] I32.
+     std::function<ggml_tensor * (ggml_tensor * moe_approx)> graph_runahead;
++    // graph build only, the same way (SiegeLadder G16): the layer's shared expert, built before build_moe_ffn, which
++    // expands it right after the router's mailbox post - the card computes it while the host runs the remap
++    ggml_tensor * graph_shexp = nullptr;
++    // SiegeLadder G16 (on by default; LLAMA_MOE_STREAM_MAILBOX=0 - off), the router's mailbox at decode: pinned host records the card posts
++    // into (ggml_mbox_post) and the remap reads instead of the scheduler's copy of a card tensor - so its CPU split
++    // has no card input, and the scheduler neither synchronizes nor copies before it. [0]: the call's ids, or the
++    // drop rule's packed input; [1]: the predicted experts of the next layer (runahead, A'). mb_on / mb_type /
++    // mb_ne: set at graph build (mb_ne[1][0] == 0 - nothing in [1]); mb_seen: the posts consumed, per record
++    void *    mb_rec[2]   = { nullptr, nullptr };
++    bool      mb_on       = false;
++    ggml_type mb_type[2]  = { GGML_TYPE_I32, GGML_TYPE_I32 };
++    int64_t   mb_ne[2][4] = { { 0, 0, 0, 0 }, { 0, 0, 0, 0 } };
++    uint32_t  mb_seen[2]  = { 0, 0 };
+ 
+     // residency state, guarded by mgr->mtx
+     std::vector<int32_t>                 slot_expert;   // [n_slots] expert id or -1
+@@ -791,6 +808,12 @@ struct llama_moe_stream {
+     bool                 async_upload    = true;
+     ggml_backend_t       up_backend      = nullptr; // own stream for the H2D copies of slabs
+     ggml_backend_t       compute_backend = nullptr; // the scheduler's instance of the same device
++    // SiegeLadder G16: the router's mailbox, on by default since 18.10 (runs.md 4.74: text = trace, +3...+6%;
++    // LLAMA_MOE_STREAM_MAILBOX=0 - the scheduler's copy); made in attach_backend - it needs unified addressing;
++    // stream_query flushes the compute stream while the host polls a record (WDDM)
++    bool                  mailbox      = true;
++    ggml_backend_buffer_t mb_buf       = nullptr;
++    int (*stream_query)(ggml_backend_t) = nullptr;
+     ggml_backend_event_t up_fence        = nullptr;
+     uint64_t             up_seq          = 0;  // slab copies enqueued so far        (upload_mtx)
+     // every copy with a seq up to this one is covered by a fence the compute stream was made to wait on (upload_mtx)
+@@ -907,6 +930,10 @@ struct llama_moe_stream {
+         // 5-16 / > 16 tokens before, by who evicted it
+         int64_t n_evict_why[4] = {};
+         int64_t n_regret[4][4] = {};
++        // G16: mailbox posts read, the time the host waited for them, and the stream flushes it made meanwhile
++        int64_t n_mb_posts   = 0;
++        int64_t t_mb_wait_us = 0;
++        int64_t n_mb_flush   = 0;
+         // M12, when a decode call starts to wait (the remap, or runahead's second half): its loads still in flight, by
+         // source (slot_src), and the calls that waited, split by whether any of those loads comes from the drive
+         int64_t n_wait_slots_drive  = 0;
+@@ -1061,6 +1088,15 @@ void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * us
+ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_exact_mask(ggml_tensor * dst, int ith, int nth, void * userdata);
+ 
++// SiegeLadder G16: the same remaps with their card inputs read from the layer's mailbox records - no card input, so
++// no synchronize and no copy before the CPU split. _mb = llama_moe_stream_remap (or _pred, when record [1] is set),
++// _v_mb = _remap_v (the packed input), _issue_mb = _remap_issue, _wait_mb = _remap_wait (its src[0], the first
++// half's output, stays a CPU tensor; the prediction comes from record [1])
++void llama_moe_stream_remap_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_remap_v_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_remap_issue_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
++void llama_moe_stream_remap_wait_mb(ggml_tensor * dst, int ith, int nth, void * userdata);
++
+ // Adds mgr->route_bias to the selection logits of every expert this layer currently holds
+ // (resident or loading), leaving masked-out entries at -inf untouched. Runs before top-k, so it
+ // changes which experts are selected. A bias of 0 copies the input unchanged.
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index e0c4a17..ead4008 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2209,6 +2209,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             };
+         }
+ 
++        // SiegeLadder G16, the router's mailbox at decode: the shared expert is built before the routed experts here
++        // too, and build_moe_ffn expands it right after the post - the card computes it while the host remaps
++        if (mstream != nullptr && mstream->mailbox && n_tokens == 1 && mstream->layer(il) != nullptr &&
++                mstream->layer(il)->mb_rec[0] != nullptr) {
++            if (ffn_shexp == nullptr) {
++                ffn_shexp = build_ffn(cur,
++                        layer.ffn_up_shexp, nullptr, nullptr,
++                        layer.ffn_gate_shexp, nullptr, nullptr,
++                        layer.ffn_down_shexp, nullptr, nullptr,
++                        nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++                cb(ffn_shexp, "ffn_shexp", il);
++            }
++            mstream->layer(il)->graph_shexp = ffn_shexp;
++        }
++
+         ggml_tensor * moe_out = build_moe_ffn(cur,
+                 layer.ffn_gate_inp,
+                 layer.ffn_up_exps,

@@ -1,0 +1,171 @@
+From a840010d2605991d3d67aa3314a4ca5ea68985d7 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 12:38:24 +0000
+Subject: [PATCH 50/91] moe-stream : the I/O pool woken once per remap, with
+ the lock let go first (SiegeLadder G24), on by default - the remap's classify
+ loop called notify_all on the 17 workers for every miss while it held the
+ lock they need to take their items, so the first worker started ~43 us after
+ the remap and the first expert copy ~82 us (Nsight with the new NVTX ranges
+ remap_drop / remap_classify / wake: the loop itself takes 2 us, a notify_all
+ of the pool ~24 us of system call). Now the loop queues its loads without
+ waking (enqueue_slot_locked(..., notify = false)) and, after it, the remap
+ lets the lock go, wakes the pool once and takes the lock back; before any
+ wait for a free slot it wakes the pool first, since that commit may need the
+ loads it just queued. The first worker takes its item ~17 us after the remap
+ starts, the first copy starts ~46 us after; the card's idle between the
+ shared expert and the first copy 1.84 -> 0.73 ms per token. SiegeLadder
+ runs.md 4.79: text = trace and the deterministic counters equal on the exact
+ path; o26 ABBA at the drop default 15.17 -> 15.35 tok/s (+1.2%), the wait for
+ loads -0.75 ms per token. LLAMA_MOE_STREAM_WAKE_ONCE=0 - a wake-up per
+ enqueue under the lock, as before
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 43 ++++++++++++++++++++++++++++++++++++----
+ src/llama-moe-stream.h   |  9 +++++++--
+ 2 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 70faa3a..2f04a0a 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -858,6 +858,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_MBOX_REPLY")) {
+         reply = atoi(p) != 0;   // SiegeLadder G22; its records come with the mailbox's
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_WAKE_ONCE")) {
++        wake_once = atoi(p) != 0; // SiegeLadder G24
++    }
+     // the drop rule runs inside runahead's first half when both are asked for (SiegeLadder 17.10, the fast preset);
+     // its VRAM_ONLY / ONLY_LAYER measurement modes stay without runahead: VRAM_ONLY=2 may leave a token no kept pair
+     if (runahead_k > 0 && drop_w > 0.0f && (drop_vram_only != 0 || drop_only_layer >= 0)) {
+@@ -2131,7 +2134,7 @@ bool llama_moe_stream::on_drive_locked(const llama_moe_stream_layer & sl, int32_
+ // item per expert meant one worker read 2-3 tensors in a for loop, strictly one at
+ // a time, which is the whole reason the drive saw a queue depth of 1.6. One item
+ // per tensor lets that many workers pull in parallel out of the same pool.
+-void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage) {
++void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage, bool notify) {
+     const int32_t n = (int32_t) sl.weights.size();
+     auto & q = stage ? q_stage : q_demand;
+     for (int32_t w = 0; w < n; w++) {
+@@ -2142,7 +2145,11 @@ void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t
+     // notify_all, not notify_one: several items just arrived and one woken worker
+     // would take one and leave the rest queued behind a sleeping pool - exactly the
+     // serialisation this change exists to remove.
+-    cv_work.notify_all();
++    // notify = false (SiegeLadder G24): the caller wakes the pool once for all it queued - the remap's classify
++    // loop, whose every wake-up of 17 workers came while it held the lock they need (26 us of the loop's time)
++    if (notify) {
++        cv_work.notify_all();
++    }
+ }
+ 
+ // "<call> <layer> <e1,e2,...>" per line, in call order. Plain text on purpose: this file is
+@@ -3621,6 +3628,7 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // C13 (LLAMA_MOE_STREAM_SUBST; see subst in the header) decides here too, when the graph sent the scores along
+     // (c13_sel / c13_probs): a heavy expert on the drive is replaced pair by pair rather than waited for. A token's top pair
+     // is heavy, so it is kept or substituted, never dropped: every token still keeps a pair with a slot.
++    moe_nvtx_push("remap_drop", sl->il); // G24: the parts of the remap's work under the lock, before the loads go
+     sl->dropped.clear();
+     sl->drop_thr = 0.0f;
+     sl->subst.clear();
+@@ -3843,7 +3851,10 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         }
+     }
+ 
++    moe_nvtx_pop();
++
+     // classify the touched experts; reserve and enqueue demand loads in deterministic order
++    moe_nvtx_push("remap_classify", sl->il);
+     std::fill(sl->keep.begin(), sl->keep.end(), 0);
+     sl->demand_slots.clear();
+ 
+@@ -3862,6 +3873,11 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     }
+ 
+     bool waited = false;
++    // G24 (on by default; LLAMA_MOE_STREAM_WAKE_ONCE=0 - a wake-up per enqueue, as before): the loop queues its loads
++    // without waking the pool and wakes it once at the end - and before any wait for a free slot, whose commit may
++    // need the very loads queued here
++    bool pending_wake = false;
++    const bool wake_once = mgr->wake_once;
+     for (const int32_t e : sl->uniq) {
+         const auto it = sl->expert_slot.find(e);
+         if (it != sl->expert_slot.end()) {
+@@ -3869,7 +3885,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             const bool loading = sl->slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING;
+             if (loading) {
+                 mgr->want_stage_slot_locked(*sl, s); // stage dispatcher: its deferred copies go now, as demand
+-                mgr->enqueue_slot_locked(*sl, e, s);
++                mgr->enqueue_slot_locked(*sl, e, s, /*stage =*/ false, /*notify =*/ !wake_once);
++                pending_wake = wake_once;
+                 waited = true;
+             }
+             if (sl->slot_staged[s]) {
+@@ -3898,6 +3915,10 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                 // spent waiting for the cache to give a slot back. they call for opposite fixes.
+                 moe_nvtx_range r_victim("victim", sl->il);
+                 const int64_t t0 = ggml_time_us();
++                if (pending_wake) {
++                    mgr->cv_work.notify_all();
++                    pending_wake = false;
++                }
+                 do {
+                     mgr->cv_done.wait(lk);
+                     if (mgr->load_failed) {
+@@ -3915,13 +3936,27 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             mgr->bind_why = 1;
+             mgr->reserve_slot_locked(*sl, e, v);
+             sl->slot_src[v] = (from_drive ? 1 : 0) | 4;
+-            mgr->enqueue_slot_locked(*sl, e, v);
++            mgr->enqueue_slot_locked(*sl, e, v, /*stage =*/ false, /*notify =*/ !wake_once);
++            pending_wake = wake_once;
+             mgr->stats.n_miss++;
+             waited = true;
+             sl->keep[v] = 1;
+             sl->demand_slots.push_back(v);
+         }
+     }
++    moe_nvtx_pop(); // remap_classify
++    if (pending_wake) {
++        // with the lock let go first: the woken workers take their items at once instead of queueing on the lock
++        // until this call reaches its wait; the waking itself (all 17 of the pool) is a system call of its own
++        moe_nvtx_push("wake", sl->il);
++        lk.unlock();
++        mgr->cv_work.notify_all();
++        lk.lock();
++        moe_nvtx_pop();
++        if (mgr->load_failed) {
++            GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
++        }
++    }
+ 
+     // whatever was staged for this call and is still marked was not asked for: a wasted load (3a counts
+     // its misses here; the oracle never has any). Cleared so it cannot be counted again.
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 384a93d..53951e4 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -832,6 +832,9 @@ struct llama_moe_stream {
+     // host's answer (ggml_mbox_read: layer*4 + record*2 + part + 1); the next mailbox wait aborts with it
+     bool                  reply        = true;
+     volatile uint32_t *   rp_err       = nullptr;
++    // SiegeLadder G24 (LLAMA_MOE_STREAM_WAKE_ONCE=0 - a wake-up per enqueue): the remap's classify loop wakes the I/O
++    // pool once for all the loads it queued, not once per miss while it holds the lock the workers need
++    bool                  wake_once    = true;
+     ggml_backend_event_t up_fence        = nullptr;
+     uint64_t             up_seq          = 0;  // slab copies enqueued so far        (upload_mtx)
+     // every copy with a seq up to this one is covered by a fence the compute stream was made to wait on (upload_mtx)
+@@ -1035,8 +1038,10 @@ struct llama_moe_stream {
+     // marks the slot RESIDENT and records its delivery time (M12)
+     void slot_resident_locked(llama_moe_stream_layer & sl, int32_t slot);
+     // queues one read per weight tensor and wakes the pool; see the .cpp for why
+-    // the split is what raises queue depth on a single stream. stage = onto q_stage instead of q_demand
+-    void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage = false);
++    // the split is what raises queue depth on a single stream. stage = onto q_stage instead of q_demand;
++    // notify = false: the caller wakes the pool itself once it has queued everything (G24)
++    void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot, bool stage = false,
++            bool notify = true);
+ 
+     // A4b: reserve slots and queue loads for the experts of calls idx+1..idx+vram_ahead
+     void stage_ahead_locked(int64_t idx, int32_t il_now);

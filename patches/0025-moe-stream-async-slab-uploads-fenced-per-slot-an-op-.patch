@@ -1,0 +1,246 @@
+From f7bf202fef0d9a1d52c96f5f3aba7083c8fb24e8 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:41:16 +0000
+Subject: [PATCH 25/91] moe-stream : async slab uploads fenced per slot - an op
+ waits for the copies into its own slots, not for the upload stream's tail
+
+Every slab copy re-records an event of its cache slot on the upload stream right after the copy. The stream runs its
+copies in order, so the event after a slot's latest copy covers every earlier copy and nothing enqueued after it. An op
+that hands slot ids to the graph (the remap, a prefill wave) makes the compute stream wait on one event: that of its
+slot with the latest copy, when that copy is past what an earlier fence covered. Copies enqueued later (another wave's
+preloads, staging for later calls) are not waited for. L2 pins are released up to the copy the last fence covered, as
+before. LLAMA_MOE_STREAM_SLOT_FENCE=0: the one fence at the stream's tail of b51ac3f.
+
+SiegeLadder runs.md 4.39: prefill waves as with the tail fence (warm runs: 2K 131.4 vs 130.8, 8.9K 166.4 vs 166.3
+tok/s; the -2..-4% of 4.38 was a cold first run of its series). Decode main mode 12.07 / 12.38 vs 12.06 / 12.00 / 12.14
+tok/s, text = trace in every run. The wave path at -ub 512 against kl/k2 gives what the earlier wave fixes gave (mean
+KLD -0.000000, max 5.8e-05, same top 100%).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 98 +++++++++++++++++++++++++++++++++++-----
+ src/llama-moe-stream.h   | 20 +++++++-
+ 2 files changed, 106 insertions(+), 12 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 6844fe7..e10560e 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -595,6 +595,9 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_ASYNC_UPLOAD")) {
+         async_upload = std::strtol(p, nullptr, 10) != 0;
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SLOT_FENCE")) {
++        slot_fence = std::strtol(p, nullptr, 10) != 0;
++    }
+ }
+ 
+ // stop and join the I/O workers before the cache buffers and files they use are destroyed
+@@ -619,6 +622,15 @@ llama_moe_stream::~llama_moe_stream() {
+     if (up_fence) {
+         ggml_backend_event_free(up_fence);
+     }
++    for (auto & sl : layers) {
++        if (sl) {
++            for (ggml_backend_event_t ev : sl->slot_up_event) {
++                if (ev) {
++                    ggml_backend_event_free(ev);
++                }
++            }
++        }
++    }
+     if (up_backend) {
+         ggml_backend_free(up_backend);
+     }
+@@ -680,11 +692,31 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+                 __func__, ggml_backend_name(backend));
+         return;
+     }
++    // per-slot fences: one event per cache slot, made once (a re-attach reuses them). The workers touch them
++    // only while compute_backend is set, which happens below.
++    bool slot_events = slot_fence;
++    for (auto & sl : layers) {
++        if (!slot_events) {
++            break;
++        }
++        if (sl) {
++            sl->slot_up_event.resize(sl->n_slots, nullptr);
++            sl->slot_up_seq  .resize(sl->n_slots, 0);
++            for (ggml_backend_event_t & ev : sl->slot_up_event) {
++                if (ev == nullptr) {
++                    ev = ggml_backend_event_new(dev);
++                }
++                slot_events = slot_events && ev != nullptr;
++            }
++        }
++    }
+     std::lock_guard<std::mutex> lock(mtx);
+     std::lock_guard<std::mutex> up(upload_mtx); // the workers read compute_backend under upload_mtx
+     compute_backend = backend;
++    slot_fence      = slot_events;
+     LLAMA_LOG_INFO("%s: MoE expert streaming: slab uploads are asynchronous on a stream of their own, "
+-            "fenced once per call (LLAMA_MOE_STREAM_ASYNC_UPLOAD=0: synchronous per slab)\n", __func__);
++            "fenced %s (LLAMA_MOE_STREAM_ASYNC_UPLOAD=0: synchronous per slab)\n", __func__,
++            slot_fence ? "per slot (LLAMA_MOE_STREAM_SLOT_FENCE=0: once per call at the stream's tail)" : "once per call");
+ }
+ 
+ void llama_moe_stream::detach_backend(ggml_backend_t backend) {
+@@ -716,7 +748,38 @@ void llama_moe_stream::fence_locked() {
+     }
+     ggml_backend_event_record(up_fence, up_backend);
+     ggml_backend_event_wait(compute_backend, up_fence);
+-    up_fenced = up_seq;
++    up_fenced    = up_seq;
++    up_fenced_ev = up_fence;
++    n_up_fences++;
++}
++
++void llama_moe_stream::fence_slots_locked(llama_moe_stream_layer & sl, const int32_t * slots, size_t n) {
++    if (compute_backend == nullptr) {
++        return;
++    }
++    if (!slot_fence || sl.slot_up_event.size() != sl.n_slots) {
++        fence_locked(); // (a layer made after attach_backend has no slot events; none is today)
++        return;
++    }
++    std::lock_guard<std::mutex> up(upload_mtx);
++    // The stream runs its copies in order: the event after the latest copy into any of these slots completes only
++    // after every earlier copy, theirs included, and waits for nothing enqueued after it. A slot whose latest copy
++    // an earlier fence already covered needs nothing.
++    uint64_t best      = up_fenced;
++    int32_t  best_slot = -1;
++    for (size_t i = 0; i < n; i++) {
++        const int32_t s = slots[i];
++        if (s >= 0 && (uint32_t) s < sl.n_slots && sl.slot_up_seq[s] > best) {
++            best      = sl.slot_up_seq[s];
++            best_slot = s;
++        }
++    }
++    if (best_slot < 0) {
++        return;
++    }
++    ggml_backend_event_wait(compute_backend, sl.slot_up_event[best_slot]);
++    up_fenced    = best;
++    up_fenced_ev = sl.slot_up_event[best_slot];
+     n_up_fences++;
+ }
+ 
+@@ -731,9 +794,13 @@ void llama_moe_stream::drain_l2_locked() {
+     if (up_l2_pending.empty()) {
+         return;
+     }
+-    // Belt and braces: the fence's latest record is exactly up_fenced (both change under upload_mtx), so this
+-    // returns at once when the argument above holds, and keeps the release independent of scheduler internals.
+-    ggml_backend_event_synchronize(up_fence);
++    // Belt and braces: the last fence's event was recorded right after copy up_fenced (both change under
++    // upload_mtx), so this returns at once when the argument above holds, and keeps the release independent of
++    // scheduler internals. A slot event is re-recorded only by a new copy into that slot, which needs a new
++    // reservation of it, and none comes between a fence and the next op's drain.
++    if (up_fenced_ev != nullptr) {
++        ggml_backend_event_synchronize(up_fenced_ev);
++    }
+     size_t keep = 0;
+     for (size_t i = 0; i < up_l2_pending.size(); i++) {
+         if (up_l2_pending[i].first <= up_fenced) {
+@@ -1146,6 +1213,11 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                             ggml_backend_synchronize(up_backend);
+                         }
+                         const uint64_t seq = ++up_seq;
++                        if (slot_fence && (size_t) w.slot < sl.slot_up_event.size()) {
++                            // the slot's event now follows its latest copy on the in-order stream
++                            ggml_backend_event_record(sl.slot_up_event[w.slot], up_backend);
++                            sl.slot_up_seq[w.slot] = seq;
++                        }
+                         if (filled_slot != SIZE_MAX) {
+                             l2->commit_pinned(filled_slot, filled_head);
+                             up_l2_pending.emplace_back(seq, filled_slot);
+@@ -1744,7 +1816,8 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 l2->wait_loading ? "" : " - waiting OFF (LLAMA_MOE_STREAM_L2_WAIT=0)");
+     }
+     LLAMA_LOG_WARN("%s: %smoe stream: slab uploads %s: %" PRIu64 " enqueued, %" PRId64 " fences\n", __func__, pfx,
+-            compute_backend != nullptr ? "asynchronous" : "synchronous per slab", up_seq, n_up_fences);
++            compute_backend == nullptr ? "synchronous per slab" :
++            slot_fence ? "asynchronous, fenced per slot" : "asynchronous, fenced at the stream's tail", up_seq, n_up_fences);
+     if (stats.n_wave_calls > 0) {
+         LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms, skipping = %" PRId64 "\n",
+                 __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0, stats.n_waves_skip);
+@@ -2380,10 +2453,6 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         mgr->stats.t_stall_us += ggml_time_us() - t0;
+     }
+ 
+-    // async_upload: every slot this call uses is at least enqueued (a hit may have been staged after the
+-    // last fence, so this runs whether the call waited or not); the expert GEMMs wait on the device
+-    mgr->fence_locked();
+-
+     for (int64_t i = 0; i < n; i++) {
+         if (sl->touched[ids[i]] == 2) {
+             out[i] = -1; // dropped: given a kept slot of its token below
+@@ -2422,6 +2491,11 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             GGML_ASSERT(out[i] >= 0);
+         }
+     }
++
++    // async_upload: every slot this call hands out is at least enqueued (a hit may have been staged after the
++    // last fence, so this runs whether the call waited or not); the expert GEMMs wait on the device for the
++    // copies into these slots, and not for copies enqueued after them (staging for later calls)
++    mgr->fence_slots_locked(*sl, out, (size_t) n);
+ }
+ 
+ // stable per-wave userdata; grows lazily and records the per-wave expert capacity (set at build)
+@@ -2701,7 +2775,9 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+ 
+     mgr->emit_wave_slots(*sl, ids, out, w, n_ids, a->ne[1]);
+ 
+-    mgr->fence_locked(); // async_upload: this wave's GEMMs wait on the device for its enqueued slabs
++    // async_upload: this wave's GEMMs wait on the device for the copies into the slots they read (its own and
++    // the borrowed parking ones), and not for the next wave's preloads enqueued meanwhile
++    mgr->fence_slots_locked(*sl, sl->plan_pool.data(), sl->plan_pool.size());
+ }
+ 
+ // multi-pass prefill: 1.0 for pairs whose expert belongs to wave w, 0.0 otherwise; multiplied into
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 797535c..2047fc4 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -116,6 +116,11 @@ struct llama_moe_stream_layer {
+     // finds it, and by any new reservation of the slot
+     std::vector<uint8_t> slot_staged;
+     std::vector<int32_t> demand_slots; // slots the current call waits on
++    // async_upload with per-slot fences (guarded by mgr->upload_mtx, not mgr->mtx): an event recorded on the
++    // upload stream right after every slab copy into the slot, and that copy's sequence number - see
++    // llama_moe_stream::fence_slots_locked
++    std::vector<ggml_backend_event_t> slot_up_event; // [n_slots], made by attach_backend
++    std::vector<uint64_t>             slot_up_seq;   // [n_slots]
+     // drop rule (LLAMA_MOE_STREAM_DROP_W): the weight multiplier of each [n_expert_used, n_tokens] pair of
+     // the current call - 0 for a dropped pair, 1 (or the renormalising factor) for the rest - written by
+     // the remap and copied out by llama_moe_stream_drop_mask; the experts dropped; per-expert scratch
+@@ -569,15 +574,28 @@ struct llama_moe_stream {
+     ggml_backend_t       compute_backend = nullptr; // the scheduler's instance of the same device
+     ggml_backend_event_t up_fence        = nullptr;
+     uint64_t             up_seq          = 0;  // slab copies enqueued so far        (upload_mtx)
+-    uint64_t             up_fenced       = 0;  // copies covered by the last fence   (upload_mtx)
++    // every copy with a seq up to this one is covered by a fence the compute stream was made to wait on (upload_mtx)
++    uint64_t             up_fenced       = 0;
++    ggml_backend_event_t up_fenced_ev    = nullptr; // the event that fence waited on (upload_mtx)
+     std::vector<std::pair<uint64_t, size_t>> up_l2_pending; // (copy seq, L2 slot) still read by a copy (upload_mtx)
+     int64_t              n_up_fences     = 0;
+ 
++    // Per-slot fences (SiegeLadder 17.10; LLAMA_MOE_STREAM_SLOT_FENCE=0 keeps the one fence at the stream's
++    // tail). The tail fence made a prefill wave's GEMMs wait for the next wave's preload copies enqueued before
++    // it, copies the synchronous path ran next to the wave's compute: prefill lost 2-4% (runs.md 4.38). The
++    // upload stream runs its copies in order, so the event recorded right after a slot's latest copy covers
++    // every earlier copy and nothing enqueued after it: an op waits on that event of its slot with the latest
++    // copy - one wait per op - and later copies (another wave's preloads, staging for later calls) go on.
++    bool                 slot_fence      = true;
++
+     // called by the context once its backends exist; the first GPU backend on the cache's device is
+     // taken. detach_backend() before that backend is freed (the context's destructor).
+     void attach_backend(ggml_backend_t backend);
+     void detach_backend(ggml_backend_t backend);
+     void fence_locked();     // under mtx: make the compute stream wait for every slab enqueued so far
++    // under mtx: make the compute stream wait for the copies into these slots of sl (ids past the last slot
++    // are skipped) - per slot, or fence_locked() when slot_fence is off
++    void fence_slots_locked(llama_moe_stream_layer & sl, const int32_t * slots, size_t n);
+     void drain_l2_locked();  // under mtx: unpin the L2 slots whose copies a completed fence covered
+ 
+     std::deque<llama_moe_stream_work> q_demand;

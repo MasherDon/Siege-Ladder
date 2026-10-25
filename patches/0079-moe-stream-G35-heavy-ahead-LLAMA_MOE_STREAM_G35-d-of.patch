@@ -1,0 +1,221 @@
+From 6b5cec42bc332a6dd6e75ac5f3369526e5d52a82 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 04:42:49 +0000
+Subject: [PATCH 79/91] moe-stream : G35 heavy-ahead (LLAMA_MOE_STREAM_G35=d,
+ off by default, a measurement): the router of layer L + d on layer L's router
+ input, its G35_M best with their unbiased scores posted in mailbox record [1]
+ on G31's split before record [0]; G31's first half reads ahead into the host
+ tier the ones whose share of the lens's top n_used is at least G35_H
+ (SiegeLadder twentieth session)
+
+---
+ src/llama-graph.cpp      |  9 ++++++
+ src/llama-moe-stream.cpp | 61 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-stream.h   | 21 ++++++++++++++
+ src/models/deepseek4.cpp | 23 +++++++++++++++
+ 4 files changed, 114 insertions(+)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1318ddf..50070da 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3045,10 +3045,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     //   taken (and cleared) here whatever happens to it, so it cannot leak into another build
+     ggml_tensor * pred_next = nullptr;
+     std::function<ggml_tensor * (ggml_tensor *)> moe_runahead; // G2 runahead: the same, for the approximate pass
++    ggml_tensor * g35_lens = nullptr; // SiegeLadder G35: the router lens of a later layer, the same way
+     if (msl) {
+         pred_next = msl->graph_pred_next;
+         msl->graph_pred_next = nullptr;
+         moe_runahead.swap(msl->graph_runahead);
++        g35_lens = msl->graph_g35;
++        msl->graph_g35 = nullptr;
++        msl->g35_on    = false;
+     }
+     if (msl && !msl->matches(gate_exps, up_exps, down_exps, gate_up_exps)) {
+         msl = nullptr; // a different expert group of the same layer (e.g. grovemoe chexps), not streamed
+@@ -3257,6 +3261,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             } else {
+                 iargs[n_iargs++] = ids_cont;
+             }
++            // SiegeLadder G35: the lens rides in record [1], posted before record [0] - the first half never waits for it
++            if (g35_lens != nullptr && msl->mb_rec[1] != nullptr) {
++                mb_post(1, g35_lens);
++                msl->g35_on = true;
++            }
+             mb_post(0, iargs[0]);
+             mb_shexp();
+             ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, nullptr, 0,
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index a230058..c8baf29 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1034,6 +1034,21 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         g31       = atoi(p) != 0 ? 1 : 0;
+         g31_asked = g31 > 0;
+     }
++    // SiegeLadder G35, heavy-ahead; see g35_depth in the header (off by default, a measurement)
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35")) {
++        g35_depth = std::max(0, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_M")) {
++        g35_m = std::max(1, std::min(64, atoi(p)));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_H")) {
++        g35_h = std::max(0.0f, (float) std::strtod(p, nullptr));
++    }
++    if (g35_depth > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: G35 (heavy-ahead, a measurement): the router lens %d calls ahead, its %d best, "
++                "read ahead into the host tier from a share of %.3f (on G31's split at decode)\n", __func__, g35_depth,
++                g35_m, g35_h);
++    }
+     // SiegeLadder C14, probe E1; see c14_q in the header. C14 proper (c14_real) takes the same keys but C14 for C14_Q
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_C14_Q")) {
+         c14_q = std::max(0.0f, (float) std::strtod(p, nullptr));
+@@ -3165,6 +3180,39 @@ void llama_moe_stream::predict_locked(const llama_moe_stream_layer & sl_now, con
+     }
+ }
+ 
++// SiegeLadder G35: the lens of layer sl.g35_target ([M, 2] F32: the ids, then their unbiased scores, best first by the
++// biased score) - each expert's share of the lens's first n_used scores, as the call would weigh them; the heavy ones
++// (share >= g35_h) are read ahead into the host tier. speculate_locked skips what sits in a VRAM slot; the worker skips
++// what the tier holds already
++void llama_moe_stream::g35_speculate(llama_moe_stream_layer & sl, const ggml_tensor & lens) {
++    if (sl.g35_target < 0 || (size_t) sl.g35_target >= layers.size() || !layers[(size_t) sl.g35_target] ||
++            lens.type != GGML_TYPE_F32 || lens.ne[1] != 2) {
++        return;
++    }
++    llama_moe_stream_layer & st = *layers[(size_t) sl.g35_target];
++    const int64_t m  = lens.ne[0];
++    const float * v  = (const float *) lens.data;
++    const int64_t nu = std::min<int64_t>(m, st.n_used > 0 ? st.n_used : 6);
++    double sum = 0.0;
++    for (int64_t k = 0; k < nu; k++) {
++        sum += v[m + k];
++    }
++    std::lock_guard<std::mutex> lk(mtx);
++    stats.n_g35_posts++;
++    if (!(sum > 0.0)) {
++        return;
++    }
++    for (int64_t k = 0; k < m; k++) {
++        if ((double) v[m + k] < (double) g35_h*sum) {
++            continue;
++        }
++        stats.n_g35_cand++;
++        const size_t before = q_spec.size();
++        speculate_locked(st, (int32_t) v[k]);
++        stats.n_g35_spec += q_spec.size() > before ? 1 : 0;
++    }
++}
++
+ // Queue a host-tier fill for an expert this layer has NOT been asked for yet. Bounded, because
+ // a speculative queue longer than the drive can drain is a queue of guesses about the past.
+ void llama_moe_stream::speculate_locked(llama_moe_stream_layer & sl, int32_t expert) {
+@@ -3438,6 +3486,12 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 stats.n_g31_all, stats.n_g31_none, 1e-3*stats.t_g31_gap_us/stats.n_g31_calls,
+                 1e-3*stats.t_g31_lock_us/stats.n_g31_calls, stats.n_g31_flush, stats.n_g31_redo);
+     }
++    if (stats.n_g35_posts > 0) {
++        LLAMA_LOG_WARN("%s: %smoe stream: G35: %" PRId64 " lenses read, %" PRId64 " experts heavy by the lens (%.2f a lens), "
++                "%" PRId64 " of them queued for the host tier (%.2f a lens)\n", __func__, pfx, stats.n_g35_posts,
++                stats.n_g35_cand, (double) stats.n_g35_cand/stats.n_g35_posts, stats.n_g35_spec,
++                (double) stats.n_g35_spec/stats.n_g35_posts);
++    }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+         // critical path, and so does runahead's second half (counted in the gap between the halves above)
+@@ -5902,6 +5956,13 @@ void llama_moe_stream_remap_issue_g31_mb(ggml_tensor * dst, int ith, int nth, vo
+     }
+     d2.src[0] = &in0;
+     moe_stream_remap_issue_half(&d2, userdata, /*half =*/ 2);
++    // SiegeLadder G35: the lens of layer g35_target rode in record [1], posted before record [0] - after this call's own
++    // loads are queued, its heavy experts are read ahead into the host tier
++    if (sl->g35_on && sl->mb_ne[1][0] > 0) {
++        moe_mb_wait(*sl->mgr, *sl, 1);
++        const ggml_tensor lens = moe_mb_tensor(*sl, 1);
++        sl->mgr->g35_speculate(*sl, lens);
++    }
+ }
+ 
+ void llama_moe_stream_remap_wait_mb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index f414553..d489273 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -88,6 +88,13 @@ struct llama_moe_stream_layer {
+     // graph build only, the same way (SiegeLadder G16): the layer's shared expert, built before build_moe_ffn, which
+     // expands it right after the router's mailbox post - the card computes it while the host runs the remap
+     ggml_tensor * graph_shexp = nullptr;
++    // graph build only, the same way (SiegeLadder G35, heavy-ahead; see g35_depth in llama_moe_stream): the router lens of
++    // layer g35_target from this layer's router input, [M, 2] F32 - the lens's M best experts (ids as floats), then their
++    // unbiased scores. build_moe_ffn posts it into mailbox record [1] on G31's split and sets g35_on; G31's first half
++    // reads it (llama_moe_stream_remap_issue_g31_mb)
++    ggml_tensor * graph_g35  = nullptr;
++    bool          g35_on     = false;
++    int32_t       g35_target = -1;
+     // graph build only, the same way (SiegeLadder C14, probe E1; c14_q in llama_moe_stream): the routed sum of the pairs
+     // this layer's remap deferred ([n_embd, n_tokens]), left out of build_moe_ffn's output; the model graph adds
+     // post_F (x) it to the residual of the next layer's attention and resets it. c14_ok: set by the model graph at build
+@@ -818,6 +825,17 @@ struct llama_moe_stream {
+     // runahead (its remap is split already), C13, the G4 probe, the drop rule's VRAM_ONLY=2 or C14 (it gives way to all of
+     // them); needs the mailbox and its reply (G16 / G22), and the expert pipeline ending in the down GEMM (build_moe_ffn)
+     int32_t  g31             = 1;
++    // SiegeLadder G35, heavy-ahead (theories G35, runs.md 4.165 / 4.170; LLAMA_MOE_STREAM_G35=d, off by default): at decode,
++    // on G31's split, each layer L computes on the card the router lens of layer L + d - the router of L + d on L's router
++    // input - and posts its G35_M best experts with their scores in mailbox record [1] before record [0]; the first half
++    // reads them and reads ahead into the host tier (speculate_locked) those whose share of the lens's top n_used is at
++    // least G35_H - the heavy drive misses the default would wait for, d calls before their call. The math is untouched
++    // (it changes when a slab is read); with the drop rule fewer heavy experts are on the drive, so fewer calls wait
++    int32_t  g35_depth       = 0;
++    int32_t  g35_m           = 8;
++    float    g35_h           = 0.14f;
++    // the first half of G31 with a lens in record [1]: the shares and the read-ahead (takes mtx)
++    void g35_speculate(llama_moe_stream_layer & sl, const ggml_tensor & lens);
+     // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
+     bool     skip_capable    = true;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+@@ -1166,6 +1184,9 @@ struct llama_moe_stream {
+         int64_t n_g31_redo    = 0; // experts the second half found evicted and loaded again (expected 0)
+         int64_t t_g31_gap_us  = 0; // time from the end of the first half to the start of the second
+         int64_t t_g31_lock_us = 0; // of that, waiting for mgr->mtx at the start of the second half
++        int64_t n_g35_posts   = 0; // SiegeLadder G35: lenses read by G31's first half
++        int64_t n_g35_cand    = 0; // their experts with a share >= G35_H (heavy by the lens)
++        int64_t n_g35_spec    = 0; // of those, queued for the host tier (not in a VRAM slot, the queue not full)
+         int64_t t_remap_lock_us = 0; // waiting for mgr->mtx at the start of every remap (or runahead's first half)
+         int64_t n_drop_pairs  = 0; // routed pairs given weight 0 by the drop rule
+         int64_t n_drop_exp    = 0; // experts not loaded for their call because of it
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 76d3a5f..7d63d6c 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2665,6 +2665,29 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             mstream->layer(il)->graph_pred_next = build_pred_next(residual, post, comb, il);
+         }
+ 
++        // SiegeLadder G35, heavy-ahead (LLAMA_MOE_STREAM_G35=d; g35_depth in llama_moe_stream): the router of layer il + d on
++        // this layer's router input - its G35_M best experts by the biased score and their unbiased scores, [M, 2] F32, for
++        // this layer's remap to read the heavy ones ahead into the host tier. Decode only; build_moe_ffn posts it on G31's
++        // split (not next to runahead or A', which use record [1]); a hash-routed target layer is left out
++        if (mstream != nullptr && mstream->g35_depth > 0 && n_tokens == 1 && pred_k == 0 && !runahead &&
++                il + mstream->g35_depth < n_layer_moe && mstream->layer(il) != nullptr &&
++                mstream->layer(il + mstream->g35_depth) != nullptr &&
++                (uint32_t) (il + mstream->g35_depth) >= hparams.dsv4_hash_layer_count) {
++            const int    ilt = il + mstream->g35_depth;
++            const auto & lt  = model.layers[ilt];
++            const int    m   = std::min<int>(mstream->g35_m, (int) n_expert);
++            ggml_tensor * lg = ggml_mul_mat(ctx0, lt.ffn_gate_inp, cur);
++            ggml_mul_mat_set_prec(lg, GGML_PREC_F32);
++            ggml_tensor * sc  = ggml_sqrt(ctx0, ggml_softplus(ctx0, lg));                              // [n_expert, 1]
++            ggml_tensor * sb  = lt.ffn_exp_probs_b ? ggml_add(ctx0, sc, lt.ffn_exp_probs_b) : sc;     // the selection's
++            ggml_tensor * top = ggml_argsort_top_k(ctx0, sb, m);                                      // [m, 1] I32
++            ggml_tensor * tsc = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, sc, 1, n_expert, 1), top); // [1, m, 1]
++            ggml_tensor * g35 = ggml_concat(ctx0, ggml_cast(ctx0, top, GGML_TYPE_F32), ggml_reshape_2d(ctx0, tsc, m, 1), 1);
++            cb(g35, "moe_g35_lens", il);
++            mstream->layer(il)->graph_g35  = g35;
++            mstream->layer(il)->g35_target = ilt;
++        }
++
+         const auto & layer = model.layers[il];
+         ggml_tensor * selected_experts = nullptr;
+         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;

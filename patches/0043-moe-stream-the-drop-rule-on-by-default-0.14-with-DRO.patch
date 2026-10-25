@@ -1,0 +1,970 @@
+From d13d8057935245c2d7bfe15a81a756b4fd7315a7 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 21:52:06 +0000
+Subject: [PATCH 43/91] moe-stream : the drop rule on by default (0.14 with
+ DROP_ALL), and C13 - a heavy expert only on the drive replaced by the
+ best-scoring held one (SiegeLadder, both lossy; C13 off by default)
+
+The drop rule (an expert held in neither VRAM nor the host tier, below 0.14 of its token's routing weight, is not waited
+for and is read into the tier for later) is the default since the user's decision of 18.10: on ds4's general-100 and
+router-112 it is within the statistical error of the exact build (SiegeLadder runs.md 4.46, 4.64) and +4.7% over
+runahead; "check the accuracy later" - Test 6. With LLAMA_MOE_STREAM_DROP_W unset it is 0.14 with DROP_ALL (the call
+must be freed from the drive); LLAMA_MOE_STREAM_DROP_W=0 is the exact path, where runahead is on by default as before;
+an explicit DROP_W keeps its old meaning. The start-up log says which.
+
+C13 (LLAMA_MOE_STREAM_SUBST, the user's idea of 18.10): inside the remap, next to the drop rule, a routed expert on the
+drive whose share is at least the drop threshold (any share with the rule off) is replaced in each of its pairs by the
+best-scoring expert of the token (router selection score) that the card holds resident or the host tier holds whole,
+and is read into the tier for later; light ones are still dropped, so the call need not wait for the drive. Mode 1: no
+slot and not in the tier; mode 2: also a slot still loading from the drive. LLAMA_MOE_STREAM_SUBST_W=1 gives the
+substitute its own renormalised probability (default: the original's weight). The selection scores and probabilities
+ride in the remap's single packed input (no extra card input or synchronize); with SUBST unset the graph and every path
+are as before. One counter line "C13 substitute". The wave plan now also clears the drop rule's list, which the trace of
+a prompt chunk after a decode call used to repeat (an old quirk the default rule would have made common).
+
+Measured (SiegeLadder runs.md 4.68-4.69): the exact path unchanged - KL 0 (max 5.2e-5) against the k5 base, and
+router-112's case_111 bit-identical to the build of 17.10; the default's KL 0.0174 at -ub 1 (more than before P9: kl_run's
+512-token calls start P9's prompt holding); C13 mode 1 with runahead KL 0.0187, mode 2 KL 0.199 (next to runahead most
+staged experts are still loading when their call comes - not a generation mode). A review agent found no crash, hang or
+output defect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |  44 +++-
+ src/llama-moe-stream.cpp | 497 ++++++++++++++++++++++++++++++++++++---
+ src/llama-moe-stream.h   |  68 +++++-
+ 3 files changed, 570 insertions(+), 39 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 18ad726..e1c2792 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2320,6 +2320,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // G2 runahead (decode; moe_runahead set by the model graph): the first half's slots and weight multipliers
+     ggml_tensor * ra_ids    = nullptr;
+     ggml_tensor * ra_mask   = nullptr;
++    // the remap takes the drop rule's path - the routing weights along, its multipliers out - for the rule itself or for C13
++    bool drop_path = false;
+     if (msl && n_stream_waves == 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
+         // The drop rule's remap reads the routing weights too. ggml's scheduler copies every card input of a CPU split
+@@ -2329,11 +2331,39 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // LLAMA_MOE_STREAM_DROP_PACK=0 passes them apart, for A/B
+         static const bool drop_pack = getenv("LLAMA_MOE_STREAM_DROP_PACK") == nullptr ||
+                 atoi(getenv("LLAMA_MOE_STREAM_DROP_PACK")) != 0;
++        // C13, substitute (LLAMA_MOE_STREAM_SUBST; SiegeLadder theory C13, the user's idea of 18.10; lossy, off by default):
++        // the remap replaces a heavy expert on the drive by the best-scoring one the card or the host tier holds, so it
++        // needs every expert's selection score and unbiased probability. They ride in the same single input, flattened
++        // after the packed ids and weights - [k*n_tokens ids | k*n_tokens weights | n_expert*n_tokens selection scores |
++        // n_expert*n_tokens probs], F32, 3 KB per token at 384 experts - so C13 adds no card input and no synchronize
++        // (it packs whatever DROP_PACK says). Only where the selection is the top-k of these scores (not a hash layer,
++        // not llama4's weighting before the FFN), the weights are the selected probs (not SOFTMAX_WEIGHT's softmax
++        // over the selected logits) and the experts have no biases or scales of their own (those are indexed by the routed
++        // ids, so a substitute would take its expert's). With SUBST unset none of this is built: the graph is the one
++        // without C13
++        const bool c13 = msl->mgr->subst > 0 && selected_experts_in == nullptr && !weight_before_ffn &&
++                gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT && (int64_t) msl->n_expert == n_expert &&
++                ggml_nelements(probs) == n_expert*n_tokens && ggml_nelements(selection_probs) == n_expert*n_tokens &&
++                up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr && gate_up_exps_b == nullptr &&
++                up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr;
++        if (c13) {
++            msl->subst_norm = norm_w;
++        }
++        drop_path = msl->mgr->drop_w > 0.0f || c13;
+         auto add_ids_weights = [&](ggml_tensor ** args, int & n_args) {
+             ggml_tensor * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+-            if (drop_pack) {
++            if (drop_pack || c13) {
+                 ggml_tensor * ids_f = ggml_cast(ctx0, ids_cont, GGML_TYPE_F32);
+-                args[n_args++] = ggml_concat(ctx0, ids_f, ggml_reshape_2d(ctx0, w, ids_cont->ne[0], ids_cont->ne[1]), 1);
++                ggml_tensor * packed = ggml_concat(ctx0, ids_f, ggml_reshape_2d(ctx0, w, ids_cont->ne[0], ids_cont->ne[1]), 1);
++                if (c13) {
++                    ggml_tensor * sel = ggml_is_contiguous(selection_probs) ? selection_probs : ggml_cont(ctx0, selection_probs);
++                    ggml_tensor * prb = ggml_is_contiguous(probs) ? probs : ggml_cont(ctx0, probs);
++                    packed = ggml_concat(ctx0, ggml_reshape_1d(ctx0, packed, ggml_nelements(packed)),
++                            ggml_reshape_1d(ctx0, sel, ggml_nelements(sel)), 0);
++                    packed = ggml_concat(ctx0, packed, ggml_reshape_1d(ctx0, prb, ggml_nelements(prb)), 0);
++                    cb(packed, "ffn_moe_c13_scores", il);
++                }
++                args[n_args++] = packed;
+             } else {
+                 args[n_args++] = ids_cont;
+                 args[n_args++] = w;
+@@ -2348,7 +2378,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             // (SiegeLadder 17.10: the fast preset's drop + runahead)
+             ggml_tensor * iargs[2] = { nullptr, nullptr };
+             int n_iargs = 0;
+-            if (msl->mgr->drop_w > 0.0f) {
++            if (drop_path) {
+                 add_ids_weights(iargs, n_iargs);
+             } else {
+                 iargs[n_iargs++] = ids_cont;
+@@ -2361,10 +2391,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     llama_moe_stream_drop_mask, 1, msl);
+             cb(ra_mask, "ffn_moe_runahead_mask", il);
+             ggml_build_forward_expand(gf, ra_mask);
+-        } else if (msl->mgr->drop_w > 0.0f && !weight_before_ffn) {
++        } else if (drop_path && !weight_before_ffn) {
+             // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, off by default): the remap also needs this call's
+             // routing weights to tell the low-weight experts; the prediction, when there is one, rides along.
+-            // Its weight multipliers come out of a second op right after it, on the same host split.
++            // Its weight multipliers come out of a second op right after it, on the same host split. C13 the same way
+             ggml_tensor * args[3] = { nullptr, nullptr, nullptr };
+             int n_args = 0;
+             add_ids_weights(args, n_args);
+@@ -2656,10 +2686,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             ids_gemm = ggml_custom_4d(ctx0, GGML_TYPE_I32, ra_ids->ne[0], ra_ids->ne[1], 1, 1, wargs, 2,
+                     llama_moe_stream_remap_wait, 1, msl);
+             cb(ids_gemm, "ffn_moe_topk_stream", il);
+-            if (msl->mgr->drop_w > 0.0f) {
++            if (drop_path) {
+                 // the drop rule's multipliers for the exact path, decided by the first half (and by the late drop at
+                 // the wait); expanded right after the second half, so both stay on one host split - see the plain
+-                // drop rule above
++                // drop rule above (C13's multipliers come the same way)
+                 drop_mask = ggml_custom_4d(ctx0, GGML_TYPE_F32, 1, ra_ids->ne[0], ra_ids->ne[1], 1, &ids_gemm, 1,
+                         llama_moe_stream_exact_mask, 1, msl);
+                 cb(drop_mask, "ffn_moe_drop_mask", il);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 63a469c..af83d79 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -756,9 +756,14 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE_RECALL")) {
+         oracle_recall = std::min(1.0f, std::max(0.0f, (float) std::strtod(p, nullptr)));
+     }
+-    // drop rule; see drop_w in the header. Lossy: it changes the output whenever it fires.
++    // drop rule; see drop_w in the header. Lossy: it changes the output whenever it fires. On by default (0.14 with
++    // DROP_ALL) since SiegeLadder 18.10; LLAMA_MOE_STREAM_DROP_W=0 is the exact path
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_W")) {
+         drop_w = std::max(0.0f, (float) std::strtod(p, nullptr));
++    } else {
++        drop_w         = 0.14f;
++        drop_all       = true;
++        drop_defaulted = true;
+     }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_RENORM")) {
+         drop_renorm = std::strtol(p, nullptr, 10) != 0;
+@@ -775,6 +780,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_DROP_ONLY_LAYER")) {
+         drop_only_layer = atoi(p);
+     }
++    // C13, substitute; see subst in the header. Lossy: it changes the output whenever it fires
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SUBST")) {
++        subst = std::min(2, std::max(0, atoi(p)));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_SUBST_W")) {
++        subst_w = atoi(p) != 0 ? 1 : 0;
++    }
+     // G2 runahead; see runahead_k in the header. It stages through predict_locked, so it takes pred_vram over.
+     // On by default with K = 6 (SiegeLadder 17.10: lossless, runs.md 4.42-4.43). The measurement modes that stage
+     // or drop on their own - an oracle (its staging and read-ahead series were all taken without runahead), A'
+@@ -829,10 +841,13 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         }
+     }
+     if (drop_w > 0.0f) {
+-        LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy): an expert held in neither VRAM nor the host tier with "
+-                       "less than %.3f of the routing weight is not waited for%s%s\n", __func__, drop_w,
++        LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy%s): an expert held in neither VRAM nor the host tier with "
++                       "less than %.3f of the routing weight is not waited for%s%s\n", __func__,
++                       drop_defaulted ? ", the default; LLAMA_MOE_STREAM_DROP_W=0 is the exact path" : "", drop_w,
+                        drop_all ? ", only when that frees the call from the drive" : "",
+                        drop_renorm ? ", the kept pairs renormalised" : "");
++    } else {
++        LLAMA_LOG_INFO("%s: moe stream: exact path (LLAMA_MOE_STREAM_DROP_W=0)\n", __func__);
+     }
+     if (drop_late && (drop_w <= 0.0f || runahead_k == 0 || drop_vram_only != 0)) {
+         LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_DROP_LATE needs the plain drop rule (DROP_W) and runahead; "
+@@ -843,6 +858,21 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         LLAMA_LOG_WARN("%s: moe stream: LATE DROP ON (lossy, timing-dependent): at runahead's wait, a light expert still "
+                 "loading once the heavy ones are in is not waited for\n", __func__);
+     }
++    if (subst > 0 && (drop_vram_only != 0 || drop_only_layer >= 0)) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_SUBST is ignored next to the drop rule's VRAM_ONLY / ONLY_LAYER "
++                "measurements\n", __func__);
++        subst = 0;
++    }
++    if (subst > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: SUBSTITUTE (C13, lossy): mode %d - a routed expert held in neither VRAM nor the host "
++                "tier%s, with %s, is replaced in each of its pairs by the best-scoring expert of the token that the card or "
++                "the host tier holds, and read into the host tier for later; the substitute takes %s%s\n", __func__, subst,
++                subst >= 2 ? " (or whose VRAM slot is still loading from the drive)" : "",
++                drop_w > 0.0f ? "at least the drop rule's share of its token's routing weight" : "any share of the routing weight",
++                subst_w == 1 ? "its own probability, the token renormalised (SUBST_W=1)" : "the routed expert's weight (SUBST_W=0)",
++                drop_all ? "; DROP_ALL: a call in which a heavy expert still waits for the drive gives its drops and "
++                           "substitutions back" : "");
++    }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_SPEC_VRAM")) {
+         spec_vram = std::strtol(p, nullptr, 10) != 0;
+     }
+@@ -2073,7 +2103,15 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+         spec_trace[(size_t) idx] = { sl.il, sl.uniq };
+         // the drop rule took some routed experts out of uniq; the trace keeps what the router chose
+         auto & tr = spec_trace[(size_t) idx].second;
++        // C13 too: the substitutes no token routed leave the list, the routed experts that left the call for them come back
++        // (with where they were when the call came, below: they were not loaded for it)
++        if (!sl.subst_added.empty()) {
++            tr.erase(std::remove_if(tr.begin(), tr.end(), [&](int32_t e) {
++                return std::find(sl.subst_added.begin(), sl.subst_added.end(), e) != sl.subst_added.end();
++            }), tr.end());
++        }
+         tr.insert(tr.end(), sl.dropped.begin(), sl.dropped.end());
++        tr.insert(tr.end(), sl.subst_gone.begin(), sl.subst_gone.end());
+         // and where each of them was when the call came ('?' where the remap did not note it, e.g. waves)
+         spec_trace_where.resize((size_t) idx + 1);
+         std::string & wh = spec_trace_where[(size_t) idx];
+@@ -2509,6 +2547,21 @@ void llama_moe_stream::print_stats(const char * role) const {
+                     stats.n_drop_late_pairs, stats.n_drop_late_exp, stats.n_drop_late_calls);
+         }
+     }
++    if (subst > 0) {
++        // one line, in words no other line of this block uses: the bench parsers keep the last match of each phrase
++        char m2[160] = "";
++        if (subst >= 2) {
++            snprintf(m2, sizeof(m2), "; mode 2: %" PRId64 " of the replaced pairs and %" PRId64 " light experts given weight 0 "
++                    "had a drive load under way", stats.n_subst_inflight, stats.n_subst_drop_inflight);
++        }
++        LLAMA_LOG_WARN("%s: %smoe stream: C13 substitute (lossy, mode %d, %s): %" PRId64 " pairs replaced in %" PRId64 " calls - "
++                "%" PRId64 " by an expert on the card, %" PRId64 " by one whole in the host tier; mean share replaced %.3f; %"
++                PRId64 " routed experts left their call to substitutes; %" PRId64 " pairs found no candidate; %" PRId64
++                " calls gave theirs back (DROP_ALL)%s\n", __func__, pfx, subst, subst_w == 1 ? "own weight" : "routed weight",
++                stats.n_subst_pairs, stats.n_subst_calls, stats.n_subst_vram, stats.n_subst_l2,
++                stats.n_subst_pairs > 0 ? stats.subst_share_sum/stats.n_subst_pairs : 0.0, stats.n_subst_gone,
++                stats.n_subst_none, stats.n_subst_cancel, m2);
++    }
+     if (n_shift > 0) {
+         LLAMA_LOG_WARN("%s: %smoe stream: miss-only shift swapped %" PRId64 " experts (%" PRId64 " from the host tier)\n",
+                 __func__, pfx, n_shift, n_shift_l2);
+@@ -2831,8 +2884,10 @@ void llama_moe_stream_route_bias(ggml_tensor * dst, const ggml_tensor * a, int i
+     }
+ }
+ 
++// c13_sel / c13_probs: C13's scores, [n_expert, n_tokens] each (moe_unpack_ids_weights), or nullptr
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+-        const ggml_tensor * wts, void * userdata, bool issue_only = false);
++        const ggml_tensor * wts, void * userdata, bool issue_only = false,
++        const float * c13_sel = nullptr, const float * c13_probs = nullptr);
+ 
+ // M12: what a decode call is about to wait for - its loads still in flight, by where their bytes come from (slot_src).
+ // 3 = a drive read of its own (a miss nobody staged ahead), 2 = drive reads staged ahead only, 1 = all from the host
+@@ -2891,20 +2946,32 @@ void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const
+ // The drop rule's ids and routing weights packed by the graph into one F32 tensor [k, 2*n_tokens], the ids' rows first
+ // (llm_graph_context::build_moe_ffn, LLAMA_MOE_STREAM_DROP_PACK): one card input of the CPU split, one synchronize. Unpacked
+ // into int32 ids and two tensor headers shaped like dst. false when src is not packed (the ids alone, I32)
++// C13 (subst): the same flattened and followed by the selection scores and the unbiased probabilities of all n_expert experts
++// of each token, F32 [2*k*n_tokens + 2*n_expert*n_tokens] - still one input; sel / probs then point at them ([n_expert,
++// n_tokens], token-major), nullptr otherwise
+ struct moe_ids_weights {
+     std::vector<int32_t> ids;
+     ggml_tensor          a;
+     ggml_tensor          w;
++    const float *        sel   = nullptr;
++    const float *        probs = nullptr;
+ };
+ 
+-static bool moe_unpack_ids_weights(const ggml_tensor * dst, const ggml_tensor * src, moe_ids_weights & u) {
++static bool moe_unpack_ids_weights(const ggml_tensor * dst, const ggml_tensor * src, moe_ids_weights & u, int64_t n_expert) {
+     if (src == nullptr || src->type != GGML_TYPE_F32) {
+         return false;
+     }
+     const int64_t n = ggml_nelements(dst);
+     GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
+-    GGML_ASSERT(ggml_is_contiguous(src) && src->ne[0] == dst->ne[0] && ggml_nelements(src) == 2*n);
+     const float * p = (const float *) src->data;
++    const int64_t n_tok = dst->ne[0] > 0 ? n/dst->ne[0] : 0;
++    if (ggml_nelements(src) != 2*n && n_expert > 0 && ggml_nelements(src) == 2*n + 2*n_expert*n_tok) {
++        GGML_ASSERT(ggml_is_contiguous(src));
++        u.sel   = p + 2*n;
++        u.probs = p + 2*n + n_expert*n_tok;
++    } else {
++        GGML_ASSERT(ggml_is_contiguous(src) && src->ne[0] == dst->ne[0] && ggml_nelements(src) == 2*n);
++    }
+     u.ids.resize((size_t) n);
+     for (int64_t i = 0; i < n; i++) {
+         u.ids[i] = (int32_t) p[i];
+@@ -2926,7 +2993,7 @@ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userda
+     const ggml_tensor * pred = nullptr;
+     const ggml_tensor * wts  = nullptr;
+     moe_ids_weights u;
+-    if (moe_unpack_ids_weights(dst, ids, u)) {
++    if (moe_unpack_ids_weights(dst, ids, u, ((const llama_moe_stream_layer *) userdata)->n_expert)) {
+         ids = &u.a;
+         wts = &u.w;
+     }
+@@ -2937,7 +3004,7 @@ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userda
+             pred = dst->src[i];
+         }
+     }
+-    moe_stream_remap_impl(dst, ids, pred, wts, userdata);
++    moe_stream_remap_impl(dst, ids, pred, wts, userdata, /*issue_only =*/ false, u.sel, u.probs);
+ }
+ 
+ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -2963,9 +3030,10 @@ void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * us
+         return;
+     }
+     // with the drop rule next to runahead the routing weights come too: packed with the ids in src[0], or apart in src[1]
++    // (C13: packed, with the scores after them)
+     moe_ids_weights u;
+-    if (moe_unpack_ids_weights(dst, dst->src[0], u)) {
+-        moe_stream_remap_impl(dst, &u.a, nullptr, &u.w, userdata, /*issue_only =*/ true);
++    if (moe_unpack_ids_weights(dst, dst->src[0], u, ((const llama_moe_stream_layer *) userdata)->n_expert)) {
++        moe_stream_remap_impl(dst, &u.a, nullptr, &u.w, userdata, /*issue_only =*/ true, u.sel, u.probs);
+         return;
+     }
+     moe_stream_remap_impl(dst, dst->src[0], nullptr, dst->src[1], userdata, /*issue_only =*/ true);
+@@ -3001,13 +3069,19 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+     sl.ra_valid   = true;
+     sl.drop_mask.assign((size_t) n, 1.0f);
+ 
++    // C13: a pair with a substitute reads the substitute, at its weight multiplier (subst_f), when that one is resident
++    const int32_t * sub = sl.subst.empty() ? nullptr : sl.subst.data();
++
+     int64_t n_kept = 0;
+     for (int64_t i = 0; i < n; i++) {
+         // an expert the drop rule took out of the call has no slot at all: it counts as one not resident yet
+-        const auto it = sl.expert_slot.find(ids[i]);
++        const auto it = sl.expert_slot.find(sub != nullptr && sub[i] >= 0 ? sub[i] : ids[i]);
+         if (it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
+             out[i] = it->second;
+             n_kept++;
++            if (sub != nullptr) {
++                sl.drop_mask[i] = sl.subst_f[i]; // > 0 (moe_c13_weights_locked); 1 under SUBST_W=0
++            }
+         } else {
+             out[i] = -1;
+             sl.drop_mask[i] = 0.0f;
+@@ -3060,8 +3134,252 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+     sl.ra_t_issue = ggml_time_us();
+ }
+ 
++// C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; see subst in the header): what each routed expert of
++// the call is to it, in llama_moe_stream_layer::subst_mark
++enum : uint8_t {
++    MOE_C13_NONE = 0,
++    MOE_C13_DROP = 1, // on the drive and light: the drop rule's
++    MOE_C13_NEED = 2, // on the drive and heavy: its pairs look for a substitute
++    MOE_C13_SUB  = 3, // the substitute of some pair (routed by another token of the call, or not routed at all)
++    MOE_C13_WAIT = 4, // on the drive and heavy, with a pair that found no substitute: the call waits for it
++    MOE_C13_GONE = 5, // on the drive and heavy, every pair substituted: out of the call, read into the host tier for later
++};
++
++struct moe_c13_counts {
++    int64_t n_pairs    = 0; // pairs given a substitute
++    int64_t n_vram     = 0; // of those, by an expert resident in VRAM
++    int64_t n_l2       = 0; // by one whole in the host tier
++    int64_t n_none     = 0; // pairs that needed one and found no held candidate
++    int64_t n_inflight = 0; // mode 2: replaced pairs whose expert was a drive load under way (it had a slot)
++    double  share      = 0.0; // the sum of the replaced pairs' shares of their token's routing weight
++};
++
++// C13's decision, made by the remap under mgr->mtx in place of the drop rule's (moe_stream_remap_impl). Each routed expert
++// of the call that is on the drive (on_drive: no slot and not whole in the host tier; mode 2 also a slot still loading from
++// the drive) is dropped when light (drop_share below thr, which is 0 with the drop rule off), as the drop rule does, and
++// otherwise needs a substitute. Each of its pairs, the token's best-scoring routed expert first, takes the expert of the
++// same token with the highest selection score that is held - resident in VRAM, or whole in the host tier (in_l2) - and is
++// neither one of the token's own k, nor on the drive in this call, nor a substitute in the token already. The token's
++// scores are sorted lazily, 16 at a time, and tested in that order, so has() runs only until the first held one. A
++// substitute that needs a slot of its own joins only while the call's experts fit the layer's slots. The host tier's lock
++// nests inside mgr->mtx, as in the drop rule. Fills sl.dropped, sl.subst (per pair, -1 = none; empty when no pair got
++// one), sl.subst_added (the substitutes no token routed), sl.subst_gone and sl.subst_mark; returns whether a heavy expert
++// keeps a pair with no substitute - the call then still waits for the drive.
++template <typename OnDrive, typename InL2>
++static bool moe_c13_decide_locked(llama_moe_stream_layer & sl, const int32_t * ids, const float * w, const float * sel,
++        int64_t k, int64_t n_tok, float thr, const OnDrive & on_drive, const InL2 & in_l2, moe_c13_counts & cnt) {
++    const int64_t n = k*n_tok;
++    const int64_t E = sl.n_expert;
++    GGML_ASSERT(k > 0 && k <= 64);
++
++    auto & mark = sl.subst_mark;
++    mark.assign((size_t) E, MOE_C13_NONE);
++    sl.subst.assign((size_t) n, -1);
++
++    bool any_need = false;
++    for (const int32_t e : sl.uniq) {
++        if (!on_drive(e)) {
++            continue;
++        }
++        if (sl.drop_share[e] < thr) {
++            sl.dropped.push_back(e);
++            mark[e] = MOE_C13_DROP;
++        } else {
++            mark[e] = MOE_C13_NEED;
++            any_need = true;
++        }
++    }
++    if (!any_need) {
++        sl.subst.clear();
++        return false;
++    }
++
++    // the call's experts must fit the layer's slots (the remap aborts past that, and uniq.size() <= n_slots holds here). The
++    // dropped leave the call - or, when DROP_ALL takes the drops back, the substitutions go with them - so a substitute that
++    // needs a slot of its own may join while room lasts; the routed experts it frees are not counted (a bound, not the count)
++    size_t room = sl.n_slots - std::min<size_t>(sl.n_slots, sl.uniq.size() - sl.dropped.size());
++
++    auto & order = sl.subst_order;
++    order.resize((size_t) E);
++    for (int64_t t = 0; t < n_tok; t++) {
++        const int32_t * tid  = ids + t*k;
++        const float   * srow = sel + t*E;
++        uint64_t todo = 0; // the token's pairs that need a substitute
++        for (int64_t j = 0; j < k; j++) {
++            if (mark[tid[j]] == MOE_C13_NEED) {
++                todo |= 1ull << j;
++            }
++        }
++        if (todo == 0) {
++            continue;
++        }
++        // the token's experts by selection score, best first: NaN as -inf (a strict weak order for the sort), ties by id
++        auto key = [srow](int32_t c) {
++            const float v = srow[c];
++            return std::isnan(v) ? -INFINITY : v;
++        };
++        auto better = [&key](int32_t x, int32_t y) {
++            const float kx = key(x);
++            const float ky = key(y);
++            return kx > ky || (kx == ky && x < y);
++        };
++        for (int64_t c = 0; c < E; c++) {
++            order[c] = (int32_t) c;
++        }
++        size_t n_sorted = 0; // order[0, n_sorted) is sorted and holds the best n_sorted
++        size_t pos      = 0; // the next candidate to test; every pair of the token goes on from where the last one stopped
++        double s_tok    = 0.0;
++        for (int64_t j = 0; j < k; j++) {
++            s_tok += w[t*k + j];
++        }
++        while (todo != 0) {
++            int64_t j = -1;
++            for (int64_t jj = 0; jj < k; jj++) {
++                if (((todo >> jj) & 1) && (j < 0 || better(tid[jj], tid[j]))) {
++                    j = jj;
++                }
++            }
++            todo &= ~(1ull << j);
++
++            int32_t cand      = -1;
++            bool    cand_vram = false;
++            while (cand < 0) {
++                if (pos == n_sorted) {
++                    if (n_sorted == (size_t) E) {
++                        break;
++                    }
++                    const size_t to = std::min<size_t>((size_t) E, n_sorted + 16);
++                    std::partial_sort(order.begin() + n_sorted, order.begin() + to, order.end(), better);
++                    n_sorted = to;
++                }
++                const int32_t c = order[pos++];
++                if (!(key(c) > -INFINITY)) {
++                    pos = n_sorted = (size_t) E; // masked out (expert groups), and so is the rest: no candidate left
++                    break;
++                }
++                bool own = false;
++                for (int64_t jj = 0; jj < k && !own; jj++) {
++                    own = tid[jj] == c;
++                }
++                if (own || (mark[c] != MOE_C13_NONE && mark[c] != MOE_C13_SUB)) {
++                    continue; // one of the token's own, or on the drive in this call
++                }
++                if (room == 0 && mark[c] != MOE_C13_SUB && !sl.touched[c]) {
++                    continue; // would need a slot of its own, and the call has none left
++                }
++                const auto it = sl.expert_slot.find(c);
++                if (it != sl.expert_slot.end() && sl.slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_RESIDENT) {
++                    cand      = c;
++                    cand_vram = true;
++                } else if (in_l2(c)) {
++                    cand      = c; // whole in the host tier: a bus copy (into its slot, if it is loading - from RAM)
++                }
++            }
++            if (cand < 0) {
++                cnt.n_none++;
++                continue;
++            }
++            if (mark[cand] != MOE_C13_SUB && !sl.touched[cand]) {
++                room--;
++                sl.subst_added.push_back(cand);
++            }
++            mark[cand] = MOE_C13_SUB;
++            sl.subst[t*k + j] = cand;
++            cnt.n_pairs++;
++            (cand_vram ? cnt.n_vram : cnt.n_l2)++;
++            cnt.share += s_tok > 0.0 ? w[t*k + j]/s_tok : 1.0;
++            if (sl.expert_slot.count(tid[j])) {
++                cnt.n_inflight++;
++            }
++        }
++    }
++
++    // a heavy expert with a pair left still waits for the drive; one whose every pair has a substitute leaves the call
++    bool waits = false;
++    for (int64_t i = 0; i < n; i++) {
++        if (sl.subst[i] < 0 && (mark[ids[i]] == MOE_C13_NEED || mark[ids[i]] == MOE_C13_WAIT)) {
++            mark[ids[i]] = MOE_C13_WAIT;
++            waits = true;
++        }
++    }
++    for (const int32_t e : sl.uniq) {
++        if (mark[e] == MOE_C13_NEED) {
++            mark[e] = MOE_C13_GONE;
++            sl.subst_gone.push_back(e);
++        }
++    }
++    if (cnt.n_pairs == 0) {
++        sl.subst.clear();
++    }
++    return waits;
++}
++
++// C13's weight multipliers (see subst_w in the header), once the call's substitutions stand: subst_f for runahead's
++// approximate pass, and drop_mask - the exact path's, already holding the drop rule's - on the tokens with a substitute.
++// SUBST_W=0 leaves both at 1 on a substituted pair: the substitute takes the routed expert's weight. SUBST_W=1 gives it its
++// own unbiased probability, the token renormalised over its new set (or, without norm_w, p_sub/p_orig of the routed
++// expert's weight, the other pairs unchanged); the drop rule's multipliers of such a token are made again on the
++// substituted weights - 0 on a dropped pair, and with DROP_RENORM the kept ones scaled back up to the token's full weight.
++// A token whose probabilities do not allow it (a p that is 0 or not finite) keeps SUBST_W=0's. Every subst_f is > 0.
++static void moe_c13_weights_locked(const llama_moe_stream & mgr, llama_moe_stream_layer & sl, const int32_t * ids,
++        const float * w, const float * probs, int64_t k, int64_t n_tok) {
++    const int64_t E = sl.n_expert;
++    sl.subst_f.assign((size_t) (k*n_tok), 1.0f);
++    if (mgr.subst_w != 1) {
++        return;
++    }
++    float f[64];
++    GGML_ASSERT(k <= 64);
++    for (int64_t t = 0; t < n_tok; t++) {
++        const int32_t * tid  = ids + t*k;
++        const int32_t * tsub = sl.subst.data() + t*k;
++        const float   * prow = probs + t*E;
++        bool any = false;
++        for (int64_t j = 0; j < k; j++) {
++            any = any || tsub[j] >= 0;
++        }
++        if (!any) {
++            continue;
++        }
++        double S  = 0.0; // the token's routed experts
++        double S2 = 0.0; // its experts after the substitution
++        for (int64_t j = 0; j < k; j++) {
++            S  += prow[tid[j]];
++            S2 += tsub[j] >= 0 ? prow[tsub[j]] : prow[tid[j]];
++        }
++        bool ok = std::isfinite(S) && std::isfinite(S2) && S > 0.0 && S2 > 0.0;
++        for (int64_t j = 0; j < k && ok; j++) {
++            if (tsub[j] >= 0) {
++                const double po = prow[tid[j]];
++                const double ps = prow[tsub[j]];
++                f[j] = po > 0.0 ? (float) (sl.subst_norm ? (ps*S)/(po*S2) : ps/po) : 0.0f;
++            } else {
++                f[j] = sl.subst_norm ? (float) (S/S2) : 1.0f;
++            }
++            ok = std::isfinite(f[j]) && f[j] > 0.0f;
++        }
++        if (!ok) {
++            continue;
++        }
++        float s      = 0.0f;
++        float s_drop = 0.0f;
++        for (int64_t j = 0; j < k; j++) {
++            const float wj = w[t*k + j]*f[j];
++            s += wj;
++            if (tsub[j] < 0 && sl.touched[tid[j]] >= 2) {
++                s_drop += wj;
++            }
++        }
++        const float r = mgr.drop_renorm && s_drop > 0.0f && s > s_drop ? s/(s - s_drop) : 1.0f;
++        for (int64_t j = 0; j < k; j++) {
++            sl.subst_f[t*k + j]   = f[j];
++            sl.drop_mask[t*k + j] = tsub[j] < 0 && sl.touched[tid[j]] >= 2 ? 0.0f : f[j]*r;
++        }
++    }
++}
++
+ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * pred,
+-        const ggml_tensor * wts, void * userdata, bool issue_only) {
++        const ggml_tensor * wts, void * userdata, bool issue_only, const float * c13_sel, const float * c13_probs) {
+     auto * sl  = (llama_moe_stream_layer *) userdata;
+     auto * mgr = sl->mgr;
+ 
+@@ -3152,9 +3470,16 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     // read into the host tier below, for the calls after this one. Its hotness was counted above: it was
+     // routed. A token's top pair has at least 1/k of its weight, so with the threshold capped under that,
+     // every token keeps at least one pair.
++    // C13 (LLAMA_MOE_STREAM_SUBST; see subst in the header) decides here too, when the graph sent the scores along
++    // (c13_sel / c13_probs): a heavy expert on the drive is replaced pair by pair rather than waited for. A token's top pair
++    // is heavy, so it is kept or substituted, never dropped: every token still keeps a pair with a slot.
+     sl->dropped.clear();
+     sl->drop_thr = 0.0f;
++    sl->subst.clear();
++    sl->subst_added.clear();
++    sl->subst_gone.clear();
+     size_t n_masked = 0; // VRAM_ONLY >= 3: experts with weight 0 that still load (touched = 3)
++    const bool c13 = wts != nullptr && c13_sel != nullptr && c13_probs != nullptr && mgr->subst > 0;
+     if (wts != nullptr) {
+         const int64_t k     = a->ne[0];
+         const int64_t n_tok = a->ne[1];
+@@ -3164,7 +3489,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                               mgr->drop_vram_only ? mgr->drop_w : std::min(mgr->drop_w, 0.99f/(float) k);
+         const float * w     = (const float *) wts->data;
+         sl->drop_thr = thr;
+-        if (thr > 0.0f) {
++        moe_c13_counts c13_cnt;
++        if (thr > 0.0f || c13) {
+             sl->drop_share.assign(sl->n_expert, 0.0f);
+             // VRAM_ONLY=2 lets the top pair go as well, but a token left with no pair needs some resident slot
+             // of the layer to map onto: before the layer has one (cold start), keep the top pair as in =1
+@@ -3195,6 +3521,19 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                     sl->drop_share[ids[t*k + j_top]] = INFINITY;
+                 }
+             }
++            // C13: whole in the host tier - every slab has(), which counts and marks nothing - under the lock order below
++            auto in_l2 = [&](int32_t e) {
++                if (!mgr->l2) {
++                    return false;
++                }
++                for (const auto & wt : sl->weights) {
++                    if (!mgr->l2->has(wt.file_idx, wt.offs + (size_t) e*wt.nb_expert, wt.nb_expert)) {
++                        return false;
++                    }
++                }
++                return true;
++            };
++            const bool c13_inflight = c13 && mgr->subst >= 2;
+             // only on the drive: held neither in VRAM (resident or loading) nor whole in the host tier. The
+             // host tier's lock nests inside mgr->mtx here; the workers never hold mgr->mtx while they are in
+             // the host tier, so the order cannot invert.
+@@ -3203,6 +3542,12 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             auto on_drive = [&](int32_t e) {
+                 const auto it = sl->expert_slot.find(e);
+                 if (it != sl->expert_slot.end()) {
++                    if (c13_inflight && sl->slot_state[it->second] == LLAMA_MOE_STREAM_SLOT_LOADING &&
++                            (sl->slot_src[it->second] & 1)) {
++                        // C13 mode 2: a slot still loading from the drive counts as on the drive, unless every slab has
++                        // reached the host tier since (then only its bus copy is left)
++                        return !in_l2(e);
++                    }
+                     return mgr->drop_vram_only == 3 && sl->slot_state[it->second] != LLAMA_MOE_STREAM_SLOT_RESIDENT;
+                 }
+                 if (!mgr->l2 || (mgr->drop_vram_only != 0 && mgr->drop_vram_only != 4)) {
+@@ -3216,13 +3561,29 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                 return false;
+             };
+             bool heavy_on_drive = false;
+-            for (const int32_t e : sl->uniq) {
+-                const bool light = sl->drop_share[e] < thr;
+-                if ((light || mgr->drop_all) && on_drive(e)) {
+-                    if (light) {
+-                        sl->dropped.push_back(e);
+-                    } else {
+-                        heavy_on_drive = true;
++            if (c13) {
++                // C13: the light experts on the drive are dropped as below, the heavy ones replaced pair by pair; only a
++                // heavy one with a pair left unreplaced still waits for the drive (heavy_on_drive)
++                heavy_on_drive = moe_c13_decide_locked(*sl, ids, w, c13_sel, k, n_tok, thr, on_drive, in_l2, c13_cnt);
++                if (mgr->drop_all && heavy_on_drive && !sl->subst.empty()) {
++                    // the call waits for the drive anyway: its substitutions give way with its drops (below), uniq untouched
++                    mgr->stats.n_subst_cancel++;
++                    sl->subst.clear();
++                    sl->subst_added.clear();
++                    sl->subst_gone.clear();
++                    const int64_t n_none = c13_cnt.n_none;
++                    c13_cnt = moe_c13_counts();
++                    c13_cnt.n_none = n_none;
++                }
++            } else {
++                for (const int32_t e : sl->uniq) {
++                    const bool light = sl->drop_share[e] < thr;
++                    if ((light || mgr->drop_all) && on_drive(e)) {
++                        if (light) {
++                            sl->dropped.push_back(e);
++                        } else {
++                            heavy_on_drive = true;
++                        }
+                     }
+                 }
+             }
+@@ -3250,6 +3611,59 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+                 }
+                 sl->uniq.resize(n_keep);
+             }
++            if (!sl->subst.empty()) {
++                // C13: a routed expert every pair of which has a substitute leaves the call as a dropped one does - not
++                // marked 2, its pairs keep their weight on the substitute's slot - and is read into the host tier below; the
++                // substitutes no token routed join it, at the end. Their hotness is not counted: they were not routed
++                size_t n_keep = 0;
++                for (size_t i = 0; i < sl->uniq.size(); i++) {
++                    if (sl->subst_mark[sl->uniq[i]] != MOE_C13_GONE) {
++                        sl->uniq[n_keep++] = sl->uniq[i];
++                    }
++                }
++                sl->uniq.resize(n_keep);
++                for (const int32_t c : sl->subst_added) {
++                    sl->touched[c] = 1;
++                    sl->uniq.push_back(c);
++                }
++                GGML_ASSERT(sl->uniq.size() <= sl->n_slots);
++                // runahead's late drop tells heavy from light by drop_share: a substitute is as heavy as the expert it stands
++                // in for, so it is waited for as that one would have been, and every token keeps a pair
++                for (int64_t i = 0; i < n; i++) {
++                    if (sl->subst[i] >= 0) {
++                        sl->drop_share[sl->subst[i]] = std::max(sl->drop_share[sl->subst[i]], sl->drop_share[ids[i]]);
++                    }
++                }
++                mgr->stats.n_subst_pairs    += c13_cnt.n_pairs;
++                mgr->stats.n_subst_vram     += c13_cnt.n_vram;
++                mgr->stats.n_subst_l2       += c13_cnt.n_l2;
++                mgr->stats.n_subst_inflight += c13_cnt.n_inflight;
++                mgr->stats.subst_share_sum  += c13_cnt.share;
++                mgr->stats.n_subst_gone     += (int64_t) sl->subst_gone.size();
++                mgr->stats.n_subst_calls++;
++            }
++            if (c13) {
++                mgr->stats.n_subst_none += c13_cnt.n_none;
++                // mode 2: what leaves the call while its drive load is under way goes on loading into its slot, for the calls
++                // after it (speculate_locked passes over an expert with a slot). Staged ahead, it is counted as the classify
++                // loop below would have counted it: a miss, staged and still loading when its call came
++                for (const std::vector<int32_t> * list : { &sl->dropped, &sl->subst_gone }) {
++                    for (const int32_t e : *list) {
++                        const auto it = sl->expert_slot.find(e);
++                        if (it == sl->expert_slot.end()) {
++                            continue;
++                        }
++                        mgr->stats.n_subst_drop_inflight += list == &sl->dropped;
++                        const int32_t s = it->second;
++                        if (sl->slot_staged[s]) {
++                            mgr->stats.n_stage_late_drive += sl->slot_staged[s] == 2;
++                            sl->slot_staged[s] = 0;
++                            mgr->stats.n_miss++;
++                            mgr->stats.n_stage_late++;
++                        }
++                    }
++                }
++            }
+         }
+         sl->drop_mask.assign((size_t) n, 1.0f);
+         for (int64_t t = 0; t < n_tok && (!sl->dropped.empty() || n_masked > 0); t++) {
+@@ -3276,6 +3690,9 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+             mgr->stats.n_drop_exp += (int64_t) (sl->dropped.size() + n_masked);
+             mgr->stats.n_drop_calls++;
+         }
++        if (!sl->subst.empty()) {
++            moe_c13_weights_locked(*mgr, *sl, ids, w, c13_probs, k, n_tok); // C13's multipliers on top of the drop rule's
++        }
+     }
+ 
+     // classify the touched experts; reserve and enqueue demand loads in deterministic order
+@@ -3376,6 +3793,10 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+     for (const int32_t e : sl->dropped) {
+         mgr->speculate_locked(*sl, e);
+     }
++    // and C13's: the routed experts that left the call for their substitutes, the same way
++    for (const int32_t e : sl->subst_gone) {
++        mgr->speculate_locked(*sl, e);
++    }
+     moe_nvtx_pop();
+ 
+     // Staging next (A4b): after this call's own demand, so its loads stay first in line, and before the
+@@ -3394,7 +3815,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         // G2 runahead: counted, classified, its loads queued; llama_moe_stream_remap_wait waits for them once the
+         // graph has computed the approximate pass on what is resident. With the drop rule (wts) the dropped experts
+         // queued no load (touched 2, gone from uniq) and drop_mask holds the exact path's multipliers: they move to
+-        // exact_mask, because the first half fills drop_mask with the approximate pass's
++        // exact_mask, because the first half fills drop_mask with the approximate pass's. C13's substitutions (subst,
++        // subst_f) stay for the approximate pass and the second half
+         if (wts != nullptr) {
+             sl->exact_mask.swap(sl->drop_mask);
+         } else {
+@@ -3428,20 +3850,23 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         moe_wait_account_locked(*mgr, kind, dt);
+     }
+ 
++    // C13: a pair with a substitute reads the substitute's slot (it is in uniq, so it is resident now)
++    const int32_t * sub = sl->subst.empty() ? nullptr : sl->subst.data();
+     for (int64_t i = 0; i < n; i++) {
+-        if (sl->touched[ids[i]] == 2) {
++        const int32_t e = sub != nullptr && sub[i] >= 0 ? sub[i] : ids[i];
++        if (sl->touched[e] == 2) {
+             out[i] = -1; // dropped: given a kept slot of its token below
+             continue;
+         }
+-        const int32_t s = sl->expert_slot.at(ids[i]);
++        const int32_t s = sl->expert_slot.at(e);
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
+     if (!sl->dropped.empty()) {
+         // a dropped pair still runs through the expert GEMMs, with weight 0: any resident slot of the same
+-        // token will do, and there is one - a token's top pair is never dropped, except under VRAM_ONLY=2,
+-        // where a token may lose every pair: then any resident slot of the layer (nothing of this call
+-        // loads, so it stays as it is until the GEMMs ran)
++        // token will do, and there is one - a token's top pair is never dropped (with C13 it may read a
++        // substitute's slot instead), except under VRAM_ONLY=2, where a token may lose every pair: then any
++        // resident slot of the layer (nothing of this call loads, so it stays as it is until the GEMMs ran)
+         const int64_t k = a->ne[0];
+         int32_t any_resident = -1;
+         for (int64_t i = 0; i < n; i++) {
+@@ -3586,9 +4011,12 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+         sl->uniq.resize(n_keep);
+         sl->demand_slots.resize(n_keep);
+         if (n_late > 0) {
++            // C13: a substitute is a kept expert like any other - its pairs are those that read it (the first half's
++            // subst); it inherited its expert's share, so it is heavy and was waited for above
+             const int32_t * rids = sl->ra_ids.data();
++            const int32_t * sub  = sl->subst.empty() ? nullptr : sl->subst.data();
+             for (int64_t i = 0; i < n; i++) {
+-                if (sl->touched[rids[i]] == 2 && sl->exact_mask[i] != 0.0f) {
++                if (sl->touched[sub != nullptr && sub[i] >= 0 ? sub[i] : rids[i]] == 2 && sl->exact_mask[i] != 0.0f) {
+                     sl->exact_mask[i] = 0.0f;
+                     mgr->stats.n_drop_late_pairs++;
+                 }
+@@ -3622,13 +4050,17 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+         moe_wait_account_locked(*mgr, kind, dt);
+     }
+ 
++    // C13: a pair with a substitute reads the substitute's slot, as the first half decided (its routed expert, if it left
++    // the call, is in no slot of uniq and is not looked up)
+     const int32_t * ids = sl->ra_ids.data();
++    const int32_t * sub = sl->subst.empty() ? nullptr : sl->subst.data();
+     for (int64_t i = 0; i < n; i++) {
+-        if (sl->touched[ids[i]] == 2) {
++        const int32_t e = sub != nullptr && sub[i] >= 0 ? sub[i] : ids[i];
++        if (sl->touched[e] == 2) {
+             out[i] = -1; // dropped by the first half (the drop rule): given a kept slot of its token below
+             continue;
+         }
+-        const int32_t s = sl->expert_slot.at(ids[i]);
++        const int32_t s = sl->expert_slot.at(e);
+         sl->slot_last_use[s] = ++sl->use_counter;
+         out[i] = s;
+     }
+@@ -3683,7 +4115,12 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
+             sl.uniq.push_back(e);
+         }
+     }
+-
++    // C13's lists and the drop rule's belong to the decode call before this one: a wave plan substitutes and drops
++    // nothing, and the trace reads them (with the drop rule on by default, a prompt chunk after a decode call would
++    // otherwise trace the experts that call dropped)
++    sl.subst_added.clear();
++    sl.subst_gone.clear();
++    sl.dropped.clear();
+ 
+     GGML_ASSERT(sl.plan_capacity > 0);
+     sl.expert_wave.assign(sl.n_expert, 0xff);
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index c666631..81b2577 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -156,6 +156,25 @@ struct llama_moe_stream_layer {
+     std::vector<int32_t> dropped;
+     std::vector<float>   drop_share; // [n_expert] the largest share of a token's routing weight it has
+     float                drop_thr = 0.0f; // the threshold the first half applied (late drop reuses it and drop_share)
++    // C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; see subst in llama_moe_stream), guarded by mgr->mtx
++    // like the drop rule's scratch above and written by the same remap (runahead's first half included). subst: per
++    // [n_expert_used, n_tokens] pair of the current call, the expert whose slot the pair reads in place of its routed one,
++    // -1 = none; empty when the call substituted nothing. The pair keeps its own routing weight, times subst_f (1, or
++    // SUBST_W=1's factor; the exact path gets it through drop_mask / exact_mask, runahead's approximate pass through the
++    // first half's drop_mask). A substitute is no dropped pair: its routed expert is not marked 2 in touched, the outputs
++    // look at subst first. subst_added: the substitutes this call loads that no token of it routed (they join uniq and are
++    // kept out of the trace); subst_gone: the routed experts every pair of which got a substitute - out of uniq like a
++    // dropped one, and read into the host tier for the calls after it. subst_mark / subst_order: per-expert scratch.
++    std::vector<int32_t> subst;
++    std::vector<float>   subst_f;
++    std::vector<int32_t> subst_added;
++    std::vector<int32_t> subst_gone;
++    std::vector<uint8_t> subst_mark;
++    std::vector<int32_t> subst_order;
++    // set at graph build next to the scores (build_moe_ffn's norm_w): the routing weights are normalised over the selected
++    // experts, so SUBST_W=1 renormalises the token over its new set; without it a substitute's weight is p_sub/p_orig of
++    // the routed one's and the other pairs keep theirs
++    bool                 subst_norm = true;
+     // with a trace on: where each routed expert of the current call was when the call came, before it
+     // loaded anything - 'v' resident in VRAM, 'l' in VRAM but still loading (staged or speculated), 'r' not
+     // in VRAM but whole in the host tier, 'd' on the drive. Written into the trace after the experts.
+@@ -648,7 +667,13 @@ struct llama_moe_stream {
+     // is not waited for: its pairs get weight 0 in this call, and it is read into the host tier for the
+     // calls after it. LLAMA_MOE_STREAM_DROP_W (0 = off); LLAMA_MOE_STREAM_DROP_RENORM=1 scales the kept
+     // pairs of the token back up to its full routing weight.
++    // On by default since SiegeLadder 18.10 (the user's decision after runs.md 4.46 / 4.64: 0.14 with DROP_ALL is
++    // within the statistical error on both ds4 sets and +4.7% over runahead; "check the accuracy later" - Test 6):
++    // with LLAMA_MOE_STREAM_DROP_W unset it is 0.14 with DROP_ALL (drop_defaulted); LLAMA_MOE_STREAM_DROP_W=0 is the
++    // exact path, where runahead is on by default as before. An explicit DROP_W keeps its old meaning (DROP_ALL
++    // only when asked for).
+     float   drop_w      = 0.0f;
++    bool    drop_defaulted = false;
+     bool    drop_renorm = false;
+     // LLAMA_MOE_STREAM_DROP_ALL=1: drop only when every drive miss of the call is below the threshold. A call
+     // with one heavy drive miss waits for the drive anyway, and its light ones load in parallel at no extra
+@@ -675,6 +700,28 @@ struct llama_moe_stream {
+     // LLAMA_MOE_STREAM_DROP_ONLY_LAYER=L (measurement): the drop rule acts on layer L alone, so the routing of
+     // L+1 shows the error of ONE approximate layer - what a runahead predictor would see
+     int32_t drop_only_layer = -1;
++    // C13, substitute (SiegeLadder theory C13, the user's idea of 18.10; lossy, so opt-in: LLAMA_MOE_STREAM_SUBST=M, 0 = off).
++    // The drop rule lets a light expert on the drive go, but a heavy one is waited for, and with it the whole step. Here a
++    // routed expert of the call held neither in VRAM (no slot, resident or loading) nor whole in the host tier, and heavy -
++    // a share of its token's routing weight at or above the drop rule's threshold in some pair, or any share with the rule
++    // off - is replaced pair by pair: each of its pairs reads the expert of the same token with the highest selection score
++    // (the router's own order) that the card holds resident or the host tier holds whole, that the token did not select and
++    // that is no substitute in the token already. The call then does not wait for the drive for it. A routed expert none of
++    // whose pairs still reads it leaves the call and is read into the host tier for the calls after it, as a dropped one
++    // is. Light experts on the drive still go to the drop rule (weight 0) when it is on. A pair with no held candidate
++    // keeps its expert and waits for it. M = 2: an expert whose VRAM slot is still loading from the drive (slot_src bit 0)
++    // and not yet whole in the host tier counts as on the drive too, for the drop rule's light test and the substitution
++    // alike - the call never waits for the drive. With DROP_ALL a call in which a heavy expert still waits for the drive
++    // after the substitution gives its drops and substitutions back (it waits anyway: they would cost quality and buy
++    // nothing). The scores (selection scores and unbiased probabilities of every expert of each token) ride to the remap in
++    // the input the ids and weights already take (build_moe_ffn), so this costs no extra synchronisation; the remap then
++    // takes the drop rule's packed path whatever DROP_W is. Not with the drop rule's VRAM_ONLY / ONLY_LAYER measurements.
++    // LLAMA_MOE_STREAM_SUBST_W: 0 (default) the substitute takes the routed expert's weight (its pair's multiplier stays
++    // 1); 1 its own unbiased probability, the token renormalised over its new set: (p_sub/S')/(p_orig/S) on the pair, S/S'
++    // on the token's other pairs, S = the sum of p over the token's k selected experts, S' = S - p_orig + p_sub (summed
++    // over its substituted pairs), times the drop rule's multipliers (with DROP_RENORM computed on the substituted weights)
++    int32_t subst   = 0;
++    int32_t subst_w = 0;
+     // speculate experts that are in the VRAM cache too (LLAMA_MOE_STREAM_SPEC_VRAM=1); see speculate_locked
+     bool    spec_vram      = false;
+     // the remap protects every slot its call reads before picking a victim (LLAMA_MOE_STREAM_KEEP_FIRST=0: off)
+@@ -883,6 +930,20 @@ struct llama_moe_stream {
+         int64_t n_drop_late_exp   = 0; // DROP_LATE: experts not waited for at the wait, still loading there
+         int64_t n_drop_late_pairs = 0; // their pairs
+         int64_t n_drop_late_calls = 0; // calls with at least one
++        // C13 (subst): pairs given a substitute, by where the substitute was (resident in VRAM / whole in the host tier), the sum
++        // of their shares of the token's routing weight, calls with at least one, routed experts that left their call (every
++        // pair substituted), pairs that needed one and found no held candidate, calls that gave theirs back (DROP_ALL); mode 2:
++        // replaced pairs whose expert was a drive load under way, and light experts dropped while theirs was
++        int64_t n_subst_pairs    = 0;
++        int64_t n_subst_vram     = 0;
++        int64_t n_subst_l2       = 0;
++        double  subst_share_sum  = 0.0;
++        int64_t n_subst_calls    = 0;
++        int64_t n_subst_gone     = 0;
++        int64_t n_subst_none     = 0;
++        int64_t n_subst_cancel   = 0;
++        int64_t n_subst_inflight = 0;
++        int64_t n_subst_drop_inflight = 0;
+         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
+ 
+         // wait for a free slot, which t_stall_us cannot see: it starts only once all demand loads
+@@ -968,7 +1029,9 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
+ // the same, with b = the model's prediction of the next layer's experts ([k, n_tokens] I32; 3a)
+ void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * userdata);
+ // the same as a ggml_custom_4d op: src[0] the ids, then by type the routing weights (F32 [1, k, n_tokens],
+-// for the drop rule) and the prediction (I32 [k', n_tokens], 3a), each optional
++// for the drop rule) and the prediction (I32 [k', n_tokens], 3a), each optional. src[0] may also be the ids and weights
++// packed as F32 [k, 2*n_tokens] (DROP_PACK), or - with C13 (subst) - that flattened and followed by every expert's
++// selection score and unbiased probability, F32 [2*k*n_tokens + 2*n_expert*n_tokens] (see moe_unpack_ids_weights)
+ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userdata);
+ // the drop rule's weight multipliers for the call its src[0] (the remap's output) has just handled,
+ // F32 [1, k, n_tokens]
+@@ -979,7 +1042,8 @@ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * user
+ // gets a resident slot, and weight 0 from llama_moe_stream_drop_mask on its output). _wait: src[0] = the issue's
+ // output (it orders the two), src[1] = the predicted experts of the next layer [k', n_tokens]; it stages those, waits
+ // for the call's loads and returns its slots, as the remap does - a pair the drop rule took out gets a kept slot of
+-// its token, and weight 0 from llama_moe_stream_exact_mask on the wait's output.
++// its token, and weight 0 from llama_moe_stream_exact_mask on the wait's output. With C13 (subst) _issue's src[0] is the
++// packed ids, weights and scores, as for _remap_v, and a substituted pair reads its substitute's slot in both halves.
+ void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * userdata);
+ void llama_moe_stream_exact_mask(ggml_tensor * dst, int ith, int nth, void * userdata);

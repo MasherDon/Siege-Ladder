@@ -1,0 +1,252 @@
+From b36caca4e113580acb3d87661fabf4b09d090ee2 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:38:08 +0000
+Subject: [PATCH 40/91] DeepSeek V4 : the attention of a big ubatch by runs of
+ head groups (SiegeLadder P7), off by default - LLAMA_DSV4_ATTN_SPLIT=S (a
+ divisor of the 8 output groups) from LLAMA_DSV4_ATTN_SPLIT_MIN tokens (512):
+ each run computes its q from its rows of wq_b, attends with its sinks,
+ deropes and goes through its slices of wo_a, and wo_b takes the
+ concatenation; the indexer, the cache write and the K / mask are made once,
+ by the first run's call (the attention flavours hand them back through
+ dsv4_attn_kv). Decode, the MTP path and runahead's pass keep the whole-head
+ graph. Measured (SiegeLadder runs.md 4.63): at -ub 2048 the attention's 256
+ MiB tensors leave the graph's largest, but the compute buffer does not shrink
+ - 1 221 MiB without, 1 269 with S = 8 - because the peak moves to the MoE
+ phase (ffn_moe_down and ffn_moe_weighted, 240 MiB each, and a 200 MiB [25600,
+ 2048] product); prefill unchanged (136 / 194 vs 139 / 196 tok/s, answers
+ identical). Kept as a switch for the next step, not a gain on its own
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/deepseek4.cpp | 116 ++++++++++++++++++++++++++++++++++++++-
+ src/models/models.h      |  19 ++++++-
+ 2 files changed, 129 insertions(+), 6 deletions(-)
+
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index de95b41..31d749f 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1062,7 +1062,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         bool use_hca,
+         int il,
+         ggml_tensor ** topk_carry,
+-        ggml_tensor ** cand_carry) const {
++        ggml_tensor ** cand_carry,
++        dsv4_attn_kv * kv_out) const {
+     // V4.1 runs this shape for both compressed groups; V4 only for the csa one
+     const auto & inp_csa = use_hca ? inp_dsv4->get_hca() : inp_dsv4->get_csa();
+     GGML_ASSERT(inp_csa.kq_mask);
+@@ -1157,6 +1158,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         ggml_tensor * m_sp = ggml_concat(ctx0, raw_mask, m_sel, 0);
+         cb(m_sp, "csa_kq_mask_sparse", il);
+ 
++        if (kv_out) {
++            *kv_out = { k_sp, m_sp, k_rot };
++        }
+         ggml_tensor * out = build_attn_mha(q, k_sp, k_sp, nullptr, m_sp, sinks, nullptr, kq_scale, il);
+         if (k_rot) {
+             out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+@@ -1196,6 +1200,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         kq_mask = ggml_concat(ctx0, ggml_concat(ctx0, masked(dense_shift), kq_mask, 0), masked(back), 0);
+     }
+ 
++    if (kv_out) {
++        *kv_out = { k_all, kq_mask, k_rot };
++    }
+     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+@@ -1212,7 +1219,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+         ggml_tensor * kv,
+         ggml_tensor * sinks,
+         float kq_scale,
+-        int il) const {
++        int il,
++        dsv4_attn_kv * kv_out) const {
+     const auto & inp_hca = inp_dsv4->get_hca();
+     GGML_ASSERT(inp_hca.kq_mask);
+ 
+@@ -1253,6 +1261,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+     cb(kq_mask, "hca_kq_mask", il);
+ 
++    if (kv_out) {
++        *kv_out = { k_all, kq_mask, k_rot };
++    }
+     ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+@@ -1268,7 +1279,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
+         ggml_tensor * kv,
+         ggml_tensor * sinks,
+         float kq_scale,
+-        int il) const {
++        int il,
++        dsv4_attn_kv * kv_out) const {
+     GGML_ASSERT(hparams.is_swa(il));
+ 
+     ggml_tensor * k_rot = inp_attn->self_k_rot;
+@@ -1289,6 +1301,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
+ 
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+ 
++    if (kv_out) {
++        *kv_out = { k, kq_mask, k_rot };
++    }
+     ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+@@ -1716,6 +1731,101 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         ggml_build_forward_expand(gf, hca_state_score);
+     }
+ 
++    // SiegeLadder P7: at a big ubatch the attention's own tensors fill the compute buffer - wq_b's output, q after RoPE,
++    // the FlashAttention output and the derope concat are each [64 heads * 512, n_tokens] f32, 256 MiB at 2048 tokens
++    // (runs.md 4.44), and that caps the ubatch of a 32K prompt at 1536. Split into S runs of head groups, each run
++    // computes its q, attends, deropes and goes through its slices of wo_a; only its [o_lora_rank * groups, n_tokens]
++    // result lives on, and wo_b takes their concatenation. The indexer, the cache write and the K / mask are made once,
++    // by the first run's call. LLAMA_DSV4_ATTN_SPLIT=S (a divisor of the 8 groups; 0 = off), from
++    // LLAMA_DSV4_ATTN_SPLIT_MIN tokens (512). Prefill only: decode and the MTP path keep the whole-head graph.
++    static const int64_t attn_split = [] {
++        const char * s = std::getenv("LLAMA_DSV4_ATTN_SPLIT");
++        return s != nullptr ? (int64_t) atoll(s) : (int64_t) 0;
++    }();
++    static const int64_t attn_split_min = [] {
++        const char * s = std::getenv("LLAMA_DSV4_ATTN_SPLIT_MIN");
++        return s != nullptr ? (int64_t) atoll(s) : (int64_t) 512;
++    }();
++    if (!inp_mtp && !part && attn_split > 1 && n_groups % attn_split == 0 && nt >= attn_split_min) {
++        const int64_t gpc      = n_groups/attn_split; // groups per run
++        const int64_t nh       = gpc*n_heads_group;   // heads per run
++        const float   kq_scale = 1.0f/sqrtf(float(n_embd_head));
++        auto run_q = [&](int64_t c) {
++            const int64_t h0 = c*nh;
++            ggml_tensor * w  = ggml_view_2d(ctx0, layer.wq_b, layer.wq_b->ne[0], nh*n_embd_head, layer.wq_b->nb[1],
++                                            (size_t) (h0*n_embd_head)*layer.wq_b->nb[1]);
++            ggml_tensor * qc = build_lora_mm(w, qr);
++            qc = ggml_reshape_3d(ctx0, qc, n_embd_head, nh, nt);
++            if (!hparams.dsv4_v41) {
++                qc = ggml_rms_norm(ctx0, qc, norm_rms_eps);
++            }
++            ggml_tensor * qn = ggml_view_3d(ctx0, qc, n_embd_head_nope, nh, nt,
++                    ggml_row_size(qc->type, n_embd_head), ggml_row_size(qc->type, n_embd_head)*nh, 0);
++            ggml_tensor * qp = ggml_view_3d(ctx0, qc, n_embd_head_rope, nh, nt,
++                    ggml_row_size(qc->type, n_embd_head), ggml_row_size(qc->type, n_embd_head)*nh,
++                    ggml_row_size(qc->type, n_embd_head_nope));
++            qp = ggml_rope_ext(ctx0, qp, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
++                    freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
++            qc = ggml_concat(ctx0, qn, qp, 0);
++            cb(qc, "q_run", il);
++            return qc;
++        };
++        auto run_sinks = [&](int64_t c) {
++            return layer.attn_sinks ? ggml_view_1d(ctx0, layer.attn_sinks, nh, (size_t) (c*nh)*ggml_element_size(layer.attn_sinks))
++                                    : nullptr;
++        };
++        auto run_out = [&](ggml_tensor * o, int64_t c) { // derope + this run's slices of wo_a -> [o_lora_rank*gpc, nt]
++            o = ggml_reshape_3d(ctx0, o, n_embd_head, nh, nt);
++            ggml_tensor * on = ggml_view_3d(ctx0, o, n_embd_head_nope, nh, nt,
++                    ggml_row_size(o->type, n_embd_head), ggml_row_size(o->type, n_embd_head)*nh, 0);
++            ggml_tensor * op = ggml_view_3d(ctx0, o, n_embd_head_rope, nh, nt,
++                    ggml_row_size(o->type, n_embd_head), ggml_row_size(o->type, n_embd_head)*nh,
++                    ggml_row_size(o->type, n_embd_head_nope));
++            op = ggml_rope_ext_back(ctx0, op, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
++                    freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
++            o = ggml_concat(ctx0, on, op, 0);
++            o = ggml_reshape_3d(ctx0, o, o_group_dim, gpc, nt);
++            o = ggml_permute(ctx0, o, 0, 2, 1, 3);
++            ggml_tensor * w = ggml_view_3d(ctx0, layer.wo_a, layer.wo_a->ne[0], layer.wo_a->ne[1], gpc,
++                    layer.wo_a->nb[1], layer.wo_a->nb[2], (size_t) (c*gpc)*layer.wo_a->nb[2]);
++            ggml_tensor * a = ggml_mul_mat(ctx0, w, o);
++            a = ggml_permute(ctx0, a, 0, 2, 1, 3);
++            return ggml_cont_2d(ctx0, a, o_lora_rank*gpc, nt);
++        };
++
++        dsv4_attn_kv prep;
++        ggml_tensor * q0 = run_q(0);
++        ggml_tensor * o0 = nullptr;
++        if (ratio == csa_ratio && inp_dsv4->get_csa().kq_mask) {
++            o0 = build_csa_lid_attention(model, inp_dsv4, inp_attn, q0, kv, qr, cur, inp_pos, run_sinks(0), kq_scale,
++                    false, il, topk_carry, cand_carry, &prep);
++        } else if (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() && inp_dsv4->get_hca().kq_mask) {
++            o0 = build_csa_lid_attention(model, inp_dsv4, inp_attn, q0, kv, qr, cur, inp_pos, run_sinks(0), kq_scale,
++                    true, il, topk_carry, cand_carry, &prep);
++        } else if (ratio == hca_ratio && inp_dsv4->get_hca().kq_mask) {
++            o0 = build_hca_attention(inp_dsv4, inp_attn, q0, kv, run_sinks(0), kq_scale, il, &prep);
++        } else {
++            o0 = build_raw_attention(inp_attn, q0, kv, run_sinks(0), kq_scale, il, &prep);
++        }
++        GGML_ASSERT(prep.k != nullptr && prep.mask != nullptr);
++        ggml_tensor * oa = run_out(o0, 0);
++        for (int64_t c = 1; c < attn_split; c++) {
++            ggml_tensor * qc = run_q(c);
++            if (prep.k_rot) {
++                qc = llama_mul_mat_hadamard(ctx0, qc, prep.k_rot);
++            }
++            ggml_tensor * oc = build_attn_mha(qc, prep.k, prep.k, nullptr, prep.mask, run_sinks(c), nullptr, kq_scale, il);
++            if (prep.k_rot) {
++                oc = llama_mul_mat_hadamard(ctx0, oc, prep.k_rot);
++            }
++            oa = ggml_concat(ctx0, oa, run_out(oc, c), 0);
++        }
++        cb(oa, "attn_wo_a", il);
++        ggml_tensor * res_out = build_lora_mm(layer.wo_b, oa);
++        cb(res_out, "attn_out", il);
++        return res_out;
++    }
++
+     ggml_tensor * out = nullptr;
+     if (inp_mtp) {
+         out = build_attn(inp_mtp,
+diff --git a/src/models/models.h b/src/models/models.h
+index c73637f..ec54f30 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1109,6 +1109,15 @@ struct llama_model_deepseek32 : public llama_model_base {
+ };
+ 
+ 
++// SiegeLadder P7: what an attention flavour of DeepSeek V4 prepared for its FlashAttention call - the K it attends over
++// (the cache view, or the concatenated / sparse K), its mask and the K rotation - so the other head groups of a big
++// ubatch attend with the same, after the indexer and the cache write ran once
++struct dsv4_attn_kv {
++    ggml_tensor * k     = nullptr;
++    ggml_tensor * mask  = nullptr;
++    ggml_tensor * k_rot = nullptr;
++};
++
+ struct llama_model_deepseek4 : public llama_model_base {
+     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+@@ -1250,8 +1259,10 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 bool use_hca,
+                 int il,
+                 ggml_tensor ** topk_carry,
+-                ggml_tensor ** cand_carry) const;
++                ggml_tensor ** cand_carry,
++                dsv4_attn_kv * kv_out = nullptr) const;
+ 
++        // kv_out (P7): when given, what the FlashAttention call used is left there for the other head groups
+         ggml_tensor * build_hca_attention(
+                 llm_graph_input_dsv4 * inp_dsv4,
+                 llm_graph_input_dsv4_raw * inp_attn,
+@@ -1259,7 +1270,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * kv,
+                 ggml_tensor * sinks,
+                 float kq_scale,
+-                int il) const;
++                int il,
++                dsv4_attn_kv * kv_out = nullptr) const;
+ 
+         ggml_tensor * build_raw_attention(
+                 llm_graph_input_dsv4_raw * inp_attn,
+@@ -1267,7 +1279,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * kv,
+                 ggml_tensor * sinks,
+                 float kq_scale,
+-                int il) const;
++                int il,
++                dsv4_attn_kv * kv_out = nullptr) const;
+ 
+         ggml_tensor * build_hc_pre(
+                 ggml_tensor * x,

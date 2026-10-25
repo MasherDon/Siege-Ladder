@@ -1,0 +1,93 @@
+From 3af3e5c01bacaa67b4f28402162c195b4e9ec343 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:49:45 +0000
+Subject: [PATCH 20/91] dsv4 : sparse attention at decode, opt-in
+ (LLAMA_DSV4_SPARSE_DECODE=1)
+
+One token in one stream gathers only the indexer's top-k compressed K rows and
+their mask entries, next to the raw window, instead of attending over every
+compressed position behind a -inf mask. K is padded to 256 rows for the 512-wide
+FA head. At 30K: -9 ms per token; long-context KL 0.00073 against the dense path
+(top-1 99.8%), not yet at the noise floor of the earlier exact changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/models/deepseek4.cpp | 55 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index f24eb2a..7323b4f 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
+ 
+@@ -1110,10 +1111,62 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
+     cb(csa_k, "csa_comp_k", il);
+ 
++    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
++
++    // At decode the dense path below attends over every compressed position and masks all but the indexer's
++    // top-k with -inf, so its cost grows with the context. One token in one stream can read only the picked
++    // blocks: gather their K rows and their mask entries (a pick may still be masked when fewer positions are
++    // valid than top-k). The masked positions add exp(-inf) = 0, so the result is the same up to summation
++    // order. Opt-in for now: LLAMA_DSV4_SPARSE_DECODE=1.
++    static const bool sparse_decode = [] {
++        const char * s = std::getenv("LLAMA_DSV4_SPARSE_DECODE");
++        return s != nullptr && atoi(s) != 0;
++    }();
++    const int64_t n_sel = top_k->ne[0];
++    if (sparse_decode && cparams.flash_attn && q->ne[2] == 1 && raw_k->ne[3] == 1 && n_sel < n_csa &&
++            raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16 &&
++            csa_k->nb[1] == ggml_row_size(csa_k->type, csa_k->ne[0])) {
++        ggml_tensor * idx = ggml_view_1d(ctx0, top_k, n_sel, 0);
++
++        // FA with a 512-wide head reads K in strides of 256 rows: pad with zero rows masked by -inf
++        const int64_t n_kv  = raw_k->ne[2] + n_sel;
++        const int64_t n_pad = GGML_PAD(n_kv, 256) - n_kv;
++
++        ggml_tensor * k_rows = ggml_view_2d(ctx0, csa_k, csa_k->ne[0]*csa_k->ne[1], n_csa, csa_k->nb[2], 0);
++        ggml_tensor * k_sel  = ggml_get_rows(ctx0, k_rows, idx);
++        if (n_pad > 0) {
++            k_sel = ggml_pad(ctx0, k_sel, 0, (int) n_pad, 0, 0);
++        }
++        k_sel = ggml_cast(ctx0, k_sel, GGML_TYPE_F16);
++        k_sel = ggml_reshape_4d(ctx0, k_sel, csa_k->ne[0], csa_k->ne[1], n_sel + n_pad, 1);
++        ggml_tensor * k_sp = ggml_concat(ctx0, raw_k, k_sel, 2);
++        cb(k_sp, "csa_k_sparse", il);
++
++        ggml_tensor * m_rows = ggml_view_2d(ctx0, inp_csa.kq_mask, 1, n_csa, ggml_element_size(inp_csa.kq_mask), 0);
++        ggml_tensor * m_sel  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, m_rows, idx), n_sel, 1);
++        if (n_pad > 0) {
++            ggml_tensor * m_tail = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pad, 1), -INFINITY);
++            m_sel = ggml_concat(ctx0, m_sel, m_tail, 0);
++        }
++        if (raw_mask->ne[1] > 1) {
++            m_sel = ggml_pad(ctx0, m_sel, 0, (int) (raw_mask->ne[1] - 1), 0, 0);   // padded query rows
++        }
++        m_sel = ggml_cast(ctx0, m_sel, raw_mask->type);
++        ggml_tensor * m_sp = ggml_concat(ctx0, raw_mask, m_sel, 0);
++        cb(m_sp, "csa_kq_mask_sparse", il);
++
++        ggml_tensor * out = build_attn_mha(q, k_sp, k_sp, nullptr, m_sp, sinks, nullptr, kq_scale, il);
++        if (k_rot) {
++            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
++        }
++        cb(out, "attn_csa_lid", il);
++
++        return out;
++    }
++
+     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+     cb(k_all, "csa_k_all", il);
+ 
+-    ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+     ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+ 
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);

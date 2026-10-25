@@ -1,0 +1,231 @@
+From 5d5434f76f1d08e52f67a59a8e96e2a360d6a00c Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 12:16:20 +0000
+Subject: [PATCH 49/91] DeepSeek V4.1 : the Engram rows faulted in ahead
+ (SiegeLadder G26), on by default - at decode set_input read the rows of each
+ Engram layer from the 189 GiB mapping one layer after another, and the
+ PrefetchVirtualMemory of each layer waited for the drive on the thread the
+ card waits on: 1.79 ms per token of a 3.6 ms token boundary (SiegeLadder
+ runs.md 4.77, NVTX ranges engram / engram_prefetch / engram_read). Now
+ llm_graph_input_engram::read_ahead, called where the DSV4 graph creates the
+ input - at the start of the build - hashes the ubatch's rows of every Engram
+ layer (reading the history, never writing it: the batch's own tokens come
+ from the ubatch, as set_input will have written them) and a helper thread
+ faults their pages in with one PrefetchVirtualMemory for all layers, while
+ the main thread builds and allocates the graph (~1.6 ms); set_input joins it
+ first (engram_wait) and then reads as before, so the values are the same and
+ a row guessed wrong only costs a fault. Decode-sized ubatches only (<= 64
+ tokens). Skipped where there is nothing to read: a graph built before the
+ weights are in memory (the memory fit's dry run - the tables' data pointers
+ are null) and a graph reserve (ubatch_reserve - null seq_id pointers); both
+ crashed the first build. SiegeLadder runs.md 4.78: text = trace, the
+ deterministic counters equal to the unit; set_inputs 2.03 -> 0.26 ms per
+ token, the boundary 3.91 -> 2.40, the card's idle 11.8 -> 10.0 ms; o25 ABBA
+ at the drop default: outside the wait -0.9 ms per token in every run (41.25
+ -> 40.33). LLAMA_ENGRAM_AHEAD=0 - off
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      | 109 +++++++++++++++++++++++++++++++++++++++
+ src/llama-graph.h        |  14 ++++-
+ src/models/deepseek4.cpp |   8 +++
+ 3 files changed, 130 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index d277866..5872300 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -128,7 +128,111 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
+     return res;
+ }
+ 
++void llm_graph_input_engram::read_ahead(const llama_ubatch & ubatch) {
++    if (ahead.joinable()) {
++        ahead.join();
++    }
++    // decode-sized ubatches only: the batch lookup below is linear, and a prompt's ubatch costs seconds anyway
++    if (kv.empty() || ubatch.token == nullptr || ubatch.pos == nullptr || ubatch.seq_id == nullptr ||
++            ubatch.n_seq_id == nullptr || ubatch.n_tokens == 0 || ubatch.n_tokens > 64) {
++        return;
++    }
++    // a graph reserve's ubatch (llama_batch_allocr::ubatch_reserve) has no sequences: its seq_id pointers are null
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        if (ubatch.n_seq_id[i] < 1 || ubatch.seq_id[i] == nullptr) {
++            return;
++        }
++    }
++    auto * cache = mctx != nullptr ? mctx->get_kv() : nullptr;
++    if (cache == nullptr || !cache->engram_enabled()) {
++        return;
++    }
++    // a graph built before the weights are in memory (the memory fit's dry run builds one with no data) has nothing
++    // to read: the tables' data pointers are null there
++    if (model.engram_token_map == nullptr || model.engram_token_map->data == nullptr ||
++            model.engram_primes == nullptr || model.engram_primes->data == nullptr ||
++            model.engram_offsets == nullptr || model.engram_offsets->data == nullptr ||
++            model.engram_multipliers == nullptr || model.engram_multipliers->data == nullptr) {
++        return;
++    }
++    for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++        const auto & layer = model.layers[hparams.engram_layer_ids[e]];
++        if (layer.engram_embd == nullptr || layer.engram_embd->data == nullptr ||
++                layer.engram_embd_scale == nullptr || layer.engram_embd_scale->data == nullptr) {
++            return;
++        }
++    }
++
++    llama_engram_tables t;
++    t.token_map   = (const int32_t *) model.engram_token_map->data;
++    t.primes      = (const int64_t *) model.engram_primes->data;
++    t.offsets     = (const int64_t *) model.engram_offsets->data;
++    t.multipliers = (const int64_t *) model.engram_multipliers->data;
++    t.n_layer     = hparams.engram_n_layer;
++    t.n_head      = hparams.engram_n_head;
++    t.max_ngram   = hparams.engram_max_ngram;
++    t.n_hash_cols = hparams.engram_n_hash_cols;
++    t.head_dim    = hparams.engram_head_dim;
++    t.pad_id      = t.token_map[hparams.engram_pad_token];
++
++    const uint32_t n_tokens = ubatch.n_tokens;
++    // the id at (seq, pos) as set_input will see it: it writes the batch's own tokens into the history before hashing
++    auto cid_at = [&](llama_seq_id s, llama_pos q) -> int32_t {
++        if (q < 0) {
++            return llama_kv_cache_dsv4::ENGRAM_DEAD;
++        }
++        for (uint32_t j = 0; j < n_tokens; ++j) {
++            if (ubatch.pos[j] == q && ubatch.seq_id[j][0] == s) {
++                return t.token_map[ubatch.token[j]];
++            }
++        }
++        return cache->engram_get(s, q);
++    };
++
++    std::vector<int32_t> hist(t.max_ngram);
++    std::vector<int64_t> rows(t.n_hash_cols);
++    std::vector<void *>  addrs;
++    std::vector<size_t>  sizes;
++    addrs.reserve((size_t) 2*t.n_layer*n_tokens*t.n_hash_cols);
++    sizes.reserve(addrs.capacity());
++    for (uint32_t e = 0; e < t.n_layer; ++e) {
++        const auto & layer = model.layers[hparams.engram_layer_ids[e]];
++        const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
++        const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            const llama_seq_id s = ubatch.seq_id[i][0];
++            const llama_pos    p = ubatch.pos[i];
++            bool blocked = false;
++            for (uint32_t g = 0; g < t.max_ngram; ++g) {
++                const int32_t cid = cid_at(s, p - (llama_pos) g);
++                blocked = blocked || cid == llama_kv_cache_dsv4::ENGRAM_DEAD
++                                  || cid == llama_kv_cache_dsv4::ENGRAM_NONE;
++                hist[g] = blocked ? t.pad_id : cid;
++            }
++            llama_engram_hash_row(t, e, hist.data(), rows.data());
++            for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
++                addrs.push_back((void *) (w  + (size_t) rows[c]*t.head_dim));
++                sizes.push_back(t.head_dim);
++                addrs.push_back((void *) (sc + (size_t) rows[c]*(t.head_dim/32)));
++                sizes.push_back(t.head_dim/32);
++            }
++        }
++    }
++    // every layer's rows in one list, so the OS has the faults of all of them in flight at once
++    ahead = std::thread([addrs = std::move(addrs), sizes = std::move(sizes)]() {
++        llama_moe_stream_nvtx_push("engram_ahead");
++        llama_prefetch_ranges(addrs.data(), sizes.data(), addrs.size());
++        llama_moe_stream_nvtx_pop();
++    });
++}
++
+ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
++    if (ahead.joinable()) {
++        // G26: the rows faulted in ahead (read_ahead); what is left of that wait is on the graph's path
++        llama_moe_stream_nvtx_push("engram_wait");
++        ahead.join();
++        llama_moe_stream_nvtx_pop();
++    }
+     if (kv.empty() || ubatch == nullptr || ubatch->token == nullptr) {
+         return;
+     }
+@@ -173,6 +277,7 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     static int64_t n_engram_row = 0;
+     static int64_t n_engram_set = 0;
+     const int64_t t0_engram = ggml_time_us();
++    const llama_moe_stream_nvtx_range nvtx_engram("engram"); // SiegeLadder G26: its share of set_inputs under Nsight
+ 
+     for (uint32_t e = 0; e < t.n_layer; ++e) {
+         const auto & layer = model.layers[hparams.engram_layer_ids[e]];
+@@ -211,8 +316,11 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+             enderecos.push_back((void *) (sc + (size_t) todas[k]*(t.head_dim/32)));
+             tamanhos .push_back(t.head_dim/32);
+         }
++        llama_moe_stream_nvtx_push("engram_prefetch");
+         llama_prefetch_ranges(enderecos.data(), tamanhos.data(), enderecos.size());
++        llama_moe_stream_nvtx_pop();
+ 
++        llama_moe_stream_nvtx_push("engram_read");
+         for (uint32_t i = 0; i < n_tokens; ++i) {
+             const int64_t * r = todas.data() + (size_t) i*t.n_hash_cols;
+             float * dst = buf.data() + (size_t) i*row;
+@@ -222,6 +330,7 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+                                          t.head_dim, dst + (size_t) c*t.head_dim);
+             }
+         }
++        llama_moe_stream_nvtx_pop();
+ 
+         ggml_backend_tensor_set(kv[e], buf.data(), 0, row*n_tokens*sizeof(float));
+     }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index db963bc..b64cdba 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -11,6 +11,7 @@
+ #include <set>
+ #include <functional>
+ #include <map>
++#include <thread>
+ 
+ struct ggml_cgraph;
+ struct ggml_context;
+@@ -632,10 +633,21 @@ public:
+         model(model),
+         mctx(mctx) {
+     }
+-    ~llm_graph_input_engram() = default;
++    ~llm_graph_input_engram() {
++        if (ahead.joinable()) {
++            ahead.join();
++        }
++    }
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+ 
++    // SiegeLadder G26: at graph build, hash this ubatch's rows of every engram layer and have a helper thread fault
++    // their pages in with one PrefetchVirtualMemory (it waits for the drive), while the main thread builds and allocates
++    // the graph; set_input joins it first, then reads as before. The history is only read here - a graph reserve
++    // must not write it - and a row it gets wrong costs a fault later, never a wrong value
++    void read_ahead(const llama_ubatch & ubatch);
++    std::thread ahead;
++
+     std::vector<ggml_tensor *> kv; // per engram layer: F32 [n_hash_cols*head_dim, n_tokens]
+ 
+     const llama_hparams & hparams;
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index ead4008..4175c36 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1998,6 +1998,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+             cb(inp->kv[e], "engram_lookup", e);
+         }
+ 
++        // SiegeLadder G26 (on by default; LLAMA_ENGRAM_AHEAD=0 - off): the ubatch's Engram rows faulted in on a helper
++        // thread while the rest of the graph is built and allocated - at decode their PrefetchVirtualMemory waited
++        // ~1.8 ms per token for the drive on the thread the card waits on (SiegeLadder runs.md 4.77)
++        static const bool engram_ahead = getenv("LLAMA_ENGRAM_AHEAD") == nullptr || atoi(getenv("LLAMA_ENGRAM_AHEAD")) != 0;
++        if (engram_ahead) {
++            inp->read_ahead(ubatch);
++        }
++
+         inp_engram = inp.get();
+         res->add_input(std::move(inp));
+     }

@@ -1,0 +1,366 @@
+From b51ac3f65ffe3875a97fde4de8e95f53fbb96b9d Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:02:23 +0000
+Subject: [PATCH 24/91] moe-stream : slab uploads enqueued on a stream of their
+ own and fenced once per call, instead of a synchronize after every slab
+
+A worker only enqueues its slab (ggml_backend_tensor_set_async on a second CUDA backend instance of the
+cache's device) and goes on to its next one; a slot counts as RESIDENT once all its slabs are enqueued, and
+every op that hands slot ids to the graph (the remap, a prefill wave) ends with an event on the upload
+stream that the compute stream waits on. L2 memory a copy reads stays pinned until the next such op, when
+the fence has completed (also checked on the event). A copy out of a worker's own pageable staging buffer
+goes on the same stream and is waited for at once. CUDA only, one live context per model: a second one
+(an MTP draft) switches the manager back to the synchronous path. LLAMA_MOE_STREAM_ASYNC_UPLOAD=0: the old
+synchronous copy per slab.
+
+SiegeLadder runs.md 4.38: main mode (L2 46 GiB, PASSIVE) 12.23 vs 11.50 tok/s (+6%), text = trace, ds4
+general-100 NLL bit-identical. Prefill waves lose 2-4% (the fence also covers the next wave's preloads).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    |  17 ++++
+ src/llama-moe-stream.cpp | 185 ++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   |  40 +++++++++
+ 3 files changed, 241 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6d4fe1b..67fc98c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -491,9 +491,26 @@ llama_context::llama_context(
+             sampling.token_ids_full_vocab[i] = i;
+         }
+     }
++
++    // MoE expert streaming: slab uploads go on a stream of their own and are fenced against this
++    // context's compute stream (llama_moe_stream::async_upload). Attached as the very last step, so a
++    // constructor that throws earlier leaves the manager no pointer to a backend about to be freed;
++    // contexts that only measure memory (no_alloc) do not attach
++    if (auto * ms = model.moe_stream(); ms != nullptr && !model.hparams.no_alloc) {
++        for (auto & backend : backends) {
++            ms->attach_backend(backend.get());
++        }
++    }
+ }
+ 
+ llama_context::~llama_context() {
++    // the expert stream must stop fencing against a compute stream that is about to go away
++    if (auto * ms = model.moe_stream()) {
++        for (auto & backend : backends) {
++            ms->detach_backend(backend.get());
++        }
++    }
++
+     // wait for any pending asynchronous copies into the output buffers before they are freed
+     synchronize();
+ 
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 4676986..6844fe7 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -362,6 +362,16 @@ void llama_moe_stream_l2::commit(size_t slot, size_t head) {
+     cv.notify_all(); // demand loads waiting in find_wait() for this slab
+ }
+ 
++void llama_moe_stream_l2::commit_pinned(size_t slot, size_t head) {
++    L2_LOCK(*this);
++    entry & e = entries[slot];
++    e.head = (uint32_t) head;
++    e.st   = RESIDENT;
++    e.pins++; // the upload enqueued out of this memory has not run yet; release() once a fence covers it
++    n_fill++;
++    cv.notify_all();
++}
++
+ void llama_moe_stream_l2::abandon(size_t slot) {
+     L2_LOCK(*this);
+     entry & e = entries[slot];
+@@ -581,6 +591,10 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+                     __func__, route_bias);
+         }
+     }
++
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_ASYNC_UPLOAD")) {
++        async_upload = std::strtol(p, nullptr, 10) != 0;
++    }
+ }
+ 
+ // stop and join the I/O workers before the cache buffers and files they use are destroyed
+@@ -597,6 +611,140 @@ llama_moe_stream::~llama_moe_stream() {
+     for (auto & w : workers) {
+         w.join();
+     }
++
++    // the copies still in flight read L2 memory and write the cache buffers: let them land first
++    if (up_backend) {
++        ggml_backend_synchronize(up_backend);
++    }
++    if (up_fence) {
++        ggml_backend_event_free(up_fence);
++    }
++    if (up_backend) {
++        ggml_backend_free(up_backend);
++    }
++}
++
++void llama_moe_stream::attach_backend(ggml_backend_t backend) {
++    if (!async_upload || backend == nullptr || bufs.empty()) {
++        return;
++    }
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++        return;
++    }
++    // CUDA only: the safety argument rests on CUDA's copy semantics (pinned sources, one ordered stream,
++    // cudaStreamWaitEvent). Vulkan defers the memcpy of a pageable source to submit time, and Metal
++    // shares one queue between backend instances and keeps every command buffer until a synchronize.
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    if (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
++        return;
++    }
++    // every cache buffer must live on this device: the async copy is issued by this device's backend
++    for (const auto & buf : bufs) {
++        if (ggml_backend_buffer_get_type(buf.get()) != ggml_backend_get_default_buffer_type(backend)) {
++            return; // the cache is on another device (or in host memory); that device's backend may attach
++        }
++    }
++    if (compute_backend != nullptr) {
++        if (backend == compute_backend) {
++            return;
++        }
++        // A second live context on this model (an MTP draft context, for one). The fence makes only the first
++        // context's compute stream wait, and the drain relies on that stream's synchronize, so a second compute
++        // stream could read slots whose copies have not landed. Synchronous uploads from here on.
++        std::lock_guard<std::mutex> lock(mtx);
++        std::lock_guard<std::mutex> up(upload_mtx);
++        ggml_backend_synchronize(up_backend);
++        for (const auto & p : up_l2_pending) {
++            if (l2) {
++                l2->release(p.second);
++            }
++        }
++        up_l2_pending.clear();
++        up_fenced       = up_seq;
++        compute_backend = nullptr;
++        async_upload    = false;
++        LLAMA_LOG_WARN("%s: MoE expert streaming: a second context uses this model (an MTP draft?), "
++                "slab uploads are synchronous per slab from now on\n", __func__);
++        return;
++    }
++    // a context attached before and was freed (detach_backend): its upload stream and event are reused
++    if (up_backend == nullptr) {
++        up_backend = ggml_backend_dev_init(dev, nullptr);
++    }
++    if (up_backend != nullptr && up_fence == nullptr) {
++        up_fence = ggml_backend_event_new(dev);
++    }
++    if (up_backend == nullptr || up_fence == nullptr) {
++        LLAMA_LOG_WARN("%s: MoE expert streaming: no second stream or no events on %s, uploads stay synchronous\n",
++                __func__, ggml_backend_name(backend));
++        return;
++    }
++    std::lock_guard<std::mutex> lock(mtx);
++    std::lock_guard<std::mutex> up(upload_mtx); // the workers read compute_backend under upload_mtx
++    compute_backend = backend;
++    LLAMA_LOG_INFO("%s: MoE expert streaming: slab uploads are asynchronous on a stream of their own, "
++            "fenced once per call (LLAMA_MOE_STREAM_ASYNC_UPLOAD=0: synchronous per slab)\n", __func__);
++}
++
++void llama_moe_stream::detach_backend(ggml_backend_t backend) {
++    if (backend == nullptr || backend != compute_backend) {
++        return;
++    }
++    // the compute stream goes away with its context: wait for the copies, then fall back to the
++    // synchronous path; the L2 pins they held are released now that the copies have landed
++    std::lock_guard<std::mutex> lock(mtx);
++    std::lock_guard<std::mutex> up(upload_mtx);
++    ggml_backend_synchronize(up_backend);
++    for (const auto & p : up_l2_pending) {
++        if (l2) {
++            l2->release(p.second);
++        }
++    }
++    up_l2_pending.clear();
++    up_fenced       = up_seq;
++    compute_backend = nullptr;
++}
++
++void llama_moe_stream::fence_locked() {
++    if (compute_backend == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> up(upload_mtx);
++    if (up_seq == up_fenced) {
++        return; // nothing enqueued since the last fence, which the compute stream already waits on
++    }
++    ggml_backend_event_record(up_fence, up_backend);
++    ggml_backend_event_wait(compute_backend, up_fence);
++    up_fenced = up_seq;
++    n_up_fences++;
++}
++
++void llama_moe_stream::drain_l2_locked() {
++    if (compute_backend == nullptr) {
++        return;
++    }
++    // Called at the start of an op that hands slot ids to the graph. The scheduler synchronized the
++    // compute stream before this CPU split, and that stream waited on the last fence, so every copy
++    // the fence covered has landed and its L2 memory may be reused.
++    std::lock_guard<std::mutex> up(upload_mtx);
++    if (up_l2_pending.empty()) {
++        return;
++    }
++    // Belt and braces: the fence's latest record is exactly up_fenced (both change under upload_mtx), so this
++    // returns at once when the argument above holds, and keeps the release independent of scheduler internals.
++    ggml_backend_event_synchronize(up_fence);
++    size_t keep = 0;
++    for (size_t i = 0; i < up_l2_pending.size(); i++) {
++        if (up_l2_pending[i].first <= up_fenced) {
++            if (l2) {
++                l2->release(up_l2_pending[i].second);
++            }
++        } else {
++            up_l2_pending[keep++] = up_l2_pending[i];
++        }
++    }
++    up_l2_pending.resize(keep);
+ }
+ 
+ ggml_tensor * llama_moe_stream::create_cache_tensor(
+@@ -986,7 +1134,30 @@ void llama_moe_stream::worker_loop(int worker_id) {
+                     std::lock_guard<std::mutex> up(upload_mtx);
+                     moe_nvtx_pop();
+                     moe_nvtx_range r_upload("upload", sl.il);
+-                    ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
++                    if (compute_backend != nullptr) {
++                        // async_upload: only enqueued; the stream runs it while this worker goes on to its
++                        // next slab. The L2 memory it reads stays pinned until a fence after it has landed.
++                        const bool from_staging = filled_slot == SIZE_MAX && pinned_slot == SIZE_MAX;
++                        ggml_backend_tensor_set_async(up_backend, wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
++                        if (from_staging) {
++                            // this worker's own pageable buffer: wait on the SAME stream, so the buffer is free
++                            // again whatever the driver does with a pageable source, and no older copy into
++                            // this cache slot (a staged one not yet fenced) can land after this one
++                            ggml_backend_synchronize(up_backend);
++                        }
++                        const uint64_t seq = ++up_seq;
++                        if (filled_slot != SIZE_MAX) {
++                            l2->commit_pinned(filled_slot, filled_head);
++                            up_l2_pending.emplace_back(seq, filled_slot);
++                            filled_slot = SIZE_MAX;
++                        }
++                        if (pinned_slot != SIZE_MAX) {
++                            up_l2_pending.emplace_back(seq, pinned_slot);
++                            pinned_slot = SIZE_MAX;
++                        }
++                    } else {
++                        ggml_backend_tensor_set(wt.cache, data, (size_t) w.slot*wt.nb_expert, wt.nb_expert);
++                    }
+                 }
+                 // Only now is the memory free to be reused by someone else.
+                 if (filled_slot != SIZE_MAX) {
+@@ -1572,6 +1743,8 @@ void llama_moe_stream::print_stats(const char * role) const {
+                 __func__, l2->n_wait, l2->n_wait_hit, l2->t_wait_us/1000.0,
+                 l2->wait_loading ? "" : " - waiting OFF (LLAMA_MOE_STREAM_L2_WAIT=0)");
+     }
++    LLAMA_LOG_WARN("%s: %smoe stream: slab uploads %s: %" PRIu64 " enqueued, %" PRId64 " fences\n", __func__, pfx,
++            compute_backend != nullptr ? "asynchronous" : "synchronous per slab", up_seq, n_up_fences);
+     if (stats.n_wave_calls > 0) {
+         LLAMA_LOG_INFO("%s: %smoe stream: waves = %" PRId64 " (%" PRId64 " non-empty), preloads issued = %" PRId64 " (ready on arrival = %" PRId64 "), wave stall = %.2f ms, skipping = %" PRId64 "\n",
+                 __func__, pfx, stats.n_wave_calls, stats.n_waves_run, stats.n_preload_issued, stats.n_preload_ready, stats.t_stall_wave_us/1000.0, stats.n_waves_skip);
+@@ -1892,6 +2065,8 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+     }
+ 
++    mgr->drain_l2_locked(); // async_upload: the copies of earlier calls have landed
++
+     mgr->stats.n_calls++;
+     mgr->start_workers_locked();
+ 
+@@ -2205,6 +2380,10 @@ static void moe_stream_remap_impl(ggml_tensor * dst, const ggml_tensor * a, cons
+         mgr->stats.t_stall_us += ggml_time_us() - t0;
+     }
+ 
++    // async_upload: every slot this call uses is at least enqueued (a hit may have been staged after the
++    // last fence, so this runs whether the call waited or not); the expert GEMMs wait on the device
++    mgr->fence_locked();
++
+     for (int64_t i = 0; i < n; i++) {
+         if (sl->touched[ids[i]] == 2) {
+             out[i] = -1; // dropped: given a kept slot of its token below
+@@ -2506,6 +2685,8 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+         GGML_ABORT("MoE expert streaming: expert load failed (I/O error)");
+     }
+ 
++    mgr->drain_l2_locked(); // async_upload: the copies of earlier calls have landed
++
+     mgr->stats.n_wave_calls++;
+ 
+     if (w == 0) {
+@@ -2519,6 +2700,8 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+     sl->plan_next_wave = w + 1;
+ 
+     mgr->emit_wave_slots(*sl, ids, out, w, n_ids, a->ne[1]);
++
++    mgr->fence_locked(); // async_upload: this wave's GEMMs wait on the device for its enqueued slabs
+ }
+ 
+ // multi-pass prefill: 1.0 for pairs whose expert belongs to wave w, 0.0 otherwise; multiplied into
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 3da77b7..797535c 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -360,6 +360,9 @@ struct llama_moe_stream_l2 {
+     // upload, never before.
+     uint8_t * reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
+     void      commit(size_t slot, size_t head);
++    // commit() and a pin in one step, for an asynchronous upload still reading OUT of the slot: the
++    // slab becomes a hit for everyone at once, but cannot be evicted until release() (async_upload)
++    void      commit_pinned(size_t slot, size_t head);
+     void      abandon(size_t slot);
+ };
+ 
+@@ -540,6 +543,43 @@ struct llama_moe_stream {
+     // held only for the copy itself, which is short next to the disk read.
+     std::mutex              upload_mtx;
+ 
++    // Asynchronous uploads (SiegeLadder 17.10, plan step 2 / theory G3; LLAMA_MOE_STREAM_ASYNC_UPLOAD=0
++    // keeps the synchronous copy per slab, for A/B). Measured 16.10 under Nsight (SiegeLadder runs.md
++    // 4.36): 307 slab copies per token took 117 us each on the card but 145 us in the worker - every
++    // ggml_backend_tensor_set ends in a stream synchronize - so the copy engine idled 28 us between
++    // copies, 8.6 ms per token, and the workers queued 133 ms per token on upload_mtx.
++    //
++    // Here a worker only ENQUEUES its slab on a stream of its own (up_backend, a second instance of
++    // the cache's device) and moves on. A slot counts as RESIDENT once all its slabs are enqueued:
++    // every op that hands slot ids to the graph (the remap, a prefill wave) ends with fence_locked(),
++    // which records an event on the upload stream and makes the compute stream wait for it. With one GPU
++    // the scheduler still synchronizes the compute stream before copying the op's slot ids into the GEMM
++    // split, so the host does wait for the fenced copies there - what goes away is the synchronize after
++    // every slab and the queue on upload_mtx. The stall counters (t_stall_us, the NVTX "upload" range,
++    // stage/preload "ready") now mean "enqueued", not "landed": compare runs on wall time and tok/s.
++    //
++    // The host memory a copy reads from must outlive the copy. An L2 slab stays pinned until a fence
++    // recorded after its copy has completed; that is known for certain at the start of the next such
++    // op, because the scheduler synchronizes the compute stream before every CPU split and the compute
++    // stream waited on the fence (drain_l2_locked, which also synchronizes the fence event itself). A copy
++    // out of the worker's own pageable staging buffer goes on the same stream and is waited for at once.
++    // Only CUDA, and only one live context per model: a second one (an MTP draft) turns this off.
++    bool                 async_upload    = true;
++    ggml_backend_t       up_backend      = nullptr; // own stream for the H2D copies of slabs
++    ggml_backend_t       compute_backend = nullptr; // the scheduler's instance of the same device
++    ggml_backend_event_t up_fence        = nullptr;
++    uint64_t             up_seq          = 0;  // slab copies enqueued so far        (upload_mtx)
++    uint64_t             up_fenced       = 0;  // copies covered by the last fence   (upload_mtx)
++    std::vector<std::pair<uint64_t, size_t>> up_l2_pending; // (copy seq, L2 slot) still read by a copy (upload_mtx)
++    int64_t              n_up_fences     = 0;
++
++    // called by the context once its backends exist; the first GPU backend on the cache's device is
++    // taken. detach_backend() before that backend is freed (the context's destructor).
++    void attach_backend(ggml_backend_t backend);
++    void detach_backend(ggml_backend_t backend);
++    void fence_locked();     // under mtx: make the compute stream wait for every slab enqueued so far
++    void drain_l2_locked();  // under mtx: unpin the L2 slots whose copies a completed fence covered
++
+     std::deque<llama_moe_stream_work> q_demand;
+ 
+     // Staged loads (A4b): cache slots already reserved for a call that has not run yet. Served after

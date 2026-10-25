@@ -1,0 +1,779 @@
+From d1bae471f7b068f015c3ef47f9a3aa687214d8c8 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 14:56:54 +0000
+Subject: [PATCH 37/91] moe-stream : the host tier in size classes (SiegeLadder
+ M3), runahead's pass skips its pairs off the card, the drop rule's inputs in
+ one tensor, and the pass's attention by part of the heads (G21, a
+ measurement) - M3: a pool per slab length (gate / up 3 041 280 B in 3 051
+ 520-byte slots, down 3 870 720 B in 3 878 912), each with its own CLOCK hand
+ and sized by the slabs of its class in the model, slots numbered across the
+ pools so a slot index means to every caller what it did; classes whose slots
+ differ by less than 1/16 share a pool. 4 948 experts at 46 GiB instead of 4
+ 244: drive reads -14.4%, L2 70.7 -> 74.8%, decode +2.2% (SiegeLadder runs.md
+ 4.57 / 4.59, ABBA blocks; text = trace, the pools evict 2.07 times per slot
+ both); LLAMA_MOE_STREAM_L2_CLASSES=0 = one pool. A pinned allocation that
+ comes back as an ordinary CPU buffer (the CUDA host buffer type falls back to
+ one quietly) no longer counts as the pinned tier - it is neither page-locked
+ nor aligned for direct I/O - and the one-pool slot is rounded up to 4096 as
+ well. LLAMA_MOE_STREAM_RA_SKIP (default on, 0 = before): runahead's first
+ half gives the pass's pairs off the card the skip id instead of a borrowed
+ resident slot, and the pass's down GEMM zeroes their rows (op_params[2] = 1)
+ - the zeros weight 0 made, so the same guess; only where the pass ends in
+ that mul_mat_id on a CUDA cache. Speed 0% with the order controlled (the pass
+ keeps 87.7% of its pairs; an early +1.6% was the position in the pair).
+ LLAMA_MOE_STREAM_DROP_PACK (default on, 0 = apart): the drop rule's expert
+ ids ride as floats (exact below 2^24) next to the routing weights in one F32
+ tensor [k, 2*n_tokens], one card input of the remap's CPU split instead of
+ two, unpacked by remap_v / remap_issue - the deterministic DROP_VRAM_ONLY=3
+ gives PPL, KL, max KLD, top-1 and 92 633 drops identical to the build before
+ it, and no measurable gain (14.17 vs 14.19 tok/s: the second synchronize
+ waits for an idle card). LLAMA_MOE_STREAM_RA_GROUPS=g (+ _SCALE=1, off by
+ default): the pass's next-layer attention on the heads of the first g of the
+ 8 output groups, through views of the same weights (wq_b rows, attn_sinks,
+ wo_a slices, a strided view of wo_b's columns) - half the groups save 3.1 ms
+ of GEMV per token but cut the guess's recall 92 -> 76% with 7x the false
+ stages, -5.5% (runs.md 4.58)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-graph.cpp      |  37 ++++++-
+ src/llama-moe-stream.cpp | 229 +++++++++++++++++++++++++++++++++------
+ src/llama-moe-stream.h   |  53 ++++++++-
+ src/models/deepseek4.cpp |  71 ++++++++----
+ src/models/models.h      |  10 +-
+ 5 files changed, 332 insertions(+), 68 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index bc0f4dd..fd47048 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2322,6 +2322,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     ggml_tensor * ra_mask   = nullptr;
+     if (msl && n_stream_waves == 1) {
+         ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts); // top_k output is a view
++        // The drop rule's remap reads the routing weights too. ggml's scheduler copies every card input of a CPU split
++        // with a synchronize and a synchronous copy of its own (SiegeLadder runs.md 4.55: +2.5 ms per token of
++        // cudaStreamSynchronize for the second input), so the ids ride as floats next to the weights - exact below
++        // 2^24 - in one tensor [k, 2*n_tokens], the ids' rows first (llama_moe_stream_remap_v / _issue unpack it).
++        // LLAMA_MOE_STREAM_DROP_PACK=0 passes them apart, for A/B
++        static const bool drop_pack = getenv("LLAMA_MOE_STREAM_DROP_PACK") == nullptr ||
++                atoi(getenv("LLAMA_MOE_STREAM_DROP_PACK")) != 0;
++        auto add_ids_weights = [&](ggml_tensor ** args, int & n_args) {
++            ggml_tensor * w = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
++            if (drop_pack) {
++                ggml_tensor * ids_f = ggml_cast(ctx0, ids_cont, GGML_TYPE_F32);
++                args[n_args++] = ggml_concat(ctx0, ids_f, ggml_reshape_2d(ctx0, w, ids_cont->ne[0], ids_cont->ne[1]), 1);
++            } else {
++                args[n_args++] = ids_cont;
++                args[n_args++] = w;
++            }
++        };
+         if (moe_runahead && msl->mgr->runahead_k > 0 && n_tokens == 1 && !weight_before_ffn && pred_next == nullptr &&
+                 n_expert_used == (int64_t) hparams.n_expert_used) {
+             // the remap in two halves: the first queues the call's loads and returns at once with the slots of its
+@@ -2329,10 +2346,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             // stay on one host split. The approximate pass and the second half follow the expert GEMMs' definition.
+             // With the drop rule the first half also takes the routing weights and decides what is dropped
+             // (SiegeLadder 17.10: the fast preset's drop + runahead)
+-            ggml_tensor * iargs[2] = { ids_cont, nullptr };
+-            int n_iargs = 1;
++            ggml_tensor * iargs[2] = { nullptr, nullptr };
++            int n_iargs = 0;
+             if (msl->mgr->drop_w > 0.0f) {
+-                iargs[n_iargs++] = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
++                add_ids_weights(iargs, n_iargs);
++            } else {
++                iargs[n_iargs++] = ids_cont;
+             }
+             ra_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32, ids_cont->ne[0], ids_cont->ne[1], 1, 1, iargs, n_iargs,
+                     llama_moe_stream_remap_issue, 1, msl);
+@@ -2346,8 +2365,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             // drop rule (LLAMA_MOE_STREAM_DROP_W, lossy, off by default): the remap also needs this call's
+             // routing weights to tell the low-weight experts; the prediction, when there is one, rides along.
+             // Its weight multipliers come out of a second op right after it, on the same host split.
+-            ggml_tensor * args[3] = { ids_cont, ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights), nullptr };
+-            int n_args = 2;
++            ggml_tensor * args[3] = { nullptr, nullptr, nullptr };
++            int n_args = 0;
++            add_ids_weights(args, n_args);
+             if (pred_next != nullptr) {
+                 args[n_args++] = ggml_cont(ctx0, pred_next);
+             }
+@@ -2605,6 +2625,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     moe_a = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f);
+                 } else {
+                     ggml_tensor * e_a = build_expert_gemms(cur, ra_ids, nullptr);
++                    // SiegeLadder G21: the pairs off the card skip these GEMMs (the first half gives them the skip id)
++                    // and the down GEMM zeroes their rows - only when the pipeline ends in that GEMM itself, as for the
++                    // prefill waves: a bias, scale or LoRA term after it would land on the zeroed rows
++                    msl->ra_skip_ok = msl->mgr->ra_skip && msl->mgr->skip_capable && e_a->op == GGML_OP_MUL_MAT_ID;
++                    if (msl->ra_skip_ok) {
++                        e_a->op_params[2] = 1;
++                    }
+                     e_a = ggml_mul(ctx0, e_a, ggml_mul(ctx0, weights, ra_mask));
+                     cb(e_a, "ffn_moe_weighted_approx", il);
+                     moe_a = ggml_view_2d(ctx0, e_a, n_embd, n_tokens, e_a->nb[2], 0);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index dc81576..9283961 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -233,7 +233,7 @@ const uint8_t * llama_moe_stream_l2::find(uint16_t file_idx, size_t offs, size_t
+     e.ref = 1;
+     n_hit++;
+     *out_slot = it->second;
+-    return base + it->second*slot_stride + e.head;
++    return slot_ptr(it->second) + e.head;
+ }
+ 
+ const uint8_t * llama_moe_stream_l2::find_wait(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
+@@ -264,7 +264,7 @@ const uint8_t * llama_moe_stream_l2::find_wait(uint16_t file_idx, size_t offs, s
+                 t_wait_us += ggml_time_us() - t_wait0;
+             }
+             *out_slot = it->second;
+-            return base + it->second*slot_stride + e.head;
++            return slot_ptr(it->second) + e.head;
+         }
+         // LOADING: a read of these very bytes is in flight
+         if (!wait_loading) {
+@@ -293,7 +293,18 @@ void llama_moe_stream_l2::release(size_t slot) {
+ }
+ 
+ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot) {
+-    if (base == nullptr || len + 2*MOE_STREAM_DIRECT_ALIGN > slot_stride) {
++    if (base == nullptr) {
++        return nullptr;
++    }
++    // the smallest slots the slab fits (M3); a pool whose every slot is in flight does not borrow from the next
++    pool * p = nullptr;
++    for (pool & q : pools) {
++        if (len <= q.max_len) {
++            p = &q;
++            break;
++        }
++    }
++    if (p == nullptr || p->n == 0) {
+         return nullptr;
+     }
+     const uint64_t key = make_key(file_idx, offs);
+@@ -305,10 +316,10 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
+ 
+     // CLOCK (second chance): a slab hit since the hand last passed it survives one sweep. Two
+     // sweeps at most, because the first clears every reference bit it walks over.
+-    const size_t start = next_victim;
+-    const size_t sweep = clock ? 2*n_entries : n_entries;
++    const size_t start = p->next_victim - p->first;
++    const size_t sweep = clock ? 2*p->n : p->n;
+     for (size_t i = 0; i < sweep; i++) {
+-        const size_t s = (start + i) % n_entries;
++        const size_t s = p->first + (start + i) % p->n;
+         entry & e = entries[s];
+         if (e.st == LOADING || e.pins > 0) {
+             // LOADING: a worker is filling it. pins > 0: a worker is uploading OUT of it. Both are
+@@ -322,6 +333,7 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
+             }
+             index.erase(e.key);
+             n_evict++;
++            p->n_evict++;
+         }
+         e.key  = key;
+         e.len  = (uint32_t) len;
+@@ -329,12 +341,12 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
+         e.pins = 0;
+         e.ref  = 0;
+         e.st   = LOADING;
+-        index[key]  = s;
+-        next_victim = (s + 1) % n_entries;
+-        *out_slot   = s;
+-        return base + s*slot_stride;
++        index[key]     = s;
++        p->next_victim = p->first + (s - p->first + 1) % p->n;
++        *out_slot      = s;
++        return slot_ptr(s);
+     }
+-    return nullptr; // every slot is in flight
++    return nullptr; // every slot of the pool is in flight
+ }
+ 
+ bool llama_moe_stream_l2::has(uint16_t file_idx, size_t offs, size_t len) {
+@@ -386,21 +398,79 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+     if (l2_gib == 0 || max_nb_expert == 0) {
+         return;
+     }
+-    // Every slot takes the largest slab plus the direct-I/O head/tail slack, so any weight fits
+-    // any slot. Uniform slots waste the difference between the widest and the narrowest weight
+-    // (0.5 MiB of 3.06 on the shipped model) and buy an allocator that cannot fragment.
+-    const size_t stride = max_nb_expert + 2*MOE_STREAM_DIRECT_ALIGN;
+-    const size_t want   = l2_gib * 1024ull * 1024ull * 1024ull;
+-    const size_t n_l2   = want / stride;
++    // A slot takes the longest slab of its pool plus the direct-I/O head/tail slack. Before M3 there was one pool,
++    // sized to the largest slab of all, which wasted the difference between the widest and the narrowest weight
++    // (0.5 MiB of 3.06 on the shipped model; 0.8 of 3.7 on the V4.1 Q2mix) and bought an allocator that cannot
++    // fragment. Now a pool per class of slab length (SiegeLadder M3, theories.md), each sized by the slabs of its
++    // class the model has: every expert brings all its weights, so the pools fill at the rate of their size and
++    // their CLOCK hands go round together. Pools still cannot fragment, and each slot stays aligned for direct I/O.
++    const size_t A    = MOE_STREAM_DIRECT_ALIGN;
++    const size_t want = l2_gib * 1024ull * 1024ull * 1024ull;
++
++    bool classes = true;
++    if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_CLASSES")) {
++        classes = std::strtol(s, nullptr, 10) != 0;
++    }
++
++    struct cls { size_t stride; double n_slab; };
++    std::vector<cls> cs; // ascending by stride
++    if (classes) {
++        std::vector<std::pair<size_t, double>> lens; // (slab length, slabs of it in the model)
++        for (const auto & sl : layers) {
++            if (!sl) {
++                continue;
++            }
++            for (const auto & wt : sl->weights) {
++                lens.emplace_back(wt.nb_expert, (double) sl->n_expert);
++            }
++        }
++        std::sort(lens.begin(), lens.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
++        // from the longest down; a class whose slots would be at least 15/16 of the next longer one's joins it,
++        // since a pool of its own would save a few % of its slots and split the eviction order for that
++        for (const auto & [len, n] : lens) {
++            const size_t stride = (len + 2*A + A - 1)/A*A;
++            if (!cs.empty() && stride*16 >= cs.back().stride*15) {
++                cs.back().n_slab += n;
++            } else {
++                cs.push_back({ stride, n });
++            }
++        }
++        std::reverse(cs.begin(), cs.end());
++    }
++    if (cs.size() <= 1) {
++        // one pool: the layout before M3 (also LLAMA_MOE_STREAM_L2_CLASSES=0), its slot now rounded up to the alignment
++        // as well - unrounded, a largest slab that is not a multiple of 4096 left every slot after the first unaligned for
++        // direct I/O (both shipped models' are multiples, so their layout is unchanged)
++        cs.assign(1, { (max_nb_expert + 2*A + A - 1)/A*A, 1.0 });
++    }
++
++    double per_unit = 0.0; // bytes of one slab of every class, weighted by its count
++    for (const cls & c : cs) {
++        per_unit += c.n_slab*(double) c.stride;
++    }
++
++    auto tier = std::make_unique<llama_moe_stream_l2>();
++    size_t n_l2 = 0;
++    size_t offs = 0;
++    for (const cls & c : cs) {
++        llama_moe_stream_l2::pool p;
++        p.stride      = c.stride;
++        p.max_len     = c.stride - 2*A;
++        p.first       = n_l2;
++        p.n           = cs.size() == 1 ? want / c.stride : (size_t) ((double) want*c.n_slab/per_unit);
++        p.offs        = offs;
++        p.next_victim = p.first;
++        n_l2 += p.n;
++        offs += p.n*p.stride;
++        tier->pools.push_back(p);
++    }
++    GGML_ASSERT(offs <= want);
+     if (n_l2 == 0) {
+         LLAMA_LOG_WARN("%s: L2 of %zu GiB is smaller than one %zu-byte slot - tier not created\n",
+-                __func__, l2_gib, stride);
++                __func__, l2_gib, tier->pools.front().stride);
+         return;
+     }
+-
+-    auto tier = std::make_unique<llama_moe_stream_l2>();
+-    tier->slot_stride = stride;
+-    tier->n_entries   = n_l2;
++    tier->n_entries = n_l2;
+ 
+     if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_CLOCK")) {
+         tier->clock = std::strtol(s, nullptr, 10) != 0;
+@@ -409,7 +479,7 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+         tier->wait_loading = std::strtol(s, nullptr, 10) != 0;
+     }
+ 
+-    const size_t bytes = n_l2 * stride;
++    const size_t bytes = tier->bytes();
+ 
+     // M9: pinned memory counts against the shared (non-local) WDDM budget; past it the tier is not locked (4.36)
+     {
+@@ -424,6 +494,16 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+ 
+     if (host_buft != nullptr) {
+         ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(host_buft, bytes);
++        // a pinned allocation the driver refused may come back as an ordinary CPU buffer (the CUDA host buffer type
++        // falls back to one, saying so only at debug level): not page-locked, and aligned for SIMD rather than for
++        // direct I/O. Such a buffer is not the tier's pinned memory - the aligned fallback below takes its place
++        if (b != nullptr && (ggml_backend_buffer_get_type(b) != host_buft ||
++                             (uintptr_t) ggml_backend_buffer_get_base(b) % A != 0)) {
++            LLAMA_LOG_WARN("%s: the pinned allocation for the L2 tier came back as an ordinary buffer - using pageable memory\n",
++                    __func__);
++            ggml_backend_buffer_free(b);
++            b = nullptr;
++        }
+         if (b != nullptr) {
+             tier->buf.reset(b);
+             tier->base   = (uint8_t *) ggml_backend_buffer_get_base(b);
+@@ -451,11 +531,18 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+     // has been PAGE-LOCKED and is gone from the rest of the machine until the process exits.
+     // A user who passes --moe-stream-l2 and sees nothing cannot tell it took effect from a typo,
+     // and silently holding 32 GiB is not something to find out from the task manager.
+-    LLAMA_LOG_WARN("%s: MoE L2 host tier = %.2f GiB %s, %zu slots of %zu bytes, eviction %s\n",
++    std::string sizes;
++    for (const auto & p : tier->pools) {
++        sizes += format("%s%zu of %zu bytes", sizes.empty() ? "" : " + ", p.n, p.stride);
++    }
++    LLAMA_LOG_WARN("%s: MoE L2 host tier = %.2f GiB %s, %zu slots (%s; %s), eviction %s\n",
+             __func__, bytes/1024.0/1024.0/1024.0,
+             tier->pinned ? "PINNED (page-locked, unavailable to the rest of the system)"
+                          : "PAGEABLE (no host buffer type - uploads stay at pageable rates)",
+-            n_l2, stride, tier->clock ? "CLOCK" : "FIFO");
++            n_l2, sizes.c_str(),
++            tier->pools.size() > 1 ? "a pool per slab size" :
++                classes ? "one slab size" : "one slot size, LLAMA_MOE_STREAM_L2_CLASSES=0",
++            tier->clock ? "CLOCK" : "FIFO");
+ 
+     l2 = std::move(tier);
+ }
+@@ -568,6 +655,15 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_DEBUG")) {
+         ra_debug = atoi(p);
+     }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_GROUPS")) {
++        ra_groups = std::max(0, atoi(p));
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_GROUPS_SCALE")) {
++        ra_groups_scale = atoi(p) != 0;
++    }
++    if (const char * p = std::getenv("LLAMA_MOE_STREAM_RA_SKIP")) {
++        ra_skip = atoi(p) != 0;
++    }
+     // the drop rule runs inside runahead's first half when both are asked for (SiegeLadder 17.10, the fast preset);
+     // its VRAM_ONLY / ONLY_LAYER measurement modes stay without runahead: VRAM_ONLY=2 may leave a token no kept pair
+     if (runahead_k > 0 && drop_w > 0.0f && (drop_vram_only != 0 || drop_only_layer >= 0)) {
+@@ -586,6 +682,10 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+         LLAMA_LOG_WARN("%s: moe stream: runahead on: at decode each streamed layer's remap is split in two; between "
+                 "the halves the next layer's experts are predicted from an approximate pass over the resident ones, "
+                 "and its top %u staged into VRAM\n", __func__, runahead_k);
++        if (ra_groups > 0) {
++            LLAMA_LOG_WARN("%s: moe stream: runahead's pass attends with the heads of the first %d output groups%s (G21)\n",
++                    __func__, ra_groups, ra_groups_scale ? ", scaled up to all" : "");
++        }
+     }
+     if (drop_w > 0.0f) {
+         LLAMA_LOG_WARN("%s: moe stream: DROP RULE ON (lossy): an expert held in neither VRAM nor the host tier with "
+@@ -1211,7 +1311,8 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+                 LLAMA_LOG_WARN("%s: %s cannot skip pairs: waves park them, which needs 3*n_expert_used slots "
+                         "(%u per layer here)\n", __func__, ggml_backend_buft_name(buft), n_slots);
+             }
+-            wave_skip = false;
++            wave_skip    = false;
++            skip_capable = false;
+         }
+     }
+     if (!no_alloc) {
+@@ -2212,11 +2313,16 @@ void llama_moe_stream::print_stats(const char * role) const {
+         }
+     }
+     if (stats.n_ra_calls > 0) {
++        bool skipped = false;
++        for (const auto & sl : layers) {
++            skipped = skipped || (sl && sl->ra_skip_ok);
++        }
+         LLAMA_LOG_WARN("%s: %smoe stream: runahead: %" PRId64 " calls split in two, the prediction above made between "
+-                "the halves; the approximate pass kept %.1f%% of their pairs (%" PRId64 " calls had no resident slot); "
+-                "%.3f ms between the halves on average; %" PRId64 " experts loaded again\n",
++                "the halves; the approximate pass kept %.1f%% of their pairs (%" PRId64 " calls had no resident slot), "
++                "the others %s; %.3f ms between the halves on average; %" PRId64 " experts loaded again\n",
+                 __func__, pfx, stats.n_ra_calls, stats.n_ra_pairs > 0 ? 100.0*stats.n_ra_kept/stats.n_ra_pairs : 0.0,
+-                stats.n_ra_invalid, 1e-3*stats.t_ra_gap_us/stats.n_ra_calls, stats.n_ra_redo);
++                stats.n_ra_invalid, skipped ? "skipped its GEMMs" : "ran on a borrowed slot at weight 0",
++                1e-3*stats.t_ra_gap_us/stats.n_ra_calls, stats.n_ra_redo);
+     }
+     if (stats.n_calls > 0) {
+         // G21: the lock the I/O workers take for every slab they pick up and publish; a remap waits for it on the
+@@ -2286,8 +2392,17 @@ void llama_moe_stream::print_stats(const char * role) const {
+         std::lock_guard<std::mutex> l2lock(l2->mtx);
+         const int64_t n_slab = l2->n_hit + l2->n_fill;
+         LLAMA_LOG_INFO("%s: moe stream: L2 host tier = %.2f GiB %s, %zu slots\n",
+-                __func__, l2->n_entries*l2->slot_stride/1024.0/1024.0/1024.0,
++                __func__, l2->bytes()/1024.0/1024.0/1024.0,
+                 l2->pinned ? "pinned" : "PAGEABLE", l2->n_entries);
++        if (l2->pools.size() > 1) {
++            // M3: the pools' hands should go round together - evictions per slot about equal
++            std::string per;
++            for (const auto & p : l2->pools) {
++                per += format("%s%zu-byte slots %" PRId64 " (%.2f per slot)", per.empty() ? "" : ", ", p.stride,
++                        p.n_evict, p.n > 0 ? (double) p.n_evict/p.n : 0.0);
++            }
++            LLAMA_LOG_WARN("%s: moe stream: L2 evictions by slot size: %s\n", __func__, per.c_str());
++        }
+         LLAMA_LOG_WARN("%s: moe stream: L2 slab hits = %" PRId64 ", fills = %" PRId64 ", evictions = %" PRId64 ", hit rate = %.2f%%\n",
+                 __func__, l2->n_hit, l2->n_fill, l2->n_evict,
+                 n_slab > 0 ? 100.0*l2->n_hit/n_slab : 0.0);
+@@ -2610,13 +2725,48 @@ void llama_moe_stream_remap_pred(ggml_tensor * dst, const ggml_tensor * a, const
+     moe_stream_remap_impl(dst, a, b, nullptr, userdata);
+ }
+ 
++// The drop rule's ids and routing weights packed by the graph into one F32 tensor [k, 2*n_tokens], the ids' rows first
++// (llm_graph_context::build_moe_ffn, LLAMA_MOE_STREAM_DROP_PACK): one card input of the CPU split, one synchronize. Unpacked
++// into int32 ids and two tensor headers shaped like dst. false when src is not packed (the ids alone, I32)
++struct moe_ids_weights {
++    std::vector<int32_t> ids;
++    ggml_tensor          a;
++    ggml_tensor          w;
++};
++
++static bool moe_unpack_ids_weights(const ggml_tensor * dst, const ggml_tensor * src, moe_ids_weights & u) {
++    if (src == nullptr || src->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const int64_t n = ggml_nelements(dst);
++    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst));
++    GGML_ASSERT(ggml_is_contiguous(src) && src->ne[0] == dst->ne[0] && ggml_nelements(src) == 2*n);
++    const float * p = (const float *) src->data;
++    u.ids.resize((size_t) n);
++    for (int64_t i = 0; i < n; i++) {
++        u.ids[i] = (int32_t) p[i];
++    }
++    u.a      = *dst;
++    u.a.data = u.ids.data();
++    u.w      = *dst;
++    u.w.type = GGML_TYPE_F32; // same element size as I32, so dst's strides hold
++    u.w.data = (void *) (p + n);
++    return true;
++}
++
+ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userdata) {
+     GGML_UNUSED(nth);
+     if (ith != 0) {
+         return;
+     }
++    const ggml_tensor * ids  = dst->src[0];
+     const ggml_tensor * pred = nullptr;
+     const ggml_tensor * wts  = nullptr;
++    moe_ids_weights u;
++    if (moe_unpack_ids_weights(dst, ids, u)) {
++        ids = &u.a;
++        wts = &u.w;
++    }
+     for (int i = 1; i < GGML_MAX_SRC && dst->src[i] != nullptr; i++) {
+         if (dst->src[i]->type == GGML_TYPE_F32) {
+             wts = dst->src[i];
+@@ -2624,7 +2774,7 @@ void llama_moe_stream_remap_v(ggml_tensor * dst, int ith, int nth, void * userda
+             pred = dst->src[i];
+         }
+     }
+-    moe_stream_remap_impl(dst, dst->src[0], pred, wts, userdata);
++    moe_stream_remap_impl(dst, ids, pred, wts, userdata);
+ }
+ 
+ void llama_moe_stream_drop_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
+@@ -2649,7 +2799,12 @@ void llama_moe_stream_remap_issue(ggml_tensor * dst, int ith, int nth, void * us
+     if (ith != 0) {
+         return;
+     }
+-    // src[1]: the routing weights, when the drop rule runs next to runahead
++    // with the drop rule next to runahead the routing weights come too: packed with the ids in src[0], or apart in src[1]
++    moe_ids_weights u;
++    if (moe_unpack_ids_weights(dst, dst->src[0], u)) {
++        moe_stream_remap_impl(dst, &u.a, nullptr, &u.w, userdata, /*issue_only =*/ true);
++        return;
++    }
+     moe_stream_remap_impl(dst, dst->src[0], nullptr, dst->src[1], userdata, /*issue_only =*/ true);
+ }
+ 
+@@ -2722,6 +2877,16 @@ static void moe_stream_runahead_issue_locked(llama_moe_stream & mgr, llama_moe_s
+             }
+         }
+     }
++    if (sl.ra_skip_ok) {
++        // G21: the pairs at weight 0 leave the pass's GEMMs instead of running on the slot they borrowed - the down
++        // GEMM zeroes their rows (op_params[2] = 1), which is what weight 0 made of them, so the guess is the same.
++        // The borrowing above still runs: which calls have no resident slot, and the slots kept, are as before
++        for (int64_t i = 0; i < n; i++) {
++            if (sl.drop_mask[i] == 0.0f) {
++                out[i] = LLAMA_MOE_STREAM_SKIP_ID;
++            }
++        }
++    }
+     mgr.stats.n_ra_calls++;
+     mgr.stats.n_ra_pairs += n;
+     mgr.stats.n_ra_kept  += n_kept;
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index b172ab1..a7eb09e 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -176,6 +176,10 @@ struct llama_moe_stream_layer {
+     // the pairs outside a wave can be skipped instead of parked (see llama_moe_stream_wave_skip)
+     bool wave_skip_ok = false;
+ 
++    // set at graph build (SiegeLadder G21): runahead's approximate pass ends in its down mul_mat_id, on a cache that can
++    // leave pairs out, so the first half gives the pairs off the card the skip id instead of a resident slot to borrow
++    bool ra_skip_ok = false;
++
+     // stable userdata for wave w (grows lazily); called at graph build time only
+     llama_moe_stream_wave * wave_userdata(int32_t wave, uint32_t capacity);
+ 
+@@ -324,14 +328,28 @@ struct llama_moe_stream_l2 {
+         uint8_t  ref  = 0;          // CLOCK reference bit: set on a hit, cleared by the hand
+     };
+ 
+-    uint8_t * base        = nullptr; // n_entries * slot_stride bytes
+-    size_t    slot_stride = 0;       // max_nb_expert + 2*align, so any slab fits any slot
+-    size_t    n_entries   = 0;
++    // SiegeLadder M3: slots in size classes. One slot size for every weight - the largest slab's - left two of every
++    // three slots of the Q2mix 22% too large (gate / up 3 041 280 B in slots for the down projection's 3 870 720),
++    // ~14% of the tier as slack. A pool per class of slab length now, each with its own slot size and CLOCK hand, and
++    // sized by how many slabs of its class the model has; slots are numbered across the pools (pool 0 first), so a slot
++    // index means to every caller what it always did. LLAMA_MOE_STREAM_L2_CLASSES=0: one pool, the old layout.
++    struct pool {
++        size_t max_len     = 0; // the longest slab it takes: stride - 2*align
++        size_t stride      = 0; // bytes per slot, a multiple of the direct-I/O alignment
++        size_t first       = 0; // its first slot index
++        size_t n           = 0; // its slots
++        size_t offs        = 0; // byte offset of its first slot in base
++        size_t next_victim = 0; // CLOCK hand, a slot index in [first, first + n)
++        int64_t n_evict    = 0;
++    };
++
++    uint8_t * base        = nullptr; // bytes() of memory
++    size_t    n_entries   = 0;       // the slots of all pools
+     bool      pinned      = false;
+ 
+-    std::vector<entry>                   entries;
++    std::vector<pool>                    pools;   // by max_len, ascending
++    std::vector<entry>                   entries; // [n_entries]
+     std::unordered_map<uint64_t, size_t> index; // key -> entry; only LOADING/RESIDENT are in it
+-    size_t                               next_victim = 0; // CLOCK hand
+     bool                                 clock       = true; // off = plain FIFO, for A/B
+     bool                                 wait_loading = true; // find_wait(); LLAMA_MOE_STREAM_L2_WAIT=0 = off, for A/B
+ 
+@@ -369,6 +387,18 @@ struct llama_moe_stream_l2 {
+         return ((uint64_t) file_idx << 48) ^ (uint64_t) offs;
+     }
+ 
++    uint8_t * slot_ptr(size_t s) const {
++        for (const pool & p : pools) {
++            if (s < p.first + p.n) {
++                return base + p.offs + (s - p.first)*p.stride;
++            }
++        }
++        GGML_ABORT("L2 slot %zu out of range", s);
++    }
++    size_t bytes() const {
++        return pools.empty() ? 0 : pools.back().offs + pools.back().n*pools.back().stride;
++    }
++
+     // Resident payload for this slab, or nullptr. A LOADING entry returns nullptr on purpose: the
+     // caller then reads it itself rather than waiting, which keeps this tier off the critical path
+     // of a second worker that happens to want the same slab.
+@@ -547,6 +577,19 @@ struct llama_moe_stream {
+     // in the pass (routed output zero); 64 / 128 / 192 - stop the pass after l_last / after the attention input of
+     // the next layer / after its FFN input. 4, 16 and 64-192 have no prediction, so they stage nothing either.
+     int32_t  ra_debug   = 0;
++    // G21, a cheaper pass (SiegeLadder 17.10, runs.md 4.55: the pass costs ~25 ms per token outside the stall, and 119
++    // of the 136 MiB it reads per layer are the next layer's q_b, output_a and output_b). LLAMA_MOE_STREAM_RA_GROUPS=g:
++    // the pass's attention of the next layer runs on the heads of its first g output groups only - views of the same
++    // weights, no VRAM - and LLAMA_MOE_STREAM_RA_GROUPS_SCALE=1 scales their output by groups/g. 0 = every group. Only
++    // the guess changes: the exact path never reads the pass.
++    int32_t  ra_groups       = 0;
++    bool     ra_groups_scale = false;
++    // G21: the pass's pairs off the card skip their GEMMs (LLAMA_MOE_STREAM_RA_SKIP, default on; 0 = they run on a
++    // borrowed resident slot at weight 0, as before). The rows they leave come out zero, as weight 0 made them: the
++    // same guess, without the GEMVs (~40% of the pass's expert pairs at decode)
++    bool     ra_skip         = true;
++    // the expert caches live where mul_mat_id can leave pairs out (a CUDA buffer): wave skipping and ra_skip need it
++    bool     skip_capable    = true;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+     // probability, by a deterministic hash of the call and the expert (LLAMA_MOE_STREAM_ORACLE_RECALL, 1 = all).
+     // Since 17.10 the oracle's read-ahead into L2 (LLAMA_MOE_STREAM_AHEAD) drops the same experts: a predictor
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 070a2d2..de95b41 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1305,8 +1305,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
+         ggml_tensor * inp_pos,
+         int il,
+         ggml_tensor ** topk_carry,
+-        ggml_tensor ** cand_carry) const {
+-    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, topk_carry, cand_carry);
++        ggml_tensor ** cand_carry,
++        int64_t n_groups_used,
++        bool groups_scale) const {
++    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, topk_carry, cand_carry, n_groups_used, groups_scale);
+ }
+ 
+ ggml_tensor * llama_model_deepseek4::graph::build_attention(
+@@ -1326,7 +1328,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         ggml_tensor * inp_pos,
+         int il,
+         ggml_tensor ** topk_carry,
+-        ggml_tensor ** cand_carry) const {
++        ggml_tensor ** cand_carry,
++        int64_t n_groups_used,
++        bool groups_scale) const {
+     GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
+ 
+     const auto & layer = model.layers[il];
+@@ -1344,6 +1348,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+     GGML_ASSERT(n_embd_head == n_embd_head_v);
+     GGML_ASSERT(n_head % n_groups == 0);
+ 
++    // SiegeLadder G21 (runahead's approximate pass only): the heads of the first n_grp output groups. Heads are rows
++    // of wq_b and of the sinks, a group is a slice of wo_a and a run of wo_b's input columns, so all of it is views
++    // of the same weights; the shared KV row, the compressor and the indexer are as in the full attention.
++    const int64_t n_grp = n_groups_used > 0 && n_groups_used < n_groups ? n_groups_used : n_groups;
++    const int64_t n_hd  = n_grp*n_heads_group;
++    const bool    part  = n_grp < n_groups;
++    ggml_tensor * wq_b  = part ? ggml_view_2d(ctx0, layer.wq_b, layer.wq_b->ne[0], n_hd*n_embd_head, layer.wq_b->nb[1], 0)
++                               : layer.wq_b;
++    ggml_tensor * sinks = part && layer.attn_sinks ? ggml_view_1d(ctx0, layer.attn_sinks, n_hd, 0) : layer.attn_sinks;
++    ggml_tensor * wo_a  = part ? ggml_view_3d(ctx0, layer.wo_a, layer.wo_a->ne[0], layer.wo_a->ne[1], n_grp,
++                                         layer.wo_a->nb[1], layer.wo_a->nb[2], 0)
++                               : layer.wo_a;
++    ggml_tensor * wo_b  = part ? ggml_view_2d(ctx0, layer.wo_b, o_lora_rank*n_grp, layer.wo_b->ne[1], layer.wo_b->nb[1], 0)
++                               : layer.wo_b;
++
+     const bool use_compress_rope = hparams.dsv4_compress_ratios[il] != 0;
+     const float freq_base_l      = use_compress_rope ? hparams.dsv4_compress_rope_base : freq_base;
+     const float freq_scale_l     = use_compress_rope ? freq_scale : 1.0f;
+@@ -1359,8 +1378,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+     cb(qr, "qr_norm", il);
+ 
+-    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
+-    q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
++    ggml_tensor * q = build_lora_mm(wq_b, qr);
++    q = ggml_reshape_3d(ctx0, q, n_embd_head, n_hd, nt);
+     if (!hparams.dsv4_v41) {
+         // V4 normalises each head of q after wq_b; V4.1 does not, and doing it anyway pins
+         // every head to RMS 1, which is where its attention output lost a fifth of its norm
+@@ -1368,13 +1387,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         cb(q, "q_norm", il);
+     }
+ 
+-    ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_head, nt,
++    ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_hd, nt,
+             ggml_row_size(q->type, n_embd_head),
+-            ggml_row_size(q->type, n_embd_head)*n_head,
++            ggml_row_size(q->type, n_embd_head)*n_hd,
+             0);
+-    ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_rope, n_head, nt,
++    ggml_tensor * q_pe = ggml_view_3d(ctx0, q, n_embd_head_rope, n_hd, nt,
+             ggml_row_size(q->type, n_embd_head),
+-            ggml_row_size(q->type, n_embd_head)*n_head,
++            ggml_row_size(q->type, n_embd_head)*n_hd,
+             ggml_row_size(q->type, n_embd_head_nope));
+     q_pe = ggml_rope_ext(ctx0, q_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+@@ -1702,49 +1721,52 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         out = build_attn(inp_mtp,
+                 nullptr, nullptr, nullptr,
+                 q, kv, nullptr,
+-                nullptr, layer.attn_sinks, nullptr,
++                nullptr, sinks, nullptr,
+                 1.0f/sqrtf(float(n_embd_head)), il);
+         cb(out, "attn_raw", il);
+     } else if (ratio == csa_ratio &&
+             inp_dsv4->get_csa().kq_mask) {
+-        out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
++        out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, sinks,
+                 1.0f/sqrtf(float(n_embd_head)), false, il, topk_carry, cand_carry);
+     } else if (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() &&
+             inp_dsv4->get_hca().kq_mask) {
+         // V4.1 has no second attention flavour: the ratio-1 group picks with the indexer too
+-        out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
++        out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, sinks,
+                 1.0f/sqrtf(float(n_embd_head)), true, il, topk_carry, cand_carry);
+     } else if (ratio == hca_ratio &&
+             inp_dsv4->get_hca().kq_mask) {
+-        out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
++        out = build_hca_attention(inp_dsv4, inp_attn, q, kv, sinks,
+                 1.0f/sqrtf(float(n_embd_head)), il);
+     } else {
+-        out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks,
++        out = build_raw_attention(inp_attn, q, kv, sinks,
+                 1.0f/sqrtf(float(n_embd_head)), il);
+     }
+ 
+-    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
+-    ggml_tensor * out_nope = ggml_view_3d(ctx0, out, n_embd_head_nope, n_head, nt,
++    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_hd, nt);
++    ggml_tensor * out_nope = ggml_view_3d(ctx0, out, n_embd_head_nope, n_hd, nt,
+             ggml_row_size(out->type, n_embd_head),
+-            ggml_row_size(out->type, n_embd_head)*n_head,
++            ggml_row_size(out->type, n_embd_head)*n_hd,
+             0);
+-    ggml_tensor * out_pe = ggml_view_3d(ctx0, out, n_embd_head_rope, n_head, nt,
++    ggml_tensor * out_pe = ggml_view_3d(ctx0, out, n_embd_head_rope, n_hd, nt,
+             ggml_row_size(out->type, n_embd_head),
+-            ggml_row_size(out->type, n_embd_head)*n_head,
++            ggml_row_size(out->type, n_embd_head)*n_hd,
+             ggml_row_size(out->type, n_embd_head_nope));
+     out_pe = ggml_rope_ext_back(ctx0, out_pe, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+     out = ggml_concat(ctx0, out_nope, out_pe, 0);
+     cb(out, "attn_derope", il);
+ 
+-    out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
++    out = ggml_reshape_3d(ctx0, out, o_group_dim, n_grp, nt);
+     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
+-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
++    ggml_tensor * oa = ggml_mul_mat(ctx0, wo_a, out);
+     cb(oa, "attn_wo_a", il);
+     oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+-    oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, nt);
++    oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_grp, nt);
+ 
+-    out = build_lora_mm(layer.wo_b, oa);
++    out = build_lora_mm(wo_b, oa);
++    if (part && groups_scale) {
++        out = ggml_scale(ctx0, out, (float) n_groups/(float) n_grp);
++    }
+     cb(out, "attn_out", il);
+ 
+     return out;
+@@ -1869,7 +1891,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         if (mstream->ra_debug & 2) {
+             cur_a = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f); // measurement
+         } else {
+-            cur_a = build_attention(model, inp_dsv4, cur_a, inp_pos, iln, &topk_c, &cand_c);
++            cur_a = build_attention(model, inp_dsv4, cur_a, inp_pos, iln, &topk_c, &cand_c,
++                    mstream->ra_groups, mstream->ra_groups_scale);
+         }
+         x = build_hc_post(cur_a, res_a, post_a, comb_a, iln);
+         // FFN L+1's input collapses with the mix attention L+1 computed (the carry), as A' does. FFN L+1's own mix
+diff --git a/src/models/models.h b/src/models/models.h
+index 835d514..c73637f 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1146,6 +1146,8 @@ struct llama_model_deepseek4 : public llama_model_base {
+ 
+         // topk_carry holds the compressed positions the last index source picked; layers that
+         // are not index sources reuse it instead of running an indexer they do not have
++        // n_groups_used > 0 (runahead's approximate pass, SiegeLadder G21): only the heads of the first n_groups_used
++        // output groups, through views of the same weights; groups_scale scales their output by n_groups/n_groups_used
+         ggml_tensor * build_attention(
+                 const llama_model & model,
+                 llm_graph_input_dsv4 * inp_dsv4,
+@@ -1153,7 +1155,9 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * inp_pos,
+                 int il,
+                 ggml_tensor ** topk_carry = nullptr,
+-                ggml_tensor ** cand_carry = nullptr) const;
++                ggml_tensor ** cand_carry = nullptr,
++                int64_t n_groups_used = 0,
++                bool groups_scale = false) const;
+ 
+         ggml_tensor * build_attention(
+                 const llama_model & model,
+@@ -1170,7 +1174,9 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * inp_pos,
+                 int il,
+                 ggml_tensor ** topk_carry,
+-                ggml_tensor ** cand_carry) const;
++                ggml_tensor ** cand_carry,
++                int64_t n_groups_used = 0,
++                bool groups_scale = false) const;
+ 
+         ggml_tensor * build_hca_compressed_kv_from_state(
+                 ggml_tensor * kv_state,

@@ -1,0 +1,97 @@
+From edcc01d67762d803df1bdcd4c46e33cc9ef87960 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 22:48:09 +0000
+Subject: [PATCH 55/91] moe-stream : P11 hardened after a review (SiegeLadder
+ runs.md 4.90) - (1) a failed pool allocation re-allocates the cache and now
+ also resets every layer's slot table (the new memory holds nothing; before,
+ the tables still said RESIDENT and the next remap would have computed with
+ garbage weights); (2) a context freed while P11 is active leaves it (its
+ destructor restored the head but left the manager on the shared pool, with no
+ cache buffer for the next context's attach_backend); (3) the quiesce clears
+ demand_ev / up_fenced_ev once the upload stream has landed, since p11_leave
+ frees the slot events past the cache's own (a dangling event for the stage
+ dispatcher with A' or the oracle's staging); (4) at a layer's first wave P11
+ waits until no slot of any layer is LOADING and synchronizes the compute
+ stream before the reset - both return at once on the normal path, and cover a
+ call aborted between two waves and a hash layer whose ids would come from the
+ host. SiegeLadder runs.md 4.90: the 30K consultant with P11 at -ub 6144 272.1
+ tok/s (276.9 before the fixes), test4's 2.2K / 8.9K prompts with P11 150.7 /
+ 298.6 tok/s vs 110.3 / 166.7 (+37% / +79%), decode after them unchanged
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    |  5 +++++
+ src/llama-moe-stream.cpp | 30 +++++++++++++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f76f671..e70c843 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -604,6 +604,11 @@ llama_context::~llama_context() {
+         gf_res_prev.reset();
+         gf_res_reserve.reset();
+         sched.reset();
++        // SiegeLadder P11: the expert cache back too, or the manager would stay on the shared pool for the next
++        // context - with no cache buffer to attach to (review of b60246c)
++        if (auto * ms = model.moe_stream(); ms != nullptr && ms->p11_active) {
++            ms->p11_leave();
++        }
+         if (!model.head_restore()) {
+             LLAMA_LOG_WARN("%s: head yield: the output head could not be read back; the next context will try\n", __func__);
+         }
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 1cb3a2e..778c857 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1775,6 +1775,10 @@ static void moe_p11_quiesce_locked(llama_moe_stream & m, std::unique_lock<std::m
+     }
+     m.up_l2_pending.clear();
+     m.up_fenced = m.up_seq;
++    // everything enqueued has landed: the stage dispatcher's and the fence's last events are spent, and p11_leave may
++    // free the slot events past the cache's own (review of b60246c)
++    m.demand_ev    = nullptr;
++    m.up_fenced_ev = nullptr;
+ }
+ 
+ bool llama_moe_stream::p11_enter() {
+@@ -1866,6 +1870,11 @@ bool llama_moe_stream::p11_enter() {
+             ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             bufs.emplace_back(buf);
+         }
++        for (auto & sl : layers) {
++            if (sl) {
++                p11_reset_layer_locked(*sl, sl->n_slots); // new memory: nothing in it is resident (review of b60246c)
++            }
++        }
+         p11_ctx.reset();
+         LLAMA_LOG_WARN("%s: P11 off: the pool of %u slots could not be allocated\n", __func__, P);
+         p11_slots = 0;
+@@ -4838,7 +4847,26 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+     if (w == 0) {
+         if (mgr->p11_active) {
+             // SiegeLadder P11: since this layer's last wave the shared pool held other layers' experts. This split
+-            // follows a synchronize of the compute stream (its ids came from the card), so their GEMMs are done
++            // follows a synchronize of the compute stream (its ids came from the card), so their GEMMs are done.
++            // Belt and braces (review of b60246c): a call aborted between two waves can leave preloads LOADING with
++            // workers still reading into slots no other layer's table knows, and a hash layer's ids could come from the
++            // host (no synchronize before this split) - so every load first, then the compute stream; both return at
++            // once on the normal path
++            mgr->cv_done.wait(lk, [&]{
++                if (mgr->load_failed) {
++                    return true;
++                }
++                for (const auto & l : mgr->layers) {
++                    if (l && std::find(l->slot_state.begin(), l->slot_state.end(),
++                            (uint8_t) LLAMA_MOE_STREAM_SLOT_LOADING) != l->slot_state.end()) {
++                        return false;
++                    }
++                }
++                return true;
++            });
++            if (mgr->compute_backend != nullptr) {
++                ggml_backend_synchronize(mgr->compute_backend);
++            }
+             mgr->p11_reset_layer_locked(*sl, sl->n_slots);
+         }
+         mgr->plan_waves_locked(*sl, ids, n);

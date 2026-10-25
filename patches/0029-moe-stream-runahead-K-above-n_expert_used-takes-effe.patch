@@ -1,0 +1,75 @@
+From 868c846fd97ec491545ce091e1150ef2d0fe97cc Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:19:57 +0000
+Subject: [PATCH 29/91] moe-stream : runahead - K above n_expert_used takes
+ effect, runahead staging keeps the oracle's marks, RA_DEBUG modes without a
+ prediction stage nothing
+
+- the approximate pass's router returns max(K, n_expert_used) experts; before, predict_locked could take no more than 6 per
+  token, so LLAMA_MOE_STREAM_RUNAHEAD=8 ran as 6 while the log said 8
+- predict_locked adds to the target layer's keep marks also when the oracle stages (VRAM_AHEAD), not only under
+  PRED_STAGE=1: a wrong guess could take the slot of an expert the oracle staged for that call
+- RA_DEBUG 4, 16 and 64-192 hand the wait this layer's own ids instead of a prediction; they stage nothing now
+
+From a review of a497d4e. SiegeLadder runs.md 4.42: K = 8 / 10 (now real) lose to K = 6 - 11.8 / 10.2 tok/s against 13.5:
+their extra guesses are mostly false (1.3 / 2.6 per call) and the bus pays for them; text = trace.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 7 +++++--
+ src/llama-moe-stream.h   | 2 +-
+ src/models/deepseek4.cpp | 3 ++-
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index bb179c7..9e34564 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1824,7 +1824,9 @@ void llama_moe_stream::predict_locked(const llama_moe_stream_layer & sl_now, con
+         n_ram  = 0;
+     }
+     if (n_vram > 0) {
+-        stage_experts_locked(*sf, pred_order.data(), n_vram, /*add_keep =*/ pred_stage == 1);
++        // on top of the oracle's staging of the same call (PRED_STAGE=1, or runahead with VRAM_AHEAD), whose keep marks
++        // must stay: cleared, a wrong guess could take the slot of an expert the oracle staged for that call
++        stage_experts_locked(*sf, pred_order.data(), n_vram, /*add_keep =*/ pred_stage == 1 || vram_ahead > 0);
+     }
+     // after staging: speculate_locked skips what now has a VRAM slot, so only the wider ranks are read ahead
+     for (size_t i = 0; i < n_ram; i++) {
+@@ -2841,7 +2843,8 @@ void llama_moe_stream_remap_wait(ggml_tensor * dst, int ith, int nth, void * use
+     sl->ra_pending = false;
+     mgr->stats.t_ra_gap_us += ggml_time_us() - sl->ra_t_issue;
+ 
+-    if (sl->ra_valid && (mgr->ra_debug & 1) == 0) {
++    // RA_DEBUG 4 / 16 / 64-192 hand over this layer's own ids in place of a prediction: nothing to stage then
++    if (sl->ra_valid && (mgr->ra_debug & (1 | 4 | 16 | 64 | 128)) == 0) {
+         moe_nvtx_range r_pred("predict", sl->il);
+         mgr->predict_locked(*sl, (const int32_t *) pred->data, pred->ne[0], pred->ne[1]);
+     }
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 8ae5f91..1eb4181 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -511,7 +511,7 @@ struct llama_moe_stream {
+     // does); 4 - the split remap alone, no approximate pass; 8 - the exact sum gets its own shared expert, in the
+     // usual place; 16 - the approximate routed output is computed and nothing is built on it; 32 - no expert GEMMs
+     // in the pass (routed output zero); 64 / 128 / 192 - stop the pass after l_last / after the attention input of
+-    // the next layer / after its FFN input (nothing staged then)
++    // the next layer / after its FFN input. 4, 16 and 64-192 have no prediction, so they stage nothing either.
+     int32_t  ra_debug   = 0;
+     // How good must a predictor be (2026-10-15): the oracle's staging keeps each expert of a call with this
+     // probability, by a deterministic hash of the call and the expert (LLAMA_MOE_STREAM_ORACLE_RECALL, 1 = all).
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index de48975..867e870 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1887,7 +1887,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         if (ln.ffn_exp_probs_b) {
+             probs = ggml_add(ctx0, probs, ln.ffn_exp_probs_b);
+         }
+-        ggml_tensor * pred = ggml_argsort_top_k(ctx0, probs, (int) hparams.n_expert_used);
++        // as wide as the stage asks for (K may exceed the router's own k); predict_locked takes the first K per token
++        ggml_tensor * pred = ggml_argsort_top_k(ctx0, probs, (int) std::max<uint32_t>(hparams.n_expert_used, mstream->runahead_k));
+         cb(pred, "moe_pred_runahead", il);
+         return pred;
+     };

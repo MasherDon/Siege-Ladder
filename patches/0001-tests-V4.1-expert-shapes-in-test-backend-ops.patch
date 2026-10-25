@@ -1,0 +1,49 @@
+From d940273c2584668dfdd38109e8eec815d6e6f6b2 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 15:26:39 +0000
+Subject: [PATCH 01/91] tests : V4.1 expert shapes in test-backend-ops
+
+MUL_MAT_ID cases with the 2-bit V4.1 expert shapes (IQ2_XXS gate/up 5120 -> 2304,
+Q2_K down 2304 -> 5120, 6 of 16 experts, n = 1..512), eval and perf.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/test-backend-ops.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8cb5989..5d1abfb 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9025,6 +9025,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+ 
++    // SiegeLadder: DeepSeek V4.1-Flash Q2mix expert shapes (gate/up IQ2_XXS 5120->2304, down Q2_K 2304->5120, top-6)
++    for (int n : {1, 2, 6, 32, 129, 512}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 16, 6, false, 2304, n, 5120));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 16, 6, false, 5120, n, 2304));
++    }
++
+     // gpt-oss issue with Vulkan mmq_id
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+@@ -9747,6 +9753,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // SiegeLadder: DeepSeek V4.1-Flash decode shapes (one token). Attention: 64 query heads on one KV head,
++    // K = V = 512, sinks; window 128 + indexer top-512 -> ~640 positions. hc_*_fn: 4 streams x 5120 -> 24.
++    for (int64_t kv : {256, 640, 1024, 4096}) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32,
++                                                        GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
++        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,   24, 1, 20480, {1, 1}, {1, 1}));   // hc_*_fn
++        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  384, 1,  5120, {1, 1}, {1, 1}));   // router
++        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 4096, 1,  5120, {1, 1}, {1, 1}));   // for scale
++    }
++
+     // Conv2d: K=CRS=NPQ=4096 matmul performance
+     uint32_t                        iwh_idx  = 0;
+     uint32_t                        kwh_idx  = 1;
