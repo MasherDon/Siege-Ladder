@@ -146,7 +146,8 @@
      "source": 15,
      "source_offset": 664
     }
-   ]
+   ],
+   "sha256": "6648643d5f31b44b988130948c886a6136ef40057c7bce4236394a7c17464cdc"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00003-of-00011.gguf",
@@ -164,7 +165,8 @@
      "source": 15,
      "source_offset": 98305579672
     }
-   ]
+   ],
+   "sha256": "b1a7196d74c7bec762be5714ffcd6c58c6d5d6eedb268c16ee7796f1cee73edc"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00004-of-00011.gguf",
@@ -182,7 +184,8 @@
      "source": 16,
      "source_offset": 672
     }
-   ]
+   ],
+   "sha256": "9332ebacd07a62d21c2682c5d219b584da141960a05f5d6158c6c67b1dee2478"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00005-of-00011.gguf",
@@ -344,7 +347,8 @@
      "source": 0,
      "source_offset": 24813771328
     }
-   ]
+   ],
+   "sha256": "2adc1bb9730203e70268b5933fce38baa687e8549833ea88c287397f1eee3681"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00006-of-00011.gguf",
@@ -506,7 +510,8 @@
      "source": 2,
      "source_offset": 1472
     }
-   ]
+   ],
+   "sha256": "ced85a877143e8b960fa646937f87b691cbd98244ae0eca225c8c11c6288b1b2"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00007-of-00011.gguf",
@@ -668,7 +673,8 @@
      "source": 10,
      "source_offset": 1167852992
     }
-   ]
+   ],
+   "sha256": "98d1cada4f5c55ebb135e876ef7527328f243a2eb69732146f689fd7374688e5"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00008-of-00011.gguf",
@@ -830,7 +836,8 @@
      "source": 4,
      "source_offset": 3043493312
     }
-   ]
+   ],
+   "sha256": "a0976c0d46c24d7fbb8d94b3919ccd6e9fd23399b77d509ec2ec573213c487df"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00009-of-00011.gguf",
@@ -992,7 +999,8 @@
      "source": 5,
      "source_offset": 4352902592
     }
-   ]
+   ],
+   "sha256": "f218f6e7bece45ec702100eb27cf6808c2002a3d212688a9e0eb40758a4322be"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00010-of-00011.gguf",
@@ -1154,7 +1162,8 @@
      "source": 13,
      "source_offset": 4989912064
     }
-   ]
+   ],
+   "sha256": "07264f0353bbb2e6f1e6a50afe719082dcf8ef7089abd79f62b64d113ae74296"
   },
   {
    "file": "DeepSeek-V4.1-Flash-MXFP4-engram-00011-of-00011.gguf",
@@ -8292,7 +8301,8 @@
      "source": 14,
      "source_offset": 36663456832
     }
-   ]
+   ],
+   "sha256": "82043a630803d2e143b25cffdd4dd8fbe1ab80d1fa1249af738edf9c1c0cc81b"
   }
  ]
 }

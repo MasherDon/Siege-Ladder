@@ -7,6 +7,7 @@ preset's "qd", 362 GB) from public Hugging Face repositories, following template
     python tools/assemble.py OUT_DIR --sources DIR ...   # read whole source files from DIR(s) when present there
     python tools/assemble.py OUT_DIR --sources DIR --verify-sources   # first check those files' SHA-256
     python tools/assemble.py OUT_DIR --check             # compare the start and end of every tensor with its source
+    python tools/assemble.py OUT_DIR --check --full      # SHA-256 of every part against our own build's
 
 Every tensor is copied byte for byte from its source file (repository, pinned revision, file, offset - all in the
 manifest); the GGUF headers and part 1 come from template/. Bytes between tensors are zeros. Resumable: progress is kept
@@ -239,7 +240,7 @@ def write_part(part, sources, out, state, workers):
     print(f"  done in {time.time() - t0:.0f} s", flush=True)
 
 
-def check(m, sources, out):
+def check(m, sources, out, full=False):
     bad = 0
     for p in m["parts"]:
         f = out / p["file"]
@@ -247,9 +248,9 @@ def check(m, sources, out):
             print(f"{p['file']}: missing or wrong size")
             bad += 1
             continue
-        if "tensors" not in p:
+        if "tensors" not in p or (full and p.get("sha256")):
             ok = sha256_file(f) == p["sha256"]
-            print(f"{p['file']}: {'ok' if ok else 'DIFFERS from the template'}")
+            print(f"{p['file']}: {'ok (SHA-256)' if ok else 'DIFFERS from our build (SHA-256)'}", flush=True)
             bad += not ok
             continue
         errs = []
@@ -278,6 +279,7 @@ def main():
     ap.add_argument("--verify-sources", action="store_true", help="check SHA-256 of the local source files first")
     ap.add_argument("--plan", action="store_true", help="print the plan and exit")
     ap.add_argument("--check", action="store_true", help="compare both ends of every tensor with its source")
+    ap.add_argument("--full", action="store_true", help="with --check: SHA-256 of every part against our build's")
     ap.add_argument("--workers", type=int, default=8, help="parallel range requests or reads (default 8)")
     ap.add_argument("--build", default="cd", choices=sorted(d.name for d in TEMPLATES.iterdir() if d.is_dir()),
                     help="cd (default) or qd (the fast preset's build)")
@@ -287,7 +289,7 @@ def main():
     m = json.loads((TEMPLATE / "manifest.json").read_text(encoding="utf-8"))
     sources = [Source(d, a.sources) for d in m["sources"]]
     if a.check:
-        check(m, sources, a.out)
+        check(m, sources, a.out, a.full)
     need = {}
     for p in m["parts"]:
         for t in p.get("tensors", []):
