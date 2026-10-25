@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# your own runs and settings
+bench/results/
+bench/config.json
+bench/.env

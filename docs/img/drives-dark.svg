@@ -12,16 +12,16 @@
 <rect x="454.4" y="87" width="10" height="10" rx="2" fill="#d95926"/>
 <text x="469.4" y="96" font-size="12" fill="#c3c2b7" text-anchor="start">system NVMe (x2 link)</text>
 <text x="134" y="133" font-size="12" fill="#c3c2b7" text-anchor="end">one drive</text>
-<path d="M144,118 h338.3 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-338.3 z" fill="#3987e5"/>
-<text x="494.3" y="133" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">13.5 GB/s</text>
+<path d="M144,118 h303.3 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-303.3 z" fill="#3987e5"/>
+<text x="459.3" y="133" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">13.5 GB/s</text>
 <text x="134" y="173" font-size="12" fill="#c3c2b7" text-anchor="end">two</text>
-<rect x="144" y="158" width="346.6" height="22" fill="#3987e5"/>
-<path d="M492.6,158 h125.2 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-125.2 z" fill="#199e70"/>
-<text x="629.8" y="173" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">18.9 GB/s</text>
+<rect x="144" y="158" width="311.2" height="22" fill="#3987e5"/>
+<path d="M457.2,158 h111.8 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-111.8 z" fill="#199e70"/>
+<text x="581.1" y="173" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">18.9 GB/s</text>
 <text x="134" y="213" font-size="12" fill="#c3c2b7" text-anchor="end">three</text>
-<rect x="144" y="198" width="347.6" height="22" fill="#3987e5"/>
-<rect x="493.6" y="198" width="129" height="22" fill="#199e70"/>
-<path d="M624.5,198 h81.1 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-81.1 z" fill="#d95926"/>
-<text x="717.7" y="213" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">22.3 GB/s</text>
+<rect x="144" y="198" width="312.1" height="22" fill="#3987e5"/>
+<rect x="458.1" y="198" width="115.6" height="22" fill="#199e70"/>
+<path d="M575.7,198 h72.3 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-72.3 z" fill="#d95926"/>
+<text x="660" y="213" font-size="12" fill="#f0efec" text-anchor="start" font-weight="600">22.3 GB/s</text>
 <text x="24" y="248" font-size="10.5" fill="#898781" text-anchor="start">data: docs/data/drives.csv</text>
 </svg>

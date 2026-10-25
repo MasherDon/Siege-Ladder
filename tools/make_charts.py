@@ -294,8 +294,8 @@ def drives(t):
     ])
     body += legend(t, [(colour[d], d) for d in order], y + 12)
     top = y + 34
-    plot_w = W - LEFT - RIGHT - 60
-    scale = plot_w / 24.0
+    widest = max(sum(float(r["gb_s"]) for r in rows if r["config"] == c) for c in configs)
+    scale = (W - (LEFT + 80) - RIGHT - 80) / widest   # room for the total's label after the longest bar
     bh, gap_y = 22, 18
     label = {"F12": "one drive", "F12+E4": "two", "F12+E4+C4": "three"}
     for i, cfg in enumerate(configs):
