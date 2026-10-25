@@ -9,7 +9,8 @@ could still run on it at a usable speed — if the weights climb a ladder of mem
 the wall in one go.
 
 > **Work in progress.** This is a research log with patches, not a finished engine: rough edges, some Windows-only
-> parts, no support promises. Use any of it for anything you like — no credit needed (see [License](#license)).
+> parts, no support promises. Our own scripts and notes are yours to use for anything, no credit needed; the patched
+> llama.cpp keeps its MIT notices (see [License](#license)).
 
 ## Goal
 
@@ -226,13 +227,17 @@ python bench/tf_series.py out/tf                 # its summary, corrected for dr
 
 Our own code and notes: [MIT-0](LICENSE) — use them however you like, no attribution needed.
 
-The patches modify llama.cpp (MIT, © the ggml authors) through JigSawPT's fork: whoever redistributes the patched
-files keeps llama.cpp's license notice, as its license requires. See [NOTICE.md](NOTICE.md).
+The patches modify llama.cpp (MIT, © the ggml authors) through JigSawPT's fork, including its expert streaming path
+from Crow (MIT, © nibor1896): whoever redistributes the patched files keeps both notices
+([patches/LICENSE-llama.cpp](patches/LICENSE-llama.cpp), [patches/LICENSE-Crow](patches/LICENSE-Crow)), as those
+licenses require. See [NOTICE.md](NOTICE.md).
 
 ## Built on
 
 - [JigSawPT's llama.cpp fork](https://github.com/JigSawPT/llama.cpp) (`dsv41-porte`): the DeepSeek-V4.1 port with SSD
-  streaming of experts that the patches build on;
+  streaming of experts that the patches build on; their own report, on an RTX 5090 with 126 GB of RAM, is
+  [deepseek-v41-flash-on-5090](https://github.com/JigSawPT/deepseek-v41-flash-on-5090);
+- [Crow](https://github.com/nibor1896/Crow) by nibor1896: the expert streaming path of that fork;
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp);
 - DeepSeek: [the model](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) and
   [DeepInfer](https://github.com/deepseek-ai/DeepInfer) (the YoCo prefill);
