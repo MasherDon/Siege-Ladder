@@ -1,0 +1,5 @@
+segment,ms,of_which_nvme_wait_ms
+compute only,15.93,
+compute and copies at once,3.03,
+expert copies only,27.06,
+idle,8.12,7.18

@@ -73,8 +73,9 @@ better). Reading — the server's own prompt timings.
 5. **Prefill:**
    - experts go through the GPU in waves via a shared pool;
    - positions the decoder half never reads run through the encoder layers only (exact);
-   - DeepSeek's own YoCo truncation from DeepInfer: the decoder half (layers 20–39) computes only the last 140 prompt
-     positions — +13% on agent turns, +60% on a cold 8.9K prompt, within error on our API sets.
+   - DeepSeek's YoCo truncation (DeepInfer's default for V4.1): the decoder half (layers 20–39) computes only the last
+     140 prompt positions. We skip its experts for the other rows (attention and dense layers still run on all of
+     them) — +13% on agent turns, +60% on a cold 8.9K prompt, within error on our API sets.
 6. **Sparse attention in decode with a q8 KV cache:** decode stays at 16–20 tok/s from short context to 512K.
 7. **A quant mix from public GGUFs:** prometheusAIR's IQ2_XS gate/up + Q2_K down, ISTA-DASLab's lighter Q5_K dense part
    (3 GB less VRAM, so more expert slots: +8.5% decode, and closer to the API than a plain 2-bit mix).
@@ -88,13 +89,33 @@ better). Reading — the server's own prompt timings.
   (+0.02 nat, +0.034 on Russian prompts) — the calibration text matters.
 - **Splitting expert reads into chunks, CUDA graph optimizations:** within noise.
 
+## Where the time goes
+
+Measured with Nsight Systems and the server's timings; the numbers behind each chart are in [docs/data](docs/data).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-token-dark.svg">
+  <img src="docs/img/decode-token-light.svg" width="760" alt="One decode token under Nsight, 54 ms: compute only 15.9 ms, compute and copies at once 3.0 ms, expert copies only 27.1 ms, idle 8.1 ms (7.2 ms of it waiting for NVMe).">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/turn-layers-dark.svg">
+  <img src="docs/img/turn-layers-light.svg" width="760" alt="Per-layer time of a 7,530-token agent turn: about 100 ms of attention and dense work per layer (heavier every fourth layer), plus expert waves; layers 0-19 take 5.7 s, layers 20-39 5.2 s.">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/agent-turns-dark.svg">
+  <img src="docs/img/agent-turns-light.svg" width="760" alt="Reading time of agent turns 2-8 against their new tokens: about 5.3 s plus 1.04 ms per token; 2-3 s of each turn is waiting for expert loads.">
+</picture>
+
 ## Where we're stuck — ideas welcome
 
 1. **Predicting which experts a token needs 1–2 layers ahead.** Perfect staging into VRAM would give 27–29 tok/s; our
    lens reaches 76% precision at ~14% recall (it needs ≥65–70% precision at ≥50% recall to pay off).
 2. **Overlapping compute with expert copies:** copies take ~30 ms per token, compute ~19 ms, and they overlap by 3 ms.
-3. **Short agent turns:** ~5.6 s fixed cost per turn — a third of it waiting for expert loads, ~1.3 s per 7.5K-token
-   turn reading Engram rows before the first kernel, ~1 s releasing and restoring GPU memory and a 4-token tail call.
+3. **Short agent turns:** reading a turn costs ~5.3 s plus ~1.04 ms per new token, so even a 500-token turn takes 6 s.
+   Waiting for expert loads is 2–3 s of every turn whatever its size; a 7.5K-token turn also spends 1.3 s reading
+   Engram rows before its first kernel, and every turn ~1 s on GPU memory setup and a 4-token tail call.
 4. **1M context:** loads only at batch 512 — the sparse prefill plan wants 11.7–15 GiB at larger batches.
 
 **The bus is the wall.** Copying experts from RAM to the GPU over PCIe 4.0 takes ~30 ms of a ~49 ms token, which caps
@@ -157,7 +178,8 @@ llama-server -m DeepSeek-V4.1-Flash-MXFP4-engram-00001-of-00011.gguf -ngl 99 -t 
 | path | what |
 |---|---|
 | `patches/` | 91 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order |
-| `docs/` | the logo; charts and notes to come |
+| `docs/img/`, `docs/data/` | the charts (light and dark) and the numbers behind them |
+| `tools/make_charts.py` | draws the charts from `docs/data/*.csv` (plain SVG, no dependencies) |
 
 ## License
 
