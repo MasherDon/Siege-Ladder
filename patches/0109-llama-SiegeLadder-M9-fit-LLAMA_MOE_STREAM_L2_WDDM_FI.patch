@@ -1,0 +1,54 @@
+From e2cab3c194aeeb03dca9f248f1619a578f81542c Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 07:17:28 +0000
+Subject: [PATCH 109/112] llama : SiegeLadder M9 fit -
+ LLAMA_MOE_STREAM_L2_WDDM_FIT=1 with LLAMA_MOE_STREAM_L2_PP_HOST_MIB=N keeps N
+ MiB of the WDDM shared budget for the prompt graph's CUDA_Host buffer before
+ the tier is laid out (L026: 512K at -ub 2048 and tier 42 failed at load,
+ 43001 + 3685 + 74 of 46965 MiB pinned; with N 3840 the tier is cut to 42411
+ MiB and the load passes); off by default, the 640 MiB cut unchanged
+ (SiegeLadder runs.md 4.288)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-moe-stream.cpp | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index d06495d..a250d69 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -537,6 +537,33 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+                 want = room;
+             }
+         }
++        // L026 path (a): extra CUDA_Host pp reserve before the tier when LLAMA_MOE_STREAM_L2_WDDM_FIT=1 (off by default).
++        // LLAMA_MOE_STREAM_L2_PP_HOST_MIB defaults to 0; preset sets it from measured sched_reserve (see L026 report).
++        const char * fit_env = std::getenv("LLAMA_MOE_STREAM_L2_WDDM_FIT");
++        if (fit_env != nullptr && std::strtol(fit_env, nullptr, 10) != 0) {
++            const size_t tier_ask        = l2_gib * 1024ull * 1024ull * 1024ull;
++            size_t       margin_base_mib = margin >> 20;
++            size_t margin_pp_mib   = 0;
++            if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_PP_HOST_MIB")) {
++                margin_pp_mib = (size_t) std::max(0LL, atoll(s));
++            }
++            const size_t total_margin = margin + (margin_pp_mib << 20);
++            size_t       room_fit     = want;
++            if (wb.ok && wb.nonlocal_budget > wb.nonlocal_usage + total_margin) {
++                room_fit = (size_t) (wb.nonlocal_budget - wb.nonlocal_usage) - total_margin;
++            }
++            if (margin_pp_mib > 0 && want > room_fit) {
++                LLAMA_LOG_WARN("%s: M9: the L2 tier asked %.2f GiB, the WDDM shared budget leaves %.2f GiB after %.0f MiB "
++                        "kept for later pinned buffers - cut to that (LLAMA_MOE_STREAM_L2_WDDM_FIT=0: base margin only)\n",
++                        __func__, want/1073741824.0, room_fit/1073741824.0, total_margin/1048576.0);
++                want = room_fit;
++            }
++            LLAMA_LOG_INFO("%s: M9 fit: WDDM budget %.0f MiB, in_use %.0f, tier_want %.0f, margin %.0f "
++                    "(base %.0f + pp_host %.0f MiB), room %.0f MiB, tier %.0f MiB\n", __func__,
++                    wb.nonlocal_budget/1048576.0, wb.nonlocal_usage/1048576.0, tier_ask/1048576.0,
++                    total_margin/1048576.0, (double) margin_base_mib, (double) margin_pp_mib,
++                    room_fit/1048576.0, want/1048576.0);
++        }
+     }
+ 
+     bool classes = true;

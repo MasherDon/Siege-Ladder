@@ -1,0 +1,531 @@
+From 109eaa656a8d9f0528afb6cbf2ace41b92cb1f59 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:29:27 +0000
+Subject: [PATCH 093/112] dsv4 + graph + moe-stream : SiegeLadder C7c - past
+ layer 20 the ubatch holding C7's bound runs only its rows from the bound (on
+ by default with C7b, LLAMA_DSV4_YOCO_CUT=0 - off; _CUT_MIN - the rows the cut
+ must leave, 64). The rows before the bound are C7b's rows without
+ consequence: no output, their decoder windows are read by no row past the
+ bound (C7's masks), and the state a call leaves is its last rows. Layer 20
+ still runs every row (its cache writes are the compressed attention of every
+ position; it is also the index and candidate source); from layer 21 the graph
+ takes views of the rows [cut, n_tokens): the stream, the carried hc mix,
+ layer 20's top-k and candidate verdicts, the positions; the HCA group's
+ inputs (masks, the ring's write rows, the dense path's C7 ring mask) are
+ views made once per graph, the P13 / D10 plan gets a chunk boundary at the
+ cut (only the chunk holding it is split), and the head gathers its outputs at
+ their rows past the cut (llm_graph_input_out_ids). The expert stream skips no
+ rows past the cut (c7_layer1). Not in the reserve graph, MODE=mask or
+ NOBOUND. Checked (SiegeLadder runs.md 4.234-4.235): against C7 computed
+ exactly at -ub 1 C7c is no farther than C7b (|d log p| 0.011 against 0.018 on
+ 3000 / 4500 / 18000-token prompts: dense, P13 chunks, sparse chunks with the
+ candidate filter; no argmax flips); agent-long dNLL +0.0002 [-0.0024,
+ +0.0027], its per-position difference to C7b (0.022) equal to the pipeline's
+ own numeric floor (a FlashAttention tile shift: 0.022). Agent turns 2-8 read
+ in 50.7 s against 59.0 s (A B B A, -14%; turn 7.5K -19%)
+
+---
+ src/llama-context.cpp    | 50 ++++++++++++++++++++++----
+ src/llama-context.h      |  6 ++++
+ src/llama-cparams.h      |  3 ++
+ src/llama-graph.cpp      | 75 +++++++++++++++++++++++++++++++++-----
+ src/llama-graph.h        | 14 ++++++++
+ src/llama-moe-stream.cpp |  7 ++--
+ src/llama-moe-stream.h   |  3 ++
+ src/models/deepseek4.cpp | 77 +++++++++++++++++++++++++++++++++-------
+ 8 files changed, 206 insertions(+), 29 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8a15e06..30b7071 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -609,6 +609,15 @@ llama_context::llama_context(
+                 yoco_mask    = m != nullptr && std::strcmp(m, "mask") == 0;
+                 yoco_nobound = !yoco_mask && nb != nullptr && atoi(nb) != 0;
+                 yoco_rows    = !yoco_mask && (r == nullptr || atoi(r) != 0);
++                // C7c (on by default with C7b since 26.10, LLAMA_DSV4_YOCO_CUT=0 - off): C7b's rows are cut out of the
++                // graph after the first decoder layer - only with the bound and C7b, so never in MODE=mask or NOBOUND.
++                // Lossless against C7b: against C7 computed exactly at -ub 1 it is no farther than C7b (|d log p| 0.011
++                // against 0.018 on dense / P13 / sparse prompts; SiegeLadder runs.md 4.235); agent turns read -14%
++                const char * cu = std::getenv("LLAMA_DSV4_YOCO_CUT");
++                yoco_cut = yoco_rows && !yoco_nobound && (cu == nullptr || atoi(cu) != 0);
++                if (const char * cm = std::getenv("LLAMA_DSV4_YOCO_CUT_MIN")) {
++                    yoco_cut_min = std::max<int64_t>(2, (int64_t) atoll(cm));
++                }
+                 yoco_lo.assign(LLAMA_MAX_SEQ, -1);
+                 LLAMA_LOG_WARN("%s: SiegeLadder C7 (lossy%s): the decoder (layers %d-%u) of a call keeps its last %d "
+                         "positions - %s%s%s\n", __func__, y_asked ? "" : "; on by default, LLAMA_DSV4_YOCO=0 - off", first,
+@@ -618,6 +627,11 @@ llama_context::llama_context(
+                         "a lower bound on their raw windows, whole ubatches below it run the encoder only",
+                         yoco_rows ? "; the decoder rows below it load and compute no routed experts (C7b)" : "",
+                         !yoco_mask && p4_reach <= 0 ? " (P4 is off: no ubatch skips the decoder)" : "");
++                if (yoco_cut) {
++                    LLAMA_LOG_WARN("%s: SiegeLadder C7c (on by default, LLAMA_DSV4_YOCO_CUT=0 - off): from layer %d on a "
++                            "ubatch holding the bound runs only its rows past it (when at least %lld are left)\n", __func__,
++                            first + 1, (long long) yoco_cut_min);
++                }
+             }
+         }
+ 
+@@ -2593,6 +2607,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     // SiegeLadder C7: this call's ubatches with the bound in their graph, and the decoder rows C7b left without experts
+     int64_t yoco_ub_call  = 0;
+     int64_t yoco_row_call = 0;
++    int64_t yoco_cut_call = 0; // C7c: the rows cut out after the first decoder layer
+ 
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+@@ -2625,18 +2640,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         // SiegeLadder C7: this ubatch's bound (its graph's masks; none with NOBOUND) and C7b's first row whose decoder
+         // experts load - set for its build and run and reset at once, like P4's flag
+         int64_t yoco_row0 = 0;
+-        cparams.dsv4_yoco_lo = -1;
++        cparams.dsv4_yoco_lo  = -1;
++        cparams.dsv4_yoco_cut = 0;
+         if (yoco_k > 0 && !cparams.dsv4_enc_only) {
+             const int32_t lo = yoco_ubatch_lo(ubatch, yoco_row0);
+             cparams.dsv4_yoco_lo = yoco_nobound ? -1 : lo;
+             yoco_row0 = yoco_rows ? yoco_row0 : 0;
+             yoco_ub_call  += lo >= 0 ? 1 : 0;
+             yoco_row_call += yoco_row0;
++            // C7c: the graph drops C7b's rows after the first decoder layer - with the bound in it (the rows left must not
++            // see the decoder windows of the dropped ones, which are never written), and no output among them
++            if (yoco_cut && cparams.dsv4_yoco_lo >= 0 && yoco_row0 > 0 &&
++                    (int64_t) ubatch.n_tokens - yoco_row0 >= yoco_cut_min) {
++                bool out_before = false;
++                for (int64_t i = 0; i < yoco_row0 && !out_before; ++i) {
++                    out_before = ubatch.output[i] != 0;
++                }
++                if (!out_before) {
++                    cparams.dsv4_yoco_cut = (int32_t) yoco_row0;
++                    yoco_cut_call += yoco_row0;
++                }
++            }
+         }
+         auto * yoco_ms = yoco_k > 0 ? model.moe_stream() : nullptr;
+         if (yoco_ms) {
+             yoco_ms->c7_row0   = yoco_row0;
+             yoco_ms->c7_layer0 = model.hparams.dsv4_dec_first();
++            yoco_ms->c7_layer1 = cparams.dsv4_yoco_cut > 0 ? model.hparams.dsv4_dec_first() + 1 : -1;
+         }
+ 
+         ggml_status status;
+@@ -2644,8 +2674,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+         cparams.dsv4_enc_only = false;
+         cparams.dsv4_yoco_lo  = -1;
++        cparams.dsv4_yoco_cut = 0;
+         if (yoco_ms) {
+-            yoco_ms->c7_row0 = 0;
++            yoco_ms->c7_row0   = 0;
++            yoco_ms->c7_layer1 = -1;
+         }
+ 
+         if (!res) {
+@@ -2828,8 +2860,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+             if (yoco_lo[s] >= 0) {
+                 LLAMA_LOG_INFO("%s: SiegeLadder C7: sequence %d - the decoder from position %d of a call ending at %u tokens; "
+-                        "%lld ubatch(es) with the bound in the graph, %lld decoder rows without routed experts (C7b)\n",
+-                        __func__, s, (int) yoco_lo[s], n_tokens_all, (long long) yoco_ub_call, (long long) yoco_row_call);
++                        "%lld ubatch(es) with the bound in the graph, %lld decoder rows without routed experts (C7b)%s\n",
++                        __func__, s, (int) yoco_lo[s], n_tokens_all, (long long) yoco_ub_call, (long long) yoco_row_call,
++                        yoco_cut ? (", " + std::to_string(yoco_cut_call) + " of them cut out after layer " +
++                                std::to_string(model.hparams.dsv4_dec_first()) + " (C7c)").c_str() : "");
+             }
+         }
+     }
+@@ -3270,13 +3304,17 @@ ggml_cgraph * llama_context::graph_reserve(
+     auto * res = gf_res_reserve.get();
+ 
+     // SiegeLadder C7: a prompt ubatch may carry the decoder layers' masks with the bound - reserve with them in the graph
+-    const int32_t save_yoco_lo = cparams.dsv4_yoco_lo;
++    // (and C7c's cut never: the reserve ubatch's output is its row 0, and every row through the decoder bounds the buffers)
++    const int32_t save_yoco_lo  = cparams.dsv4_yoco_lo;
++    const int32_t save_yoco_cut = cparams.dsv4_yoco_cut;
+     if (yoco_k > 0 && n_tokens > 1 && !yoco_nobound) {
+         cparams.dsv4_yoco_lo = 0;
+     }
++    cparams.dsv4_yoco_cut = 0;
+ 
+     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+-    cparams.dsv4_yoco_lo = save_yoco_lo;
++    cparams.dsv4_yoco_lo  = save_yoco_lo;
++    cparams.dsv4_yoco_cut = save_yoco_cut;
+ 
+     res->reset();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index b25ac4c..d28ca3c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -392,6 +392,12 @@ private:
+     bool     yoco_mask    = false;         // LLAMA_DSV4_YOCO_MODE=mask: the bound alone - no skips at all (the check's reference)
+     bool     yoco_nobound = false;         // LLAMA_DSV4_YOCO_NOBOUND=1: the skips without the bound (a negative control)
+     bool     yoco_rows    = true;          // LLAMA_DSV4_YOCO_ROWS=0: no C7b
++    // C7c (on by default with C7b since 26.10, LLAMA_DSV4_YOCO_CUT=0 - off; SiegeLadder runs.md 4.234-4.235): the ubatch
++    // holding C7b's rows goes on from layer dsv4_dec_first() + 1 with its rows from
++    // the first one past the bound only (cparams.dsv4_yoco_cut) - the decoder of the rows before it is never computed.
++    // Layer dsv4_dec_first() keeps every row: its cache writes are the compressed attention of every position
++    bool     yoco_cut     = false;
++    int64_t  yoco_cut_min = 64;            // rows the cut must leave (fewer: C7b alone; a one-row tail would look like decode)
+     std::vector<llama_pos> yoco_lo;        // [LLAMA_MAX_SEQ] for the current call, -1 = not active
+     int64_t  yoco_n_calls = 0;             // calls with the bound active so far
+     int32_t  yoco_ubatch_lo(const llama_ubatch & ubatch, int64_t & row0) const;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 6d5770a..df38696 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -58,6 +58,9 @@ struct llama_cparams {
+     // SiegeLadder C7 (LLAMA_DSV4_YOCO=K): this ubatch's decoder bound - its rows at or past it see the raw window of
+     // layers 20-39 only from it on (llama_context::yoco_lo); -1 - no bound in this ubatch's graph
+     int32_t dsv4_yoco_lo    = -1;
++    // SiegeLadder C7c (LLAMA_DSV4_YOCO_CUT): the first row of this ubatch that layers dsv4_dec_first() + 1 on and the head
++    // run - the rows before it are C7b's rows without consequence, whose decoder nothing reads; 0 - every row
++    int32_t dsv4_yoco_cut   = 0;
+     // SiegeLadder D12: the compute buffers hold the non-sparse plan only for positions below this (0 - for all)
+     uint32_t dsv4_dense_cap = 0;
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index e68cdbc..ae12a8c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -604,11 +604,16 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+ 
+     GGML_ASSERT(ubatch->output);
+ 
++    // SiegeLadder C7c: a DSV4 graph cut at row dsv4_yoco_cut gathers its outputs from the rows past the cut only (0 for
++    // every other graph; llama_context cuts no ubatch with an output before the cut)
++    const int32_t row0 = cparams.dsv4_yoco_cut;
++
+     int n_outputs = 0;
+ 
+     for (int i = 0; i < n_tokens; ++i) {
+         if (ubatch->output[i]) {
+-            data[n_outputs++] = i;
++            GGML_ASSERT(i >= row0);
++            data[n_outputs++] = i - row0;
+         }
+     }
+ }
+@@ -1675,18 +1680,33 @@ static llm_graph_input_dsv4::p13_plan dsv4_p13_build_plan(
+     const int64_t nq       = sparse ? env.sp_qc : env.nq;
+     const bool    identity = !sparse && env.identity;
+ 
+-    const int64_t n_chunk = identity ? 1 : (nt + nq - 1)/nq;
++    // SiegeLadder C7c (cparams.dsv4_yoco_cut): the decoder past its first layer runs the rows from the cut only - the plan
++    // gets a chunk boundary there, so that the decoder's chunks are its last ones (llm_graph_input_dsv4::c7c_chunk0). Only
++    // the chunk holding the cut is split: every other chunk - and so the encoder's attention of its rows - stays as without
++    // the cut. The identity mode (one chunk of every row) leaves such a ubatch the attention of before; the reserve graph
++    // has no cut
++    const int64_t cut = reserve ? 0 : (int64_t) cparams.dsv4_yoco_cut;
++    if (cut > 0 && identity) {
++        return plan;
++    }
++    GGML_ASSERT(cut >= 0 && cut < nt);
++
++    const int64_t n_chunk0 = identity ? 1 : (nt + nq - 1)/nq;
+ 
+     // a ubatch runs chunks as equal as possible, at most nq each; the reserve graph runs chunks of exactly nq, the
+     // widest any ubatch can get (balanced chunks of a smaller ubatch reach nq: 2 x 1665 at nq 1665 against 4 x 1536
+     // at -ub 6144), so its window rows, FlashAttention outputs and masks bound every chunk the buffers will see
+-    std::vector<int64_t> t0(n_chunk + 1);
++    std::vector<int64_t> t0(n_chunk0 + 1);
++    for (int64_t c = 0; c <= n_chunk0; ++c) {
++        t0[c] = reserve && !identity ? std::min<int64_t>(c*nq, nt) : c*nt/n_chunk0;
++    }
++    if (cut > 0 && std::find(t0.begin(), t0.end(), cut) == t0.end()) {
++        t0.insert(std::upper_bound(t0.begin(), t0.end(), cut), cut);
++    }
++    const int64_t n_chunk = (int64_t) t0.size() - 1;
+     int64_t n_max = 0;
+-    for (int64_t c = 0; c <= n_chunk; ++c) {
+-        t0[c] = reserve && !identity ? std::min<int64_t>(c*nq, nt) : c*nt/n_chunk;
+-        if (c > 0) {
+-            n_max = std::max<int64_t>(n_max, t0[c] - t0[c - 1]);
+-        }
++    for (int64_t c = 1; c <= n_chunk; ++c) {
++        n_max = std::max<int64_t>(n_max, t0[c] - t0[c - 1]);
+     }
+ 
+     // a chunk of n consecutive positions needs n + n_swa - 1 window rows; FlashAttention with the 512-wide head takes
+@@ -5187,6 +5207,45 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+         }
+     }
+ 
++    // SiegeLadder C7c: the views the layers past the cut read (see c7c_cut), once per graph. llama_context cuts only a
++    // ubatch with the bound in its graph - one sequence, one stream, one write row per token
++    if (cparams.dsv4_yoco_cut > 0 && !mctx_cur->is_reserve()) {
++        const int64_t cut = cparams.dsv4_yoco_cut;
++        const int64_t ntc = (int64_t) ubatch.n_tokens - cut;
++        GGML_ASSERT(inp->c7_built && ntc > 0 && "C7c: a cut without C7's bound in the graph");
++        const auto rows = [&](ggml_tensor * t) -> ggml_tensor * {
++            if (t == nullptr) {
++                return nullptr;
++            }
++            GGML_ASSERT(t->ne[1] == (int64_t) ubatch.n_tokens && t->ne[2] == 1 && t->ne[3] == 1);
++            return ggml_view_4d(ctx0, t, t->ne[0], ntc, 1, 1, t->nb[1], t->nb[2], t->nb[3], (size_t) cut*t->nb[1]);
++        };
++        inp->c7c_cut = cut;
++        inp->c7c_hca = inp->inp_hca;
++        inp->c7c_hca.kq_mask  = rows(inp->inp_hca.kq_mask);
++        inp->c7c_hca.lid_mask = inp->inp_hca.lid_mask == inp->inp_hca.kq_mask ? inp->c7c_hca.kq_mask :
++                rows(inp->inp_hca.lid_mask);
++        inp->c7c_hca.cand_pin = rows(inp->inp_hca.cand_pin);
++
++        ggml_tensor * ki = inp->inp_raw->self_k_idxs;
++        GGML_ASSERT(ki != nullptr && ki->ne[0] == (int64_t) ubatch.n_tokens);
++        inp->c7c_k_idxs = ggml_view_1d(ctx0, ki, ntc, (size_t) cut*ki->nb[0]);
++
++        const auto & p13 = inp->p13;
++        if (p13.n_chunk == 0) {
++            inp->c7c_raw_mask = rows(inp->c7_raw_mask);
++        } else {
++            int64_t c0 = 0;
++            while (c0 < p13.n_chunk && p13.t0[c0] < cut) {
++                c0++;
++            }
++            GGML_ASSERT(c0 < p13.n_chunk && p13.t0[c0] == cut && "C7c: the chunk plan has no boundary at the cut");
++            inp->c7c_chunk0   = c0;
++            inp->c7c_p13_rows = ggml_view_1d(ctx0, inp->p13_rows, p13.raw_len*(p13.n_chunk - c0),
++                    (size_t) (c0*p13.raw_len)*ggml_element_size(inp->p13_rows));
++        }
++    }
++
+     return (llm_graph_input_dsv4 *) res->add_input(std::move(inp));
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 964e2c8..96374ad 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -701,6 +701,18 @@ public:
+     ggml_tensor *              c7_sp_mask  = nullptr;              // F16 [sp_kv, 1, 1, n_tokens]
+     std::vector<ggml_tensor *> c7_sp_mask_c;                       // [sp_kv, 1, 1, n_c]
+ 
++    // SiegeLadder C7c (cparams.dsv4_yoco_cut): layers dsv4_dec_first() + 1 on run the rows [c7c_cut, n_tokens) only - with
++    // these views of the inputs, made once per graph (see p13_mask_c): the HCA group's masks (the state inputs are a
++    // source's, and no layer past the first decoder layer is one), the ring's write rows, the dense path's C7 ring mask,
++    // and P13's rows of the chunks from c7c_chunk0 on - the plan cuts its chunks at c7c_cut (dsv4_p13_build_plan), and the
++    // per-chunk views of the other inputs serve as they are. 0 - no cut
++    int64_t       c7c_cut       = 0;
++    int64_t       c7c_chunk0    = 0;
++    comp_input    c7c_hca;                // inp_hca with its kq_mask / lid_mask / cand_pin rows from c7c_cut
++    ggml_tensor * c7c_k_idxs    = nullptr; // I64 [n_tokens - c7c_cut]
++    ggml_tensor * c7c_raw_mask  = nullptr; // rows of c7_raw_mask (no P13 plan)
++    ggml_tensor * c7c_p13_rows  = nullptr; // I32 [raw_len*(n_chunk - c7c_chunk0)]
++
+     // SiegeLadder G29: D11's sparse decode reads the compressed mask input as a column view - one view per graph and
+     // group (0 csa, 1 hca), made by the first layer that needs it, so the scheduler copies it once per token, not once
+     // per compressed layer (a view of an input is not an input: each distinct one got its own synchronous copy)
+@@ -1049,6 +1061,8 @@ struct llm_graph_params {
+             cparams.dsv4_enc_only           == other.cparams.dsv4_enc_only           &&
+             // SiegeLadder C7: a graph with the bound reads its own masks in the decoder layers (the bound itself is input)
+             (cparams.dsv4_yoco_lo >= 0)     == (other.cparams.dsv4_yoco_lo >= 0)     &&
++            // SiegeLadder C7c: the cut is the decoder's row count
++            cparams.dsv4_yoco_cut           == other.cparams.dsv4_yoco_cut           &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index c46cb1d..788931f 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -5797,10 +5797,11 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
+     start_workers_locked();
+ 
+     // SiegeLadder C7b: in the decoder layers the rows before c7_row0 plan no expert (see c7_row0 in the header) - only
+-    // in the wave-skip mode, where emit_wave_slots leaves their pairs out by id
++    // in the wave-skip mode, where emit_wave_slots leaves their pairs out by id; C7c's layers past the cut have those rows
++    // no more (c7_layer1)
+     const int64_t n_tok = n_ids > 0 ? n/(int64_t) n_ids : 0;
+-    sl.plan_row0 = c7_row0 > 0 && c7_layer0 >= 0 && sl.il >= c7_layer0 && c7_row0 < n_tok &&
+-            llama_moe_stream_wave_skip(sl, n_tok) ? c7_row0 : 0;
++    sl.plan_row0 = c7_row0 > 0 && c7_layer0 >= 0 && sl.il >= c7_layer0 && (c7_layer1 < 0 || sl.il < c7_layer1) &&
++            c7_row0 < n_tok && llama_moe_stream_wave_skip(sl, n_tok) ? c7_row0 : 0;
+     c7_n_rows += sl.plan_row0;
+ 
+     sl.touched.assign(sl.n_expert, 0);
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 27883a4..f103ed8 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -655,6 +655,9 @@ struct llama_moe_stream {
+     int64_t                 c7_row0   = 0;
+     int32_t                 c7_layer0 = -1;
+     int64_t                 c7_n_rows = 0; // rows so left, summed over layers and calls
++    // SiegeLadder C7c: from this layer on the graph has only the rows from c7_row0 (llama_cparams::dsv4_yoco_cut) - none
++    // of its rows is before the bound; -1 - no cut in this ubatch's graph
++    int32_t                 c7_layer1 = -1;
+ 
+     size_t size_bufs() const;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 4778f9b..4082fbf 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1140,8 +1140,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         ggml_tensor ** cand_carry,
+         dsv4_attn_kv * kv_out,
+         dsv4_attn_parts * parts) const {
++    // SiegeLadder C7c: a layer past the cut reads the HCA group's inputs at its rows (llm_graph_input_dsv4::c7c_cut)
++    const bool c7c = inp_dsv4->c7c_cut > 0 && il > hparams.dsv4_dec_first();
++    GGML_ASSERT(!c7c || use_hca);
++
+     // V4.1 runs this shape for both compressed groups; V4 only for the csa one
+-    const auto & inp_csa = use_hca ? inp_dsv4->get_hca() : inp_dsv4->get_csa();
++    const auto & inp_csa = c7c ? inp_dsv4->c7c_hca : use_hca ? inp_dsv4->get_hca() : inp_dsv4->get_csa();
+     GGML_ASSERT(inp_csa.kq_mask);
+ 
+     // only an index source owns an indexer; the layers after it reuse what it picked
+@@ -1169,7 +1173,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+ 
+     const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+ 
+-    ggml_tensor * ring_w = mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il);
++    ggml_tensor * ring_w = mctx_raw->cpy_k(ctx0, kv, c7c ? inp_dsv4->c7c_k_idxs : inp_attn->get_k_idxs(), il);
+     ggml_build_forward_expand(gf, ring_w);
+ 
+     // SiegeLadder D3: the candidate source's block verdicts are computed here, in their own layer and after q. Their
+@@ -1197,8 +1201,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
+     cb(csa_k, "csa_comp_k", il);
+ 
+-    // SiegeLadder C7: a decoder layer of a graph with the bound reads the ring mask with it (dense path; see c7_lo)
+-    ggml_tensor * raw_mask = inp_dsv4->c7_raw_mask != nullptr && il >= hparams.dsv4_dec_first() ? inp_dsv4->c7_raw_mask :
++    // SiegeLadder C7: a decoder layer of a graph with the bound reads the ring mask with it (dense path; see c7_lo) - past
++    // C7c's cut its rows of it (null with a P13 plan, whose chunks bring their own)
++    ggml_tensor * raw_mask = c7c ? inp_dsv4->c7c_raw_mask :
++            inp_dsv4->c7_raw_mask != nullptr && il >= hparams.dsv4_dec_first() ? inp_dsv4->c7_raw_mask :
+             inp_attn->get_kq_mask();
+ 
+     // SiegeLadder P13: the parts only - the top-k mask at the full width (a top-k mask built on a narrower width could
+@@ -1232,6 +1238,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         parts->top_k     = sparse ? top_k : nullptr;
+         return nullptr;
+     }
++    GGML_ASSERT(raw_mask != nullptr); // C7c past the cut: c7c_raw_mask exists exactly when there is no P13 plan
+ 
+     // At decode the dense path below attends over every compressed position and masks all but the indexer's
+     // top-k with -inf, so its cost grows with the context. One token in one stream can read only the picked
+@@ -1629,6 +1636,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+     GGML_UNUSED(csa_ratio);
+     GGML_UNUSED(hca_ratio);
+ 
++    // SiegeLadder C7c: a layer past the cut runs the rows from it only (llm_graph_input_dsv4::c7c_cut). V4.1's decoder layers
++    // are all of the HCA group with the indexer, whose inputs build_csa_lid_attention reads at those rows; no source among
++    // them (its state inputs are the whole ubatch's)
++    const bool c7c = inp_dsv4 != nullptr && inp_dsv4->c7c_cut > 0 && il > hparams.dsv4_dec_first();
++    GGML_ASSERT(!c7c || (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() && inp_dsv4->get_hca().kq_mask &&
++            !hparams.dsv4_is_kv_source[il] && !part && !src_only));
++
+     ggml_tensor * hca_state_kv    = nullptr;
+     ggml_tensor * hca_state_score = nullptr;
+     ggml_tensor * hca_source_kv   = nullptr;
+@@ -1955,8 +1969,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+     if (!inp_mtp && !part && inp_dsv4->p13.n_chunk > 0) {
+         const auto  & p13      = inp_dsv4->p13;
+         const float   kq_scale = 1.0f/sqrtf(float(n_embd_head));
+-        GGML_ASSERT(p13.t0.back() == nt);
++        // SiegeLadder C7c: past the cut the layer's rows are those of the plan's chunks from c7c_chunk0 on; the per-chunk
++        // views of the inputs serve as they are, its own tensors are read from row r_lo on
++        const int64_t c_lo     = c7c ? inp_dsv4->c7c_chunk0 : 0;
++        const int64_t r_lo     = p13.t0[c_lo];
++        GGML_ASSERT(p13.t0.back() - r_lo == nt);
+         GGML_ASSERT(inp_dsv4->p13_rows != nullptr && inp_dsv4->p13_mask != nullptr);
++        GGML_ASSERT(!c7c || (r_lo == inp_dsv4->c7c_cut && inp_dsv4->c7c_p13_rows != nullptr));
+ 
+         dsv4_attn_parts pa;
+         const std::vector<int64_t> * widths = nullptr;
+@@ -1995,7 +2014,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         // q8_0 and q4_0, as on the sparse decode path (D11). A sparse layer gathers its window per query instead
+         ggml_tensor * raw_rows = nullptr;
+         if (!sparse) {
+-            raw_rows = ggml_get_rows(ctx0, ring, inp_dsv4->p13_rows);
++            raw_rows = ggml_get_rows(ctx0, ring, c7c ? inp_dsv4->c7c_p13_rows : inp_dsv4->p13_rows);
+             raw_rows = ggml_cast(ctx0, raw_rows, pa.ring->type);
+             cb(raw_rows, "p13_raw_rows", il);
+         }
+@@ -2023,11 +2042,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         GGML_ASSERT((int64_t) inp_dsv4->p13_mask_c.size() == p13.n_chunk);
+         GGML_ASSERT((int64_t) inp_dsv4->p13_pos_c.size()  == p13.n_chunk);
+         GGML_ASSERT(!comp_is_input || (int64_t) inp_dsv4->p13_hca_c.size() == p13.n_chunk);
++        GGML_ASSERT(!comp_is_input || !c7c);
+ 
+         std::vector<ggml_tensor *> outs;
+-        for (int64_t c = 0; c < p13.n_chunk; ++c) {
+-            const int64_t i0 = p13.t0[c];
+-            const int64_t n  = p13.t0[c + 1] - i0;
++        for (int64_t c = c_lo; c < p13.n_chunk; ++c) {
++            const int64_t i0 = p13.t0[c] - r_lo; // the chunk's first row in this layer's tensors
++            const int64_t n  = p13.t0[c + 1] - p13.t0[c];
+ 
+             ggml_tensor * qc = ggml_view_3d(ctx0, pa.q, n_embd_head, n_hd, n, pa.q->nb[1], pa.q->nb[2],
+                     (size_t) i0*pa.q->nb[2]);
+@@ -2058,7 +2078,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+                 // of 256 - FlashAttention with the 512-wide head runs nowhere else but on the CPU
+                 ggml_tensor * kc = ggml_view_4d(ctx0, raw_rows, n_embd_head, 1, p13.raw_len, 1,
+                         raw_rows->nb[1], raw_rows->nb[1], raw_rows->nb[1]*p13.raw_len,
+-                        (size_t) (c*p13.raw_len)*raw_rows->nb[1]);
++                        (size_t) ((c - c_lo)*p13.raw_len)*raw_rows->nb[1]);
+                 // SiegeLadder C7: a decoder layer of a graph with the bound - the chunk's mask with it (see c7_lo)
+                 ggml_tensor * mc = !inp_dsv4->c7_p13_mask_c.empty() && il >= hparams.dsv4_dec_first() ?
+                         inp_dsv4->c7_p13_mask_c[c] : inp_dsv4->p13_mask_c[c];
+@@ -2399,7 +2419,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         if ((uint32_t) iln < hparams.dsv4_hash_layer_count) {
+             return ggml_get_rows(ctx0, ln.ffn_gate_tid2eid, res->t_inp_tokens);
+         }
+-        ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens), 0.0f);
++        // (the residual's rows: past C7c's cut they are fewer than the ubatch's)
++        ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, residual->ne[2]), 0.0f);
+         ggml_tensor * h1   = build_hc_post(zero, residual, post, comb, il); // past FFN L
+         ggml_tensor * post_a = nullptr;
+         ggml_tensor * comb_a = nullptr;
+@@ -2537,6 +2558,38 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * c14_wait  = nullptr;
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        // SiegeLadder C7c (cparams.dsv4_yoco_cut; llama_context::yoco_cut): past the first decoder layer only the rows from
++        // the cut go on - the rows before it are C7b's rows without consequence: no output, their decoder windows are read
++        // by no row past the bound (C7's masks), and the state a call leaves is its last rows, all past the bound. The first
++        // decoder layer ran every row (its cache writes are the compressed attention of every position); from here on the
++        // stream, the carried mix, the top-k and the candidate verdicts it left are their rows from the cut, and so are the
++        // positions (a view of the input made once per graph, see p13_mask_c) and the inputs the attention reads (c7c_*).
++        // The head gathers its outputs at their rows past the cut (llm_graph_input_out_ids::set_input)
++        if (inp_dsv4->c7c_cut > 0 && il == hparams.dsv4_dec_first() + 1) {
++            const int64_t cut = inp_dsv4->c7c_cut;
++            const int64_t ntc = n_tokens - cut;
++            GGML_ASSERT(p4_src < 0 && hc_carry_v != nullptr && inpL->ne[2] == n_tokens && hc_carry_v->ne[1] == n_tokens);
++
++            // rows [cut, n_tokens) along the axis that counts them
++            auto rows = [&](ggml_tensor * t, int axis) -> ggml_tensor * {
++                GGML_ASSERT(t->ne[axis] == n_tokens);
++                int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
++                ne[axis] = ntc;
++                return ggml_view_4d(ctx0, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3],
++                        (size_t) cut*t->nb[axis]);
++            };
++            inpL       = rows(inpL, 2);
++            hc_carry_v = rows(hc_carry_v, 1);
++            if (topk_carry_v != nullptr) {
++                topk_carry_v = rows(topk_carry_v, 1);
++            }
++            if (cand_carry_v != nullptr) {
++                // D3's compact verdicts are [1, n_blocks, nt, ns], the per-position mask [n_pos, nt, 1, ns]
++                cand_carry_v = rows(cand_carry_v, cand_carry_v->ne[0] == 1 && cand_carry_v->ne[2] == n_tokens ? 2 : 1);
++            }
++            inp_pos = ggml_view_1d(ctx0, inp_pos, ntc, (size_t) cut*ggml_element_size(inp_pos));
++        }
++
+         // G32: the attention block of this layer, which the first half of layer il - 1 may leave out. Its inputs go into
+         // the graph first, so the nodes added from here to its copies below are the block's own (the engram included)
+         const bool g32_here  = mstream != nullptr && il > 0 && g32_pass[il].ok && mstream->layer(il - 1) != nullptr;
+@@ -2813,7 +2866,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+     }
+ 
+-    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
++    ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, inpL->ne[2]); // (C7c: the rows past the cut)
+     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
+ 
+     if (cparams.embeddings_nextn) {

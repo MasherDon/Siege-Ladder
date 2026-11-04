@@ -1,0 +1,355 @@
+From 864b18a944b79e5c398be85738db54d078362ce9 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 09:37:30 +0000
+Subject: [PATCH 112/112] llama : SiegeLadder P19 stage B step 3 - the layer
+ pool shrinks back to P11's 64 slots before the graph of the ubatch holding
+ the C7 bound reaches the decoder layers, where the 512K scheduler buffer
+ grows to 5438 MiB, plus a DXGI guard (LLAMA_DSV4_LAYER_MAJOR_POOL_GUARD_MIB,
+ 256); LLAMA_DSV4_LAYER_MAJOR_COST=2 times set_in per input class and carry_in
+ per kind, sync no longer counts pull+copy's wait (L033); off by default; 48K
+ equal byte for byte in exact and default at k 1 and 4 with the shrink firing
+ in default; 512K k 1 -ub 2048 with the pool 457.96 tok/s against 390.30
+ without, VRAM within budget (SiegeLadder runs.md 4.293)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    | 65 ++++++++++++++++++++++++++++++--
+ src/llama-context.h      |  4 ++
+ src/llama-graph.cpp      | 11 +++++-
+ src/llama-graph.h        |  6 ++-
+ src/llama-moe-stream.cpp | 80 +++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   |  2 +
+ 6 files changed, 161 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index bc9fd4b..8383288 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -691,6 +691,7 @@ llama_context::llama_context(
+             }
+             if (const char * cost = std::getenv("LLAMA_DSV4_LAYER_MAJOR_COST")) {
+                 lm_cost_enable = atoi(cost) != 0;
++                lm_cost_detail = atoi(cost) == 2;
+             }
+             if (const char * resv = std::getenv("LLAMA_DSV4_LAYER_MAJOR_RESERVE")) {
+                 lm_reserve_enable = atoi(resv) != 0;
+@@ -2250,11 +2251,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             const int64_t t0 = ggml_time_us();
+             // an input no op of this segment reads (the top-k or the verdicts before a layer that makes its own, P4's
+             // last group) is left out of the graph and has no buffer - its bytes stay the slot's for the next segment
++            size_t lm_kind = 0;
+             for (const auto & it : cparams.dsv4_lm_carry_in->v) {
+                 if (it.t != nullptr && it.t->buffer != nullptr) {
+                     GGML_ASSERT(it.host != nullptr);
+-                    ggml_backend_tensor_set(it.t, it.host, 0, ggml_nbytes(it.t));
++                    const size_t nb = ggml_nbytes(it.t);
++                    const int64_t kind_t0 = lm_cost_seg && lm_cost_detail ? ggml_time_us() : 0;
++                    ggml_backend_tensor_set(it.t, it.host, 0, nb);
++                    if (lm_cost_seg && lm_cost_detail) {
++                        lm_carry_kind_us[lm_kind] += ggml_time_us() - kind_t0;
++                        lm_carry_kind_bytes[lm_kind] += nb;
++                    }
+                 }
++                ++lm_kind;
+             }
+             const int64_t dt = ggml_time_us() - t0;
+             lm_copy_us += dt;
+@@ -2266,7 +2275,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         llama_moe_stream_nvtx_push("set_inputs");
+         const int64_t t_set0 = lm_cost_seg ? ggml_time_us() : 0;
+-        res->set_inputs(&ubatch);
++        res->set_inputs(&ubatch, lm_cost_seg && lm_cost_detail ? &lm_inputs_cost : nullptr);
+         if (lm_cost_seg) {
+             lm_cost_set_in_us += ggml_time_us() - t_set0;
+         }
+@@ -3077,6 +3086,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             } else {
+             dctx->lm_metadata_pass();
+             lm_copy_us = 0;
++            lm_inputs_cost.clear();
++            std::fill(std::begin(lm_carry_kind_us), std::end(lm_carry_kind_us), 0);
++            std::fill(std::begin(lm_carry_kind_bytes), std::end(lm_carry_kind_bytes), 0);
+             lm_cost_build_us      = 0;
+             lm_cost_alloc_us      = 0;
+             lm_cost_carry_in_us   = 0;
+@@ -3230,6 +3242,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 }
+             }
+ 
++            size_t guard_buffer = lm_seg_sched ? lm_cuda0_sched_buffer() : 0;
++            bool guard_pending = false;
++            size_t guard_mib = 256;
++            if (const char * value = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_GUARD_MIB")) {
++                const long parsed = std::strtol(value, nullptr, 10);
++                if (parsed >= 0 && parsed <= 1048576) guard_mib = (size_t) parsed;
++            }
++            auto pool_guard_check = [&]() {
++                if (!ms_lm || !ms_lm->p19_lm_pool_active) return;
++                const size_t now = lm_cuda0_sched_buffer();
++                if (now > guard_buffer) {
++                    guard_buffer = now;
++                    const llama_wddm_budget wb = llama_wddm_query_budget();
++                    const uint64_t margin = (uint64_t) guard_mib * 1048576;
++                    if (wb.ok && (wb.local_budget <= margin || wb.local_usage > wb.local_budget - margin)) {
++                        guard_pending = true;
++                        LLAMA_LOG_WARN("%s: P19 LM pool guard usage=%" PRIu64 " budget=%" PRIu64 " margin_mib=%zu; shrink before next graph\n", __func__, wb.local_usage, wb.local_budget, guard_mib);
++                    }
++                }
++            };
++            auto pool_shrink_before = [&](const char * reason, size_t sc, int layer, size_t ub) {
++                if (ms_lm && ms_lm->p19_lm_pool_active) {
++                    ggml_backend_sched_synchronize(sched.get());
++                    gf_res_prev->reset(); // discard graph views of the old pool before any reuse
++                    ms_lm->p19_lm_pool_shrink(reason, sc, layer, ub);
++                    guard_pending = false;
++                }
++            };
+             // one slot per ubatch of a superchunk: in - what the next group's graph reads (host bytes, shape, type; the
+             // graph fills in its input tensors), out - the tensors the group's graph exported. Each item has a pinned
+             // host buffer of its own, which grows as the item does (the candidate verdicts widen with the position)
+@@ -3366,9 +3406,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 cparams.dsv4_lm_carry_in  = nullptr;
+                 cparams.dsv4_lm_carry_out = nullptr;
+ 
++                if (guard_pending || p.yoco_lo >= 0) pool_shrink_before(guard_pending ? "guard" : "C7-full", u, 0, u);
+                 ggml_status status = GGML_STATUS_SUCCESS;
+                 llm_graph_result * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, true);
+ 
++                pool_guard_check();
++
+                 cparams.dsv4_enc_only = false;
+                 cparams.dsv4_yoco_lo  = -1;
+                 cparams.dsv4_yoco_cut = 0;
+@@ -3463,10 +3506,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         cparams.dsv4_lm_carry_in  = gr.first > 0 ? &slots[i].in  : nullptr;
+                         cparams.dsv4_lm_carry_out = carry_on     ? &slots[i].out : nullptr;
+ 
++                        if (guard_pending || (gr.first >= dec && p.yoco_lo >= 0)) {
++                            pool_shrink_before(guard_pending ? "guard" : "C7-boundary", sc.first, gr.first, u);
++                        }
+                         ggml_status         status = GGML_STATUS_SUCCESS;
+                         llm_graph_result * res     = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                                 mctx.get(), status, true);
+                         ++n_graphs;
++                        pool_guard_check();
+                         if (lm_seg_sched) {
+                             lm_seg_sched_buf_max = std::max(lm_seg_sched_buf_max, lm_cuda0_sched_buffer());
+                         }
+@@ -3500,9 +3547,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                             const int64_t t0 = ggml_time_us();
+                             lm_slot_pull(slots[i]);
+                             if (lm_cost_enable) {
+-                                const int64_t ts = ggml_time_us();
+                                 ggml_backend_sched_synchronize(sched.get());
+-                                lm_cost_sync_us += ggml_time_us() - ts;
+                             } else {
+                                 ggml_backend_sched_synchronize(sched.get());
+                             }
+@@ -3565,6 +3610,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         copy_pull_ms / ng);
+             }
+ 
++            if (lm_cost_detail && n_graphs > 0) {
++                std::vector<std::pair<std::string, lm_input_cost>> ranking(lm_inputs_cost.begin(), lm_inputs_cost.end());
++                std::sort(ranking.begin(), ranking.end(), [](const auto & a, const auto & b) { return a.second.us > b.second.us; });
++                for (size_t j = 0; j < std::min<size_t>(10, ranking.size()); ++j) {
++                    const auto & e = ranking[j];
++                    LLAMA_LOG_INFO("%s: layer-major input class=%s total_ms=%.3f ms_per_graph=%.3f calls=%" PRIu64 " bytes_per_graph=unknown\n", __func__, e.first.c_str(), e.second.us / 1000.0, e.second.us / (1000.0 * n_graphs), e.second.calls);
++                }
++                const char * names[] = { "H", "HC", "TOPK", "CAND" };
++                for (size_t j = 0; j < 4; ++j) {
++                    LLAMA_LOG_INFO("%s: layer-major carry_in kind=%s total_ms=%.3f ms_per_graph=%.3f bytes_per_graph=%.1f\n", __func__, names[j], lm_carry_kind_us[j] / 1000.0, lm_carry_kind_us[j] / (1000.0 * n_graphs), (double) lm_carry_kind_bytes[j] / n_graphs);
++                }
++            }
+             layer_major_done = true;
+             }
+             }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0e3ce2e..52cdd27 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -435,6 +435,10 @@ private:
+     int64_t  lm_copy_us    = 0;    // P19: time of the carried state's copies (set_inputs and pulls), per decode call
+     // P19 cost probe (LLAMA_DSV4_LAYER_MAJOR_COST=1): per layer-major decode call, summed over segment graphs
+     bool     lm_cost_enable    = false;
++    bool     lm_cost_detail    = false;
++    lm_input_costs lm_inputs_cost;
++    int64_t lm_carry_kind_us[4] = {};
++    uint64_t lm_carry_kind_bytes[4] = {};
+     int64_t  lm_cost_build_us  = 0;
+     int64_t  lm_cost_alloc_us  = 0;
+     int64_t  lm_cost_carry_in_us = 0;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 93f4583..2a5dc94 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2666,9 +2666,18 @@ void llm_graph_result::reset() {
+     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
+ }
+ 
+-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
++void llm_graph_result::set_inputs(const llama_ubatch * ubatch, lm_input_costs * costs) {
++    if (!costs) {
++        for (auto & input : inputs) input->set_input(ubatch);
++        return;
++    }
+     for (auto & input : inputs) {
++        const int64_t t0 = ggml_time_us();
+         input->set_input(ubatch);
++        const int64_t elapsed = ggml_time_us() - t0;
++        auto & cost = (*costs)[typeid(*input).name()];
++        cost.us += elapsed;
++        ++cost.calls;
+     }
+ }
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 9104ecc..48fd129 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -6,6 +6,7 @@
+ #include "llama-adapter.h"
+ 
+ #include <cstdint>
++#include <string>
+ #include <vector>
+ #include <memory>
+ #include <set>
+@@ -1102,6 +1103,9 @@ struct llm_graph_g32 {
+     std::vector<ggml_tensor *> nodes;
+ };
+ 
++struct lm_input_cost { int64_t us = 0; uint64_t calls = 0; };
++using lm_input_costs = std::map<std::string, lm_input_cost>;
++
+ class llm_graph_result {
+ public:
+     llm_graph_result(int64_t max_nodes);
+@@ -1123,7 +1127,7 @@ public:
+ 
+     void reset();
+ 
+-    void set_inputs(const llama_ubatch * ubatch);
++    void set_inputs(const llama_ubatch * ubatch, lm_input_costs * costs = nullptr);
+     void set_outputs(const llm_graph_params & params);
+ 
+     // try to update the existing graph result using the new graph parameters in order to reuse it
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 3f8a042..8336c22 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -2867,6 +2867,7 @@ bool llama_moe_stream::p19_lm_pool_begin(uint32_t target_slots, size_t seg_reser
+     plan_slots         = p19_lm_base_slots;
+     p19_lm_pool_n      = P;
+     p19_lm_pool_active = true;
++    p19_lm_pool_shrunk = false;
+     p19_lm_last_il     = -1; // new memory: the first wave 0 of every layer resets its table
+     p19_lm_keep_tables = 0;
+     p19_lm_hits0       = stats.n_hit;
+@@ -2883,14 +2884,91 @@ bool llama_moe_stream::p19_lm_pool_begin(uint32_t target_slots, size_t seg_reser
+     return true;
+ }
+ 
++void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int layer, size_t ub) {
++    if (!p19_lm_pool_active || !p11_active) return;
++    std::unique_lock<std::mutex> lk(mtx);
++    moe_p11_quiesce_locked(*this, lk);
++    const uint32_t P = p19_lm_base_slots;
++    LLAMA_LOG_WARN("%s: P19 LM pool shrink reason=%s sc=%zu layer=%d ub=%zu hits=%" PRId64 " miss=%" PRId64 "\n",
++            __func__, reason, sc, layer, ub, stats.n_hit - p19_lm_hits0, stats.n_miss - p19_lm_miss0);
++        std::vector<const ggml_tensor *> widest;
++        for (const auto & sl : layers) {
++            if (!sl) {
++                continue;
++            }
++            widest.resize(sl->weights.size(), nullptr);
++            for (size_t w = 0; w < sl->weights.size(); w++) {
++                const ggml_tensor * a = sl->weights[w].cache;
++                if (widest[w] == nullptr || a->nb[2] > widest[w]->nb[2]) {
++                    widest[w] = a;
++                }
++            }
++        }
++        for (auto & sl : layers) {
++            if (sl) for (auto & wt : sl->weights) {
++                wt.cache->data = nullptr;
++                wt.cache->buffer = nullptr;
++            }
++        }
++        p11_buf.reset();
++        p11_ctx.reset();
++        ggml_init_params params = {
++            /*.mem_size   =*/ ggml_tensor_overhead()*(widest.size() + 1),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        p11_ctx.reset(ggml_init(params));
++        std::vector<ggml_tensor *> pool;
++        for (const ggml_tensor * c : widest) {
++            ggml_tensor * t = ggml_new_tensor_3d(p11_ctx.get(), c->type, c->ne[0], c->ne[1], P);
++            pool.push_back(t);
++        }
++        ggml_backend_buffer_type_t buft = ctxs[0].first;
++        p11_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(p11_ctx.get(), buft));
++        if (!p11_buf) GGML_ABORT("P19 pool restore failed");
++        ggml_backend_buffer_set_usage(p11_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        ggml_backend_dev_t dev = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
++        for (auto & sl : layers) {
++            if (!sl) {
++                continue;
++            }
++            for (size_t w = 0; w < sl->weights.size(); w++) {
++                ggml_tensor * c = sl->weights[w].cache;
++                c->ne[2]  = P;
++                c->nb[3]  = c->nb[2] * P;
++                c->data   = pool[w]->data;
++                c->buffer = pool[w]->buffer;
++            }
++            p11_reset_layer_locked(*sl, P); // the replacement buffer is empty
++            if (slot_fence && dev != nullptr) {
++                if (sl->slot_up_event.size() < P) {
++                    const size_t n0 = sl->slot_up_event.size();
++                    sl->slot_up_event.resize(P, nullptr);
++                    sl->slot_up_seq.resize(P, 0);
++                    for (size_t s = n0; s < P; s++) {
++                        sl->slot_up_event[s] = ggml_backend_event_new(dev);
++                    }
++                }
++            }
++        }
++    p19_lm_pool_active = false;
++    p19_lm_pool_shrunk = true;
++    p19_lm_last_il = -1;
++}
+ void llama_moe_stream::p19_lm_pool_end() {
+-    if (!p19_lm_pool_active) {
++    if (!p19_lm_pool_active && !p19_lm_pool_shrunk) {
+         return;
+     }
+     const int64_t hits  = stats.n_hit - p19_lm_hits0;
+     const int64_t miss  = stats.n_miss - p19_lm_miss0;
+     const int64_t bytes = io[0].bytes.load() - p19_lm_io_bytes0;
+     if (p11_active) {
++        if (p19_lm_pool_shrunk) {
++            LLAMA_LOG_INFO("%s: P19 LM pool (call end) shrunk: slots=%u plan=%u hits=%" PRId64 " miss=%" PRId64 " demand_io_bytes=%" PRId64 " kept_tables=%" PRId64 "\n", __func__, p19_lm_base_slots, plan_slots, hits, miss, bytes, p19_lm_keep_tables);
++            p19_lm_pool_shrunk = false;
++            return;
++        }
++
+         // p1_leave -> p11_leave restores p11_saved_slots and the per-layer cache; only clear planning state
+         LLAMA_LOG_INFO("%s: P19 LM pool (call end): slots=%u plan=%u hits=%" PRId64 " miss=%" PRId64 " demand_io_bytes=%" PRId64
+                 " kept_tables=%" PRId64 " (delta vs call start; compare POOL off on the same prompt)\n", __func__,
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 31efb81..ca5ebae 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -661,6 +661,8 @@ struct llama_moe_stream {
+     int64_t  p19_lm_keep_tables   = 0;  // wave-0 entries that kept their table (layer-major pool hits possible)
+     // target_slots: 0 = auto from DXGI; seg_reserve_bytes = margin for segment graphs (POOL_MARGIN + peak sched buf)
+     bool p19_lm_pool_begin(uint32_t target_slots, size_t seg_reserve_bytes, size_t margin_mib);
++    bool p19_lm_pool_shrunk = false;
++    void p19_lm_pool_shrink(const char * reason, size_t sc, int layer, size_t ub);
+     void p19_lm_pool_end(); // shrink to p19_lm_base_slots; no-op when p11_leave will restore the cache
+     // SiegeLadder P4: the last layer whose experts the latest graph build runs (-1: every layer) - an encoder-only ubatch
+     // stops before the first decoder layer's FFN, and nothing reads ahead into a layer it will not run. Set at graph build

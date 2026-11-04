@@ -1,0 +1,274 @@
+From d6713a4a9b64f340602c31da16ed491d3fbfa10e Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:27:59 +0000
+Subject: [PATCH 098/112] ggml-cuda : SiegeLadder D4 - the top k of a long row
+ by radix select instead of a sort of the whole row (on by default,
+ GGML_CUDA_TOPK_SELECT=0 - the sort). With CCCL 3.0 (no DeviceTopK) TOP_K on a
+ row past 1024 sorted the row with cub and kept its first k; DeepSeek-V4.1's
+ indexer takes the top 512 / 2048 of every query's scores over all compressed
+ positions. Now one block of 1024 threads per row: three histogram passes over
+ the order-preserving key of each float (12 + 12 + 8 bits from the top, cub's
+ own twiddle) find the k-th largest key exactly, a fourth pass gathers the
+ keys above it and the needed ones equal to it (lowest indices first), and a
+ bitonic sort of the k (key, index) pairs in shared memory orders them by
+ value descending, ties by index ascending - what a stable descending radix
+ sort gives, so the same indices in the same order. Bitwise the same logits
+ (SiegeLadder bench/topk_select_check.py: the decode path at -ub 1 and a
+ 6144-row prompt batch), test-backend-ops TOP_K 445/445; per op at k 400: 65
+ 000 x 1 109 -> 27 us, 200 000 x 1 90 -> 53, 65 000 x 16 321 -> 28, 200 000 x
+ 16 933 -> 54 (SiegeLadder runs.md 4.242). The hot path has little of it left
+ (P4 skips the indexer before the C7 bound; decode's single row already had
+ DeviceRadixSort): ~0.2 ms a token at 1M
+
+---
+ ggml/src/ggml-cuda/top-k.cu | 230 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 230 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/top-k.cu b/ggml/src/ggml-cuda/top-k.cu
+index 9681cd2..7ac287c 100644
+--- a/ggml/src/ggml-cuda/top-k.cu
++++ b/ggml/src/ggml-cuda/top-k.cu
+@@ -48,6 +48,233 @@ static int next_power_of_2(int x) {
+ 
+ #endif                            // CUB_TOP_K_AVAILABLE
+ 
++// SiegeLadder D4 (on by default, GGML_CUDA_TOPK_SELECT=0 - off): the top k of a long row by radix select instead of a sort of the whole
++// row. DeepSeek-V4.1's indexer takes the top 512 / 2048 of every query's row of scores over all compressed positions - at
++// 1M a row of ~262K - and the fallback above sorts the whole row (cub, CCCL 3.0 has no DeviceTopK) only to copy its first
++// k. Here one block per row: three histogram passes over the order-preserving key of each float (12 + 12 + 8 bits, from
++// the top) find the k-th largest key exactly, a fourth pass gathers the elements above it and as many equal to it as are
++// still needed - the lowest indices first - and a bitonic sort of the k (key, index) pairs in shared memory orders them
++// by value descending, ties by index ascending: exactly what a stable descending radix sort gives (cub's DeviceRadixSort
++// and DeviceSegmentedRadixSort, the same key twiddle), so the indices come out the same and in the same order.
++static constexpr int TOPK_SELECT_NT   = 1024;
++static constexpr int TOPK_SELECT_BINS = 4096;
++
++static __device__ __forceinline__ uint32_t topk_select_key(const float f) {
++    const uint32_t u = __float_as_uint(f);
++    return (u & 0x80000000u) ? ~u : (u | 0x80000000u); // cub's twiddle: ascending key = ascending float
++}
++
++static __global__ void __launch_bounds__(TOPK_SELECT_NT) top_k_select_f32(
++        const float * __restrict__ x, int * __restrict__ dst, const int ncols, const int k, const int kpad) {
++    extern __shared__ uint32_t topk_smem[];
++    uint32_t *           hist  = topk_smem;                                              // TOPK_SELECT_BINS
++    unsigned long long * pairs = (unsigned long long *) (topk_smem + TOPK_SELECT_BINS); // kpad
++    __shared__ uint32_t s_part[TOPK_SELECT_NT / 32];
++    __shared__ uint32_t s_bin, s_need, s_eq, s_n_gt, s_taken;
++
++    const int     tid = threadIdx.x;
++    const float * row = x   + (int64_t) blockIdx.x * ncols;
++    int *         out = dst + (int64_t) blockIdx.x * k;
++
++    // block-wide exclusive prefix sum of v over the threads in their order; the total in *total
++    auto block_excl_scan = [&](uint32_t v, uint32_t * total) -> uint32_t {
++        const int lane = tid & 31, warp = tid >> 5;
++        uint32_t incl = v;
++        for (int o = 1; o < 32; o <<= 1) {
++            const uint32_t n = __shfl_up_sync(0xffffffffu, incl, o);
++            if (lane >= o) {
++                incl += n;
++            }
++        }
++        if (lane == 31) {
++            s_part[warp] = incl;
++        }
++        __syncthreads();
++        if (warp == 0) {
++            uint32_t p = lane < TOPK_SELECT_NT/32 ? s_part[lane] : 0;
++            for (int o = 1; o < 32; o <<= 1) {
++                const uint32_t n = __shfl_up_sync(0xffffffffu, p, o);
++                if (lane >= o) {
++                    p += n;
++                }
++            }
++            if (lane < TOPK_SELECT_NT/32) {
++                s_part[lane] = p; // inclusive over the warps
++            }
++        }
++        __syncthreads();
++        const uint32_t before = warp > 0 ? s_part[warp - 1] : 0;
++        *total = s_part[TOPK_SELECT_NT/32 - 1];
++        __syncthreads();
++        return before + incl - v;
++    };
++
++    uint32_t prefix = 0, pmask = 0;
++    uint32_t need   = (uint32_t) k; // elements under the fixed prefix still to take, from the top
++    uint32_t n_eq   = 0;            // elements whose key equals the threshold
++    const int shifts[3] = { 20, 8, 0 };
++    const int widths[3] = { 12, 12, 8 };
++    for (int pass = 0; pass < 3; ++pass) {
++        const int sh = shifts[pass];
++        const int nb = 1 << widths[pass];
++        for (int i = tid; i < nb; i += TOPK_SELECT_NT) {
++            hist[i] = 0;
++        }
++        __syncthreads();
++        for (int i = tid; i < ncols; i += TOPK_SELECT_NT) {
++            const uint32_t key = topk_select_key(row[i]);
++            if ((key & pmask) == prefix) {
++                atomicAdd(&hist[(key >> sh) & (nb - 1)], 1u);
++            }
++        }
++        __syncthreads();
++        // from the top bin down: thread t sums its run of bins, the scan over threads gives what lies above each run, and
++        // the run in which the count reaches need finds its bin
++        const int per = (nb + TOPK_SELECT_NT - 1) / TOPK_SELECT_NT;
++        uint32_t run = 0;
++        for (int j = 0; j < per; ++j) {
++            const int b = nb - 1 - (tid*per + j);
++            if (b >= 0) {
++                run += hist[b];
++            }
++        }
++        uint32_t total = 0;
++        const uint32_t above = block_excl_scan(run, &total);
++        if (above < need && above + run >= need) {
++            uint32_t acc = above;
++            for (int j = 0; j < per; ++j) {
++                const int b = nb - 1 - (tid*per + j);
++                if (b < 0) {
++                    break;
++                }
++                if (acc + hist[b] >= need) {
++                    s_bin  = (uint32_t) b;
++                    s_need = need - acc;
++                    s_eq   = hist[b];
++                    break;
++                }
++                acc += hist[b];
++            }
++        }
++        __syncthreads();
++        prefix |= s_bin << sh;
++        pmask  |= (uint32_t) (nb - 1) << sh;
++        need    = s_need;
++        n_eq    = s_eq;
++        __syncthreads();
++    }
++    // the threshold key is prefix: every key above it is taken (k - need of them), of the n_eq equal to it the need with
++    // the lowest indices
++    const uint32_t n_gt = (uint32_t) k - need;
++    if (tid == 0) {
++        s_n_gt  = 0;
++        s_taken = 0;
++    }
++    __syncthreads();
++    if (n_eq == need) {
++        // all of the equal ones: no order needed here, the sort below orders them
++        for (int i = tid; i < ncols; i += TOPK_SELECT_NT) {
++            const uint32_t key = topk_select_key(row[i]);
++            if (key >= prefix) {
++                const uint32_t slot = atomicAdd(&s_n_gt, 1u);
++                pairs[slot] = ((unsigned long long) (~key) << 32) | (uint32_t) i;
++            }
++        }
++    } else {
++        // more equal ones than needed (ties, e.g. masked positions at -inf): the lowest indices, chunk by chunk in order
++        for (int base = 0; base < ncols; base += TOPK_SELECT_NT) {
++            const int      i   = base + tid;
++            const uint32_t key = i < ncols ? topk_select_key(row[i]) : 0;
++            const bool     gt  = i < ncols && key > prefix;
++            const bool     eq  = i < ncols && key == prefix;
++            if (gt) {
++                const uint32_t slot = atomicAdd(&s_n_gt, 1u);
++                pairs[slot] = ((unsigned long long) (~key) << 32) | (uint32_t) i;
++            }
++            uint32_t n_chunk = 0;
++            const uint32_t rank  = block_excl_scan(eq ? 1u : 0u, &n_chunk);
++            const uint32_t taken = s_taken;
++            if (eq && taken + rank < need) {
++                pairs[n_gt + taken + rank] = ((unsigned long long) (~key) << 32) | (uint32_t) i;
++            }
++            __syncthreads();
++            if (tid == 0) {
++                s_taken = taken + n_chunk;
++            }
++            __syncthreads();
++            if (s_taken >= need && s_n_gt >= n_gt) {
++                break; // the needed equal ones are in, and so is every key above the threshold: the rest adds nothing
++            }
++        }
++    }
++    __syncthreads();
++    for (int i = k + tid; i < kpad; i += TOPK_SELECT_NT) {
++        pairs[i] = ~0ull;
++    }
++    __syncthreads();
++    // bitonic sort, ascending composite = value descending, index ascending
++    for (int size = 2; size <= kpad; size <<= 1) {
++        for (int stride = size >> 1; stride > 0; stride >>= 1) {
++            for (int i = tid; i < kpad/2; i += TOPK_SELECT_NT) {
++                const int lo = 2*i - (i & (stride - 1));
++                const int hi = lo + stride;
++                const bool up = (lo & size) == 0;
++                const unsigned long long a = pairs[lo], b = pairs[hi];
++                if ((a > b) == up) {
++                    pairs[lo] = b;
++                    pairs[hi] = a;
++                }
++            }
++            __syncthreads();
++        }
++    }
++    for (int i = tid; i < k; i += TOPK_SELECT_NT) {
++        out[i] = (int) (uint32_t) (pairs[i] & 0xffffffffull);
++    }
++}
++
++// true when the select kernel took the op: a row longer than the bitonic path's 1024 and k small enough for the pairs in
++// shared memory. Bitwise the same as the sort (SiegeLadder bench/topk_select_check.py: the decode path at -ub 1 and a
++// prompt batch; test-backend-ops TOP_K 445/445); per op at k 400: 65 000 x 1 109 -> 27 us, 200 000 x 1 90 -> 53,
++// 65 000 x 16 321 -> 28, 200 000 x 16 933 -> 54 (runs.md 4.242)
++static bool top_k_select(const float * x, int * dst, const int64_t ncols, const int64_t nrows, const int64_t k,
++        cudaStream_t stream) {
++    static const bool on = [] {
++        const char * s = getenv("GGML_CUDA_TOPK_SELECT");
++        return s == nullptr || atoi(s) != 0;
++    }();
++    if (!on || ncols <= 1024 || k <= 0 || k > ncols || ncols > INT_MAX || nrows > INT_MAX) {
++        return false;
++    }
++    int kpad = 1;
++    while (kpad < k) {
++        kpad <<= 1;
++    }
++    kpad = std::max(kpad, 2);
++    const size_t smem = TOPK_SELECT_BINS*sizeof(uint32_t) + (size_t) kpad*sizeof(unsigned long long);
++    // 16 KB of bins + 8 bytes a pair: 32 KB at k 2048 (the indexer's largest), under the 48 KB a block gets without opt-in
++    if (smem > 48*1024) {
++        const size_t smem_max = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
++        if (smem + 1024 > smem_max) {
++            return false;
++        }
++        static size_t attr_smem = 0;
++        if (smem > attr_smem) {
++            CUDA_CHECK(cudaFuncSetAttribute(top_k_select_f32, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++            attr_smem = smem;
++        }
++    }
++    static bool logged = false;
++    if (!logged) {
++        logged = true;
++        GGML_LOG_INFO("%s: SiegeLadder D4: top-k by radix select (row %lld, k %lld, %lld rows; GGML_CUDA_TOPK_SELECT=0 - the sort)\n",
++                __func__, (long long) ncols, (long long) k, (long long) nrows);
++    }
++    top_k_select_f32<<<(unsigned) nrows, TOPK_SELECT_NT, smem, stream>>>(x, dst, (int) ncols, (int) k, kpad);
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
+ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0   = dst->src[0];
+     const float *       src0_d = (const float *) src0->data;
+@@ -63,6 +290,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t    nrows = ggml_nrows(src0);
+     const int64_t    k     = dst->ne[0];
+     ggml_cuda_pool & pool  = ctx.pool();
++    if (top_k_select(src0_d, dst_d, ncols, nrows, k, stream)) {
++        return;
++    }
+ #ifdef CUB_TOP_K_AVAILABLE
+     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
+     // https://github.com/NVIDIA/cccl/issues/6391

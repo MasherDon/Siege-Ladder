@@ -1,0 +1,458 @@
+From 1bda74ba9edf52864d579ce3791570fd35ab299a Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 20:35:39 +0000
+Subject: [PATCH 097/112] graph + mmap + model : SiegeLadder P8d - the Engram
+ tables unmapped, every row read straight from the model files (on by default,
+ LLAMA_ENGRAM_UNMAPPED=0 - off). At load the files that hold nothing
+ host-resident but engram tables (on 1017: the two 98 GB FP8 tables and layer
+ 1's 3 GB scale table, 186 GiB) are released like the expert files; a table
+ that is a copied host tensor (layer 14's scales, in a streamed expert file)
+ stays in RAM and is read from there (llama_model::engram_w_disk /
+ engram_s_disk). At decode G26's helper (read_ahead) reads the ubatch's rows
+ into dec_rows - fill_layer takes them when its own hashes match, else reads
+ them itself; in prompts P8's helper always reads directly (P8c's path, now
+ through llm_graph_input_engram::read_rows). llama_read_scattered keeps one
+ unbuffered overlapped handle per file for the process, asks BypassIO for it
+ (FSCTL_MANAGE_BYPASS_IO) and reads on the caller's thread when n_thr is 1.
+ Why: Windows checks every unbuffered read of a mapped file for cache
+ coherency - diskspd on a mapped engram file 13K 4 KB reads a second, unmapped
+ 0.72M, with BypassIO 1.14M; cached reads of the mapped file 0.2-0.44M, no
+ better than PrefetchVirtualMemory (SiegeLadder runs.md 4.240). Bitwise the
+ same logits as the mapped path at -ub 4096 and -ub 32
+ (bench/engram_pp_check.py arms u / m). A B B A: agent turns 2-8 read in 48.0
+ / 47.7 s against 50.6 / 50.1 (-5%; turn 7.5K +10%), answers 18.37 / 18.30
+ tok/s against 17.89 / 17.60 (+3%), cold 2.2K / 8.9K +2% / +6%, the turns'
+ paging 350-860 MB -> 9-120 MB
+
+---
+ src/llama-graph.cpp | 126 +++++++++++++++++++++++++++++++++++---------
+ src/llama-graph.h   |   8 +++
+ src/llama-mmap.cpp  |  95 ++++++++++++++++++++++++++-------
+ src/llama-model.cpp |  55 +++++++++++++++++++
+ src/llama-model.h   |   5 ++
+ 5 files changed, 244 insertions(+), 45 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8978639..093a361 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -213,12 +213,14 @@ void llm_graph_input_engram::read_ahead(const llama_ubatch & ubatch) {
+     std::vector<int64_t> rows(t.n_hash_cols);
+     std::vector<void *>  addrs;
+     std::vector<size_t>  sizes;
++    std::vector<std::vector<int64_t>> rowidx(t.n_layer); // P8d: the same rows by index, per layer
+     addrs.reserve((size_t) 2*t.n_layer*n_tokens*t.n_hash_cols);
+     sizes.reserve(addrs.capacity());
+     for (uint32_t e = 0; e < t.n_layer; ++e) {
+         const auto & layer = model.layers[hparams.engram_layer_ids[e]];
+         const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
+         const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
++        rowidx[e].reserve((size_t) n_tokens*t.n_hash_cols);
+         for (uint32_t i = 0; i < n_tokens; ++i) {
+             const llama_seq_id s = ubatch.seq_id[i][0];
+             const llama_pos    p = ubatch.pos[i];
+@@ -235,9 +237,29 @@ void llm_graph_input_engram::read_ahead(const llama_ubatch & ubatch) {
+                 sizes.push_back(t.head_dim);
+                 addrs.push_back((void *) (sc + (size_t) rows[c]*(t.head_dim/32)));
+                 sizes.push_back(t.head_dim/32);
++                rowidx[e].push_back(rows[c]);
+             }
+         }
+     }
++    if (model.engram_unmapped) {
++        // SiegeLadder P8d: the tables are not mapped - the helper reads the rows themselves, from one thread with its
++        // reads in flight together (a decode ubatch's 48 rows: ~100 pieces); fill_layer checks the indices and reads
++        // on its own if they are not the ones it hashes (the history moved between the build and set_input)
++        dec_idx = std::move(rowidx);
++        dec_rows.assign(t.n_layer, {});
++        ahead = std::thread([this]() {
++            llama_moe_stream_nvtx_push("engram_ahead");
++            const size_t rb = (size_t) hparams.engram_head_dim + hparams.engram_head_dim/32;
++            for (uint32_t e = 0; e < (uint32_t) dec_idx.size(); ++e) {
++                dec_rows[e].resize(dec_idx[e].size()*rb);
++                if (!read_rows(e, dec_idx[e].data(), dec_idx[e].size(), dec_rows[e].data(), 1, 64)) {
++                    dec_rows[e].clear(); // fill_layer reads them again and fails loudly
++                }
++            }
++            llama_moe_stream_nvtx_pop();
++        });
++        return;
++    }
+     // every layer's rows in one list, so the OS has the faults of all of them in flight at once
+     ahead = std::thread([addrs = std::move(addrs), sizes = std::move(sizes)]() {
+         llama_moe_stream_nvtx_push("engram_ahead");
+@@ -389,7 +411,8 @@ void llm_graph_input_engram::pp_start(const llama_ubatch & ub) {
+         const char * s = getenv("LLAMA_ENGRAM_PP_DIRECT_QD");
+         return std::max(1, s != nullptr ? atoi(s) : 32);
+     }();
+-    const bool use_direct = direct && model.engram_src.size() == t.n_layer;
++    // P8d: with the tables unmapped there is nothing to fault in - always the direct reads
++    const bool use_direct = (direct || model.engram_unmapped) && model.engram_src.size() == t.n_layer;
+     pp_rows.assign(use_direct ? t.n_layer : 0, {});
+     pp_direct.assign(t.n_layer, 0);
+     {
+@@ -415,41 +438,27 @@ void llm_graph_input_engram::pp_start(const llama_ubatch & ub) {
+             const size_t T = std::min(n_thr, std::max<size_t>(1, n/4096));
+             bool read = false;
+             if (use_direct) {
+-                // P8c: per row its FP8 bytes (two pieces when they cross a 4 KB boundary) and its scale bytes
+-                const auto &   src = model.engram_src[e];
+-                const size_t   sb  = hd/32;
+-                const size_t   rb  = hd + sb;
+-                const uint64_t SEC = 4096;
++                // P8c: per row its FP8 bytes (two pieces when they cross a 4 KB boundary) and its scale bytes (P8d: from
++                // RAM where the scale table is a copied host tensor)
++                const size_t rb = hd + hd/32;
+                 pp_rows[e].resize(rowidx[e].size()*rb);
+-                std::vector<llama_scatter_piece> ps;
+-                ps.reserve(rowidx[e].size()*2 + rowidx[e].size()/8);
+-                for (size_t k = 0; k < rowidx[e].size(); ++k) {
+-                    uint8_t *      d  = pp_rows[e].data() + k*rb;
+-                    const uint64_t wo = src.offs_w + (uint64_t) rowidx[e][k]*hd;
+-                    const uint64_t a  = std::min<uint64_t>(hd, SEC - (wo & (SEC - 1)));
+-                    ps.push_back({ wo, (uint32_t) a, 0, d });
+-                    if (a < hd) {
+-                        ps.push_back({ wo + a, (uint32_t) (hd - a), 0, d + a });
+-                    }
+-                    ps.push_back({ src.offs_s + (uint64_t) rowidx[e][k]*sb, (uint32_t) sb, 1, d + hd });
+-                }
+-                const std::string paths[2] = { src.path_w, src.path_s };
+                 const int64_t t0 = ggml_time_us();
+-                const size_t n_ps = ps.size();
+-                read = llama_read_scattered(paths, ps, d_thr, d_qd);
+-                LLAMA_LOG_INFO("%s: SiegeLadder P8c: engram layer %zu - %zu rows, %zu pieces read in %.1f ms (%d x %d)\n",
+-                        __func__, e, rowidx[e].size(), n_ps, (ggml_time_us() - t0)/1000.0, d_thr, d_qd);
++                read = read_rows((uint32_t) e, rowidx[e].data(), rowidx[e].size(), pp_rows[e].data(), d_thr, d_qd);
++                LLAMA_LOG_INFO("%s: SiegeLadder P8c: engram layer %zu - %zu rows read in %.1f ms (%d x %d)\n",
++                        __func__, e, rowidx[e].size(), (ggml_time_us() - t0)/1000.0, d_thr, d_qd);
+                 if (!read) {
+                     static bool warned = false;
+                     if (!warned) {
+                         warned = true;
+-                        LLAMA_LOG_WARN("%s: SiegeLadder P8c: the direct read of engram layer %zu failed - its pages are "
+-                                "faulted in as before\n", __func__, e);
++                        LLAMA_LOG_WARN("%s: SiegeLadder P8c: the direct read of engram layer %zu failed - %s\n", __func__,
++                                e, model.engram_unmapped ? "fill_layer reads it again" : "its pages are faulted in as before");
+                     }
+                 }
+             }
+             if (read) {
+                 pp_direct[e] = 1;
++            } else if (model.engram_unmapped) {
++                // P8d: no mapping to fault in - fill_layer reads the rows itself (and stops the process if that fails too)
+             } else if (T <= 1) {
+                 llama_prefetch_ranges(addrs[e].data(), sizes[e].data(), n);
+             } else {
+@@ -481,6 +490,46 @@ void llm_graph_input_engram::pp_wait(uint32_t e) {
+     pp_cv.wait(lk, [&] { return pp_done > e; });
+ }
+ 
++bool llm_graph_input_engram::read_rows(uint32_t e, const int64_t * idx, size_t n, uint8_t * out, int n_thr, int qd) const {
++    const size_t   hd  = hparams.engram_head_dim;
++    const size_t   sb  = hd/32;
++    const size_t   rb  = hd + sb;
++    const uint64_t SEC = 4096;
++    if (e >= model.engram_src.size()) {
++        return false;
++    }
++    const auto & src = model.engram_src[e];
++    // P8c (tables mapped): both from the files; P8d: from the file what lies only there, from memory what is in RAM
++    const bool w_file = !model.engram_unmapped || (e < model.engram_w_disk.size() && model.engram_w_disk[e]);
++    const bool s_file = !model.engram_unmapped || (e < model.engram_s_disk.size() && model.engram_s_disk[e]);
++    const auto &    layer = model.layers[hparams.engram_layer_ids[e]];
++    const uint8_t * w     = (const uint8_t *) layer.engram_embd->data;
++    const uint8_t * sc    = (const uint8_t *) layer.engram_embd_scale->data;
++    std::vector<llama_scatter_piece> ps;
++    ps.reserve(n*(w_file ? 2 : 0) + (s_file ? n : 0));
++    for (size_t k = 0; k < n; ++k) {
++        uint8_t * d = out + k*rb;
++        if (w_file) {
++            // a row's FP8 bytes: two pieces when they cross a 4 KB boundary
++            const uint64_t wo = src.offs_w + (uint64_t) idx[k]*hd;
++            const uint64_t a  = std::min<uint64_t>(hd, SEC - (wo & (SEC - 1)));
++            ps.push_back({ wo, (uint32_t) a, 0, d });
++            if (a < hd) {
++                ps.push_back({ wo + a, (uint32_t) (hd - a), 0, d + a });
++            }
++        } else {
++            std::memcpy(d, w + (size_t) idx[k]*hd, hd);
++        }
++        if (s_file) {
++            ps.push_back({ src.offs_s + (uint64_t) idx[k]*sb, (uint32_t) sb, 1, d + hd });
++        } else {
++            std::memcpy(d + hd, sc + (size_t) idx[k]*sb, sb);
++        }
++    }
++    const std::string paths[2] = { src.path_w, src.path_s };
++    return llama_read_scattered(paths, ps, n_thr, qd);
++}
++
+ void llm_graph_input_engram::fill_layer(uint32_t e, float * dst, const llama_ubatch & ub, bool prefetch) {
+     auto * cache = mctx->get_kv();
+     GGML_ASSERT(cache != nullptr && cache->engram_enabled());
+@@ -553,6 +602,33 @@ void llm_graph_input_engram::fill_layer(uint32_t e, float * dst, const llama_uba
+         llama_engram_hash_row(t, e, hist.data(), todas.data() + (size_t) i*t.n_hash_cols);
+     }
+ 
++    if (model.engram_unmapped) {
++        // SiegeLadder P8d: no table memory to touch - the rows the read-ahead brought if they are these, else read now
++        const size_t rb = (size_t) t.head_dim + t.head_dim/32;
++        const uint8_t * rows_p = nullptr;
++        std::vector<uint8_t> own;
++        if (e < dec_idx.size() && dec_idx[e] == todas && dec_rows[e].size() == todas.size()*rb) {
++            rows_p = dec_rows[e].data();
++        } else {
++            own.resize(todas.size()*rb);
++            const bool big = todas.size() > 4096;
++            if (!read_rows(e, todas.data(), todas.size(), own.data(), big ? 8 : 1, big ? 32 : 64)) {
++                GGML_ABORT("SiegeLadder P8d: the direct read of engram layer %u failed", e);
++            }
++            rows_p = own.data();
++        }
++        llama_moe_stream_nvtx_push("engram_read");
++        for (uint32_t i = 0; i < n_tokens; ++i) {
++            float * out = dst + (size_t) i*row;
++            for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
++                const uint8_t * r = rows_p + ((size_t) i*t.n_hash_cols + c)*rb;
++                llama_engram_dequant_row(r, r + t.head_dim, t.head_dim, out + (size_t) c*t.head_dim);
++            }
++        }
++        llama_moe_stream_nvtx_pop();
++        return;
++    }
++
+     for (size_t k = 0; k < todas.size(); ++k) {
+         enderecos.push_back((void *) (w  + (size_t) todas[k]*t.head_dim));
+         tamanhos .push_back(t.head_dim);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 20fea64..298313a 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -815,6 +815,14 @@ public:
+     void pp_start(const llama_ubatch & ub);
+     void pp_wait(uint32_t e);
+ 
++    // SiegeLadder P8d (model.engram_unmapped): the rows idx[0..n) of engram layer e into out (head_dim bytes of FP8, then
++    // head_dim/32 of scale per row) - from the file for a table on disk, from memory for one in RAM; false when a read fails
++    bool read_rows(uint32_t e, const int64_t * idx, size_t n, uint8_t * out, int n_thr, int qd) const;
++    // P8d at decode: read_ahead reads the ubatch's rows straight from the files into dec_rows[e], their indices in
++    // dec_idx[e]; fill_layer takes them when its own hashes match, else reads the rows itself
++    std::vector<std::vector<uint8_t>> dec_rows;
++    std::vector<std::vector<int64_t>> dec_idx;
++
+     const llama_hparams & hparams;
+     const llama_model   & model;
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 6878a4e..31ded98 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -10,7 +10,9 @@
+ #include <cerrno>
+ #include <algorithm>
+ #include <atomic>
++#include <mutex>
+ #include <thread>
++#include <unordered_map>
+ 
+ #ifdef __has_include
+     #if __has_include(<unistd.h>)
+@@ -1260,6 +1262,53 @@ void llama_prefetch_ranges(void * const * addrs, const size_t * sizes, size_t n)
+ #endif
+ }
+ 
++#ifdef _WIN32
++// SiegeLadder P8d: FSCTL_MANAGE_BYPASS_IO (Windows 11), declared here - winioctl.h shows it only from NTDDI_WIN10_CO on
++struct sl_bpio_input  { int32_t op; int32_t in_flags; uint64_t r1, r2; };
++struct sl_bpio_output { int32_t op; int32_t out_flags; uint64_t r1, r2; uint32_t op_status; uint16_t drv_len;
++                        wchar_t drv[32]; uint16_t why_len; wchar_t why[128]; };
++
++// SiegeLadder P8d: one unbuffered overlapped handle per file for the whole process (each thread brings its own
++// OVERLAPPED), with BypassIO asked for: on an unmapped engram file diskspd did 0.72M 4 KB reads a second plain and
++// 1.14M with it (SiegeLadder runs.md 4.240); on a mapped one it changes nothing (13K). Opened once instead of by every
++// reader thread of every call - decode reads a layer's ~50 sectors per token
++static HANDLE llama_scatter_handle(const std::string & path) {
++    static std::mutex mtx;
++    static std::unordered_map<std::string, HANDLE> handles;
++    std::lock_guard<std::mutex> lk(mtx);
++    auto it = handles.find(path);
++    if (it != handles.end()) {
++        return it->second;
++    }
++    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
++            FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
++    if (h != INVALID_HANDLE_VALUE) {
++        sl_bpio_input  in  = { 1 /* FS_BPIO_OP_ENABLE */, 0, 0, 0 };
++        sl_bpio_output out = {};
++        OVERLAPPED     ov  = {};
++        ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
++        DWORD got = 0;
++        BOOL  r   = ov.hEvent != NULL && DeviceIoControl(h, CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 274, METHOD_BUFFERED,
++                FILE_ANY_ACCESS), &in, sizeof(in), &out, sizeof(out), &got, &ov);
++        if (!r && ov.hEvent != NULL && GetLastError() == ERROR_IO_PENDING) {
++            r = GetOverlappedResult(h, &ov, &got, TRUE);
++        }
++        if (ov.hEvent != NULL) {
++            CloseHandle(ov.hEvent);
++        }
++        const bool on = r && out.op_status == 0;
++        std::string why;
++        for (uint16_t k = 0; !on && k < std::min<uint16_t>(out.why_len, 128); ++k) {
++            why += (char) (out.why[k] < 128 ? out.why[k] : '?');
++        }
++        LLAMA_LOG_INFO("%s: SiegeLadder P8d: %s - BypassIO %s%s%s\n", __func__, path.c_str(), on ? "on" : "off",
++                on ? "" : ": ", on ? "" : (why.empty() ? llama_format_win_err(r ? (DWORD) out.op_status : GetLastError()).c_str() : why.c_str()));
++    }
++    handles.emplace(path, h);
++    return h;
++}
++#endif
++
+ bool llama_read_scattered(const std::string (&paths)[2], std::vector<llama_scatter_piece> & pieces, int n_thr, int qd) {
+ #ifdef _WIN32
+     constexpr uint64_t SEC = 4096;
+@@ -1285,17 +1334,19 @@ bool llama_read_scattered(const std::string (&paths)[2], std::vector<llama_scatt
+     const size_t n_sec = sec0.size() - 1;
+ 
+     std::atomic<bool> ok { true };
+-    std::vector<std::thread> ths;
+-    ths.reserve(n_thr);
+-    for (int t = 0; t < n_thr; ++t) {
+-        ths.emplace_back([&, t] {
+-            HANDLE h[2] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
+-            for (int f = 0; f < 2; ++f) {
+-                if (!paths[f].empty()) {
+-                    h[f] = CreateFileA(paths[f].c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+-                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, NULL);
+-                }
+-            }
++    // P8d: the handles once per file for the process (llama_scatter_handle), not per thread and call
++    HANDLE hs[2] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
++    for (int f = 0; f < 2; ++f) {
++        if (!paths[f].empty()) {
++            hs[f] = llama_scatter_handle(paths[f]);
++        }
++    }
++    // no more slots than sectors (a decode layer's ~50)
++    qd = (int) std::min<size_t>((size_t) qd, (n_sec + (size_t) n_thr - 1)/(size_t) n_thr);
++    qd = std::max(1, qd);
++    auto worker = [&](int t) {
++        {
++            HANDLE h[2] = { hs[0], hs[1] };
+             uint8_t * buf = (uint8_t *) _aligned_malloc((size_t) SEC*qd, (size_t) SEC);
+             std::vector<OVERLAPPED> ov(qd);
+             std::vector<HANDLE>     ev(qd, NULL);
+@@ -1383,18 +1434,22 @@ bool llama_read_scattered(const std::string (&paths)[2], std::vector<llama_scatt
+                     CloseHandle(e);
+                 }
+             }
+-            for (HANDLE x : h) {
+-                if (x != INVALID_HANDLE_VALUE) {
+-                    CloseHandle(x);
+-                }
+-            }
+             if (buf != nullptr) {
+                 _aligned_free(buf);
+             }
+-        });
+-    }
+-    for (auto & th : ths) {
+-        th.join();
++        }
++    };
++    if (n_thr == 1) {
++        worker(0); // P8d at decode: on the caller's (helper) thread, no thread of its own
++    } else {
++        std::vector<std::thread> ths;
++        ths.reserve(n_thr);
++        for (int t = 0; t < n_thr; ++t) {
++            ths.emplace_back(worker, t);
++        }
++        for (auto & th : ths) {
++            th.join();
++        }
+     }
+     return ok;
+ #else
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0cc7afa..f00ff20 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1982,6 +1982,61 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // SiegeLadder P8d (on by default, LLAMA_ENGRAM_UNMAPPED=0 - off): the engram tables leave the mapping - the files
++    // that hold nothing host-resident but engram tables (on 1017: the two 98 GB FP8 tables and layer 1's 3 GB scale
++    // table) are released here, as the loader releases the expert files, and their rows are read with unbuffered
++    // overlapped I/O (llama_read_scattered). While a file is mapped, Windows checks every unbuffered read of it for cache
++    // coherency: 13K reads a second on a mapped engram file against 0.7-1.1M unmapped (SiegeLadder runs.md 4.238, 4.240),
++    // so the direct reads of P8c pay only here. A table that is a copied host tensor (copy_host_from) stays in RAM.
++    // Bitwise the same logits; agent turns 2-8 read 5% faster (turn 7.5K +10%), cold 2.2K / 8.9K +2% / +6%, answers +3%,
++    // and the turns' paging is gone (350-860 MB a turn -> 9-120 MB; runs.md 4.240)
++    engram_unmapped = false;
++    engram_w_disk.clear();
++    engram_s_disk.clear();
++    const char * um = std::getenv("LLAMA_ENGRAM_UNMAPPED");
++    if ((um == nullptr || atoi(um) != 0) && use_mmap_buffer &&
++            !engram_src.empty() && engram_src.size() == hparams.engram_n_layer) {
++        // per file: bit 1 - it holds an engram table, bit 2 - another host-resident tensor (that one keeps it mapped)
++        std::vector<uint8_t> holds(ml.mappings.size(), 0);
++        auto is_table = [](const std::string & n) {
++            auto ends = [&](const char * s) { const size_t k = strlen(s); return n.size() >= k && n.compare(n.size() - k, k, s) == 0; };
++            return ends(".engram_embd.weight") || ends(".engram_embd_scale.weight");
++        };
++        for (const auto & [name, t] : tensors_by_name) {
++            const auto * w = ml.get_weight(name.c_str());
++            if (w == nullptr || w->idx >= holds.size() || copy_host_from[w->idx] ||
++                    t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
++                continue; // a copied host tensor (in RAM), a device tensor or a streamed expert
++            }
++            holds[w->idx] |= is_table(name) ? 1 : 2;
++        }
++        auto on_disk = [&](const ggml_tensor * t) -> uint8_t {
++            const auto * w = t != nullptr ? ml.get_weight(ggml_get_name(t)) : nullptr;
++            return w != nullptr && w->idx < holds.size() && holds[w->idx] == 1 && ml.mappings[w->idx] != nullptr;
++        };
++        engram_w_disk.assign(hparams.engram_n_layer, 0);
++        engram_s_disk.assign(hparams.engram_n_layer, 0);
++        for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++            const auto & L = layers[hparams.engram_layer_ids[e]];
++            engram_w_disk[e] = on_disk(L.engram_embd);
++            engram_s_disk[e] = on_disk(L.engram_embd_scale);
++            engram_unmapped  = engram_unmapped || engram_w_disk[e] || engram_s_disk[e];
++        }
++        uint32_t n_files = 0;
++        double   gib     = 0.0;
++        for (uint32_t idx = 0; idx < holds.size(); ++idx) {
++            if (holds[idx] == 1 && ml.mappings[idx] != nullptr && ml.mappings[idx]->addr() != nullptr) {
++                gib += ml.mappings[idx]->size() / 1024.0 / 1024.0 / 1024.0;
++                ml.mappings[idx]->unmap_fragment(0, ml.mappings[idx]->size());
++                n_files++;
++            }
++        }
++        LLAMA_LOG_WARN("%s: SiegeLadder P8d: engram tables read from their files (%u files unmapped, %.1f GiB; rows of "
++                "%u layers, scales of %u from the files, the rest in RAM)\n", __func__, n_files, gib,
++                (unsigned) std::count(engram_w_disk.begin(), engram_w_disk.end(), 1),
++                (unsigned) std::count(engram_s_disk.begin(), engram_s_disk.end(), 1));
++    }
++
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+             pimpl->mappings.emplace_back(std::move(mapping));
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 56f8b9d..819a851 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -595,6 +595,11 @@ struct llama_model {
+         size_t      offs_w = 0, offs_s = 0;
+     };
+     std::vector<engram_file_src> engram_src; // [engram_n_layer]
++    // SiegeLadder P8d (on by default, LLAMA_ENGRAM_UNMAPPED=0 - off): the files that hold only engram tables are not kept mapped - their
++    // mappings are released at load and those tables' rows are read straight from the files (llm_graph_input_engram);
++    // a table that is a copied host tensor (a scale table in a streamed expert file) stays in RAM and is read from there
++    bool                 engram_unmapped = false;
++    std::vector<uint8_t> engram_w_disk, engram_s_disk; // [engram_n_layer]: 1 - its rows are read from the file
+ 
+     // NVFP4 per-tensor scale2, input_scale for LM head
+     struct ggml_tensor * output_s    = nullptr;

@@ -1,0 +1,137 @@
+From bf840f21d05f9511236aaddc21ab9e8adabf1724 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 03 Nov 2026 17:33:40 +0000
+Subject: [PATCH 103/112] moe-stream + model : SiegeLadder G44 on by default
+ (the user's decision R16 of 04.11). With LLAMA_MOE_STREAM_G44 unset or "auto"
+ load_g44 looks for the lens next to the model's folder - <the model's
+ folder>/../g44/*-lens-d<G35's depth>.gguf - and takes it when exactly one
+ file matches (<models>/g44/1017-lens-d2.gguf for og and qd: one set of
+ routers); "0" turns G44 off, a path names the file as before. The exact
+ preset (runahead, G35 gives way) leaves the default lens off without a word;
+ an explicit file there still warns. load_g44 takes the model's first part
+ (ml.file_paths[0]). Measured before the switch: default +2.3%, fast +4.5%
+ with the GPU scheduler (SiegeLadder runs.md 4.272); general-100 dNLL -0.0004
+ [-0.0091, +0.0095] against a fresh base, router-112 -0.0009 (4.273 / 4.270);
+ the math is untouched - with the drop rule off the logits match (4.270);
+ agent turns at 32K / 128K read as fast as without it, VRAM +144 MiB
+ (queue94). Not yet checked with G44 on: the 1M document (12 slots, the
+ tightest VRAM)
+
+---
+ src/llama-model.cpp      |  3 ++-
+ src/llama-moe-stream.cpp | 40 +++++++++++++++++++++++++++++++++++-----
+ src/llama-moe-stream.h   | 11 +++++++----
+ 3 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 368e53f..e2d138c 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1943,7 +1943,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             pimpl->moe_stream->alloc_bufs(ml.no_alloc);
+             if (!ml.no_alloc) {
+                 pimpl->moe_stream->open_files(ml.file_paths);
+-                pimpl->moe_stream->load_g44(hparams.n_embd, hparams.n_expert); // SiegeLadder G44, when asked for
++                pimpl->moe_stream->load_g44(hparams.n_embd, hparams.n_expert,
++                        ml.file_paths.empty() ? std::string() : ml.file_paths[0]); // SiegeLadder G44 (on by default)
+             }
+         }
+     }
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 481e0ea..12fb0ac 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -14,6 +14,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
++#include <filesystem>
+ #include <fstream>
+ #include <sstream>
+ #include <string>
+@@ -753,7 +754,8 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
+ // A preset only fills keys that are not set, so an explicit key still wins. exact - no drops (runahead K = 6 then takes
+ // over by itself, lossless; G35 gives way to it) and no C7 (LLAMA_DSV4_YOCO=0: the prefill truncation, on by default
+ // since 25.10, is lossy - exact stays the full model's math); default - the fork's own defaults (drop 0.14 with DROP_ALL,
+-// G31, G35 v2, C7 K 140 since 25.10); fast - the default plus C14 0.2 (late, N 1: +4.8...+5.2% over the default,
++// G31, G35 v2, C7 K 140 since 25.10, G44 since 04.11 - when its file is found next to the model, see load_g44);
++// fast - the default plus C14 0.2 (late, N 1: +4.8...+5.2% over the default,
+ // general-100 dNLL about +0.005 more, 4.152 / 4.157) and G40 k 1 (G35's lens staged into VRAM: +3% on qd fast, k 2 the
+ // same within the spread with 14% more stagings - runs.md 4.224 / 4.229; the user's decision of 25.10: the fast preset
+ // only). Runs before any key is read, at the start of the ctor - while the model loads, before a context reads
+@@ -1896,15 +1898,43 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+     }
+ }
+ 
+-void llama_moe_stream::load_g44(int64_t n_embd, int64_t n_expert) {
+-    const char * path = std::getenv("LLAMA_MOE_STREAM_G44");
+-    if (path == nullptr || path[0] == '\0' || std::strcmp(path, "0") == 0) {
++void llama_moe_stream::load_g44(int64_t n_embd, int64_t n_expert, const std::string & model_path) {
++    const char * env = std::getenv("LLAMA_MOE_STREAM_G44");
++    if (env != nullptr && std::strcmp(env, "0") == 0) {
+         return;
+     }
++    // on by default since 04.11 (R16): unset or "auto" - the lens found next to the model's folder
++    const bool by_default = env == nullptr || env[0] == '\0' || std::strcmp(env, "auto") == 0;
+     if (g35_depth <= 0 || runahead_k > 0) {
+-        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G44 needs G35's lens (G35 on, no runahead); ignored\n", __func__);
++        if (!by_default) { // the exact preset (runahead, G35 gives way) leaves the default one off without a word
++            LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G44 needs G35's lens (G35 on, no runahead); ignored\n", __func__);
++        }
+         return;
+     }
++    std::string path_s = by_default ? std::string() : std::string(env);
++    if (by_default) {
++        namespace fs = std::filesystem;
++        std::error_code ec;
++        const fs::path    dir    = fs::path(model_path).parent_path().parent_path() / "g44";
++        const std::string suffix = format("-lens-d%d.gguf", g35_depth);
++        std::vector<fs::path> found;
++        if (!model_path.empty() && fs::is_directory(dir, ec)) {
++            for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
++                const std::string n = it->path().filename().string();
++                if (it->is_regular_file(ec) && n.size() > suffix.size() &&
++                        n.compare(n.size() - suffix.size(), suffix.size(), suffix) == 0) {
++                    found.push_back(it->path());
++                }
++            }
++        }
++        if (found.size() != 1) {
++            LLAMA_LOG_WARN("%s: moe stream: G44: %s *%s in %s - G44 off (LLAMA_MOE_STREAM_G44=<file> names one)\n",
++                    __func__, found.empty() ? "no" : "more than one", suffix.c_str(), dir.string().c_str());
++            return;
++        }
++        path_s = found[0].string();
++    }
++    const char * path = path_s.c_str();
+     // next to the expert caches: the first device (non-host) buffer type they live in
+     ggml_backend_buffer_type_t buft = nullptr;
+     for (auto & [b, c] : ctxs) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 5aac329..ce42574 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -883,16 +883,19 @@ struct llama_moe_stream {
+     // V4.1, on the expert caches' device). G35's read-ahead and G40's staging both take it; offline (the tier model)
+     // -12% calls waiting for the drive, -31% drive reads, G40's precision 0.81 -> 0.93 at the same recall. The file
+     // holds g44.lens.S and the depth it was fit for (g44.depth): another G35 depth, no G35 or runahead leave it off.
+-    // Off by default until measured
++    // On by default since 04.11 (the user's decision R16; runs.md 4.272 / 4.273): with LLAMA_MOE_STREAM_G44 unset or
++    // "auto" the lens is looked for next to the model's folder - <the model's folder>/../g44/*-lens-d<G35's depth>.gguf,
++    // taken when exactly one file matches; "0" turns it off, a path names the file
+     std::vector<ggml_tensor *> g44_lens; // [n_layer]: source layer S's corrected lens matrix, or null
+     ggml_context_ptr           g44_ctx;
+     ggml_backend_buffer_ptr    g44_buf;
+     ggml_tensor * g44_lens_of(int32_t il) const {
+         return il >= 0 && (size_t) il < g44_lens.size() ? g44_lens[il] : nullptr;
+     }
+-    // reads LLAMA_MOE_STREAM_G44's file into a buffer of the expert caches' device (after alloc_bufs); a file that
+-    // does not fit the lens, or a buffer that cannot be had, leaves G44 off with a warning
+-    void load_g44(int64_t n_embd, int64_t n_expert);
++    // reads the G44 file (LLAMA_MOE_STREAM_G44's, or the one found next to model_path - the model's first part) into a
++    // buffer of the expert caches' device (after alloc_bufs); a file that does not fit the lens, or a buffer that
++    // cannot be had, leaves G44 off with a warning
++    void load_g44(int64_t n_embd, int64_t n_expert, const std::string & model_path);
+     // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer
+     // before, it never makes the host wait (a lens exists only for L + d < the last layer + 1, so L + 1 always exists);
+     // the read-ahead starts a layer later, so G35=3 with it leads as G35=2 without it. =2 (v4): layer L's own first half

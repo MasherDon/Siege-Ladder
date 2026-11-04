@@ -1,13 +1,13 @@
 From 9104370e1e80b09ef3549f2d7db51d9ead441a2d Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 09:31:46 +0000
-Subject: [PATCH 47/92] moe-stream : the L2 tier cut to the WDDM shared budget
- minus a margin before it is laid out (SiegeLadder M9) - pinned memory counts
- against that budget, and the context pins more after the tier (the CUDA_Host
- compute buffers of P1's start-up probe: 476-542 MiB at 64K / 128K; the output
- buffer; the mailbox records); a 46 GiB tier left too little in the daytime
- and the output head could not come back at load (SiegeLadder runs.md 4.72).
- Default margin 640 MiB (46 GiB -> 45.67 on this box),
+Subject: [PATCH 047/112] moe-stream : the L2 tier cut to the WDDM shared
+ budget minus a margin before it is laid out (SiegeLadder M9) - pinned memory
+ counts against that budget, and the context pins more after the tier (the
+ CUDA_Host compute buffers of P1's start-up probe: 476-542 MiB at 64K / 128K;
+ the output buffer; the mailbox records); a 46 GiB tier left too little in the
+ daytime and the output head could not come back at load (SiegeLadder runs.md
+ 4.72). Default margin 640 MiB (46 GiB -> 45.67 on this box),
  LLAMA_MOE_STREAM_L2_MARGIN=MiB, 0 - no cut. 64K at 46 GiB loads again
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

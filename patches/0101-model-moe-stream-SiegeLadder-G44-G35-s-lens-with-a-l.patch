@@ -1,0 +1,198 @@
+From b524d43eab12fb57ea3192acfad644f7901358df Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 20:34:36 +0000
+Subject: [PATCH 101/112] model + moe-stream : SiegeLadder G44 - G35's lens
+ with a learned correction (LLAMA_MOE_STREAM_G44=<gguf file>, off by default).
+ For each pair S -> S + 2 a ridge regression (strength 0.1 x the mean of the
+ Gram matrix's diagonal; C17's dumps, 98 sequences, 199K tokens of router
+ inputs) of the target router's logits z_T(x_T) - z_T(x_S) over S's router
+ input x_S, folded into the target's router: the lens multiplies x_S by W'_S =
+ G_{S+2} + B_S^T (f16 [5120, 384]) instead of G_{S+2} - the same GEMV with
+ another matrix, nothing more computed. 38 matrices (1017 has no hash layers),
+ 142.5 MiB in a buffer of the expert caches' device
+ (llama_moe_stream::load_g44 after alloc_bufs; the file's g44.depth must match
+ G35's depth, and without G35 or next to runahead it stays unloaded). G35's
+ read-ahead and G40's staging both take it. Offline on held-out sequences:
+ top-6 agreement at d = 2 0.617 -> 0.713, better on every one of the 38 pairs;
+ in the tier model 12% fewer calls waiting on the drive and 31% fewer drive
+ reads. In the fork (og default, teacher forcing without C7, GPU scheduling
+ off, A B B A): -1.12 ms a token (+2.0%; +2.3% at zero drive stalls), drive
+ wait 8.63 -> 7.71 ms, drive reads 95 -> 73 slabs a token, drops -0.9%; G40 k
+ 1 stages with precision 0.90 against 0.77 (a third of the wrong stagings),
+ G40 k 1 + G44 +8.6% over the default against +5.4% for G40 alone. The math is
+ untouched - only when experts are read: with the drop rule off the logits
+ match the arm without it to the rounding of the stored base (mean KLD 0 +-
+ 1e-6, top-1 100%, PPL per chunk equal) (SiegeLadder runs.md 4.266 / 4.270;
+ the file: bench/g44_fit2.py export)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-model.cpp      |  1 +
+ src/llama-moe-stream.cpp | 90 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-stream.h   | 17 ++++++++
+ src/models/deepseek4.cpp |  4 +-
+ 4 files changed, 111 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index f00ff20..368e53f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1943,6 +1943,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             pimpl->moe_stream->alloc_bufs(ml.no_alloc);
+             if (!ml.no_alloc) {
+                 pimpl->moe_stream->open_files(ml.file_paths);
++                pimpl->moe_stream->load_g44(hparams.n_embd, hparams.n_expert); // SiegeLadder G44, when asked for
+             }
+         }
+     }
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 788931f..481e0ea 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-impl.h"
+ 
+ #include "ggml-backend.h"
++#include "gguf.h"
+ 
+ #include <algorithm>
+ #include <chrono>
+@@ -1895,6 +1896,95 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+     }
+ }
+ 
++void llama_moe_stream::load_g44(int64_t n_embd, int64_t n_expert) {
++    const char * path = std::getenv("LLAMA_MOE_STREAM_G44");
++    if (path == nullptr || path[0] == '\0' || std::strcmp(path, "0") == 0) {
++        return;
++    }
++    if (g35_depth <= 0 || runahead_k > 0) {
++        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_G44 needs G35's lens (G35 on, no runahead); ignored\n", __func__);
++        return;
++    }
++    // next to the expert caches: the first device (non-host) buffer type they live in
++    ggml_backend_buffer_type_t buft = nullptr;
++    for (auto & [b, c] : ctxs) {
++        if (!ggml_backend_buft_is_host(b)) {
++            buft = b;
++            break;
++        }
++    }
++    if (buft == nullptr) {
++        LLAMA_LOG_WARN("%s: moe stream: G44: no expert cache on a device to put the lens next to; ignored\n", __func__);
++        return;
++    }
++    ggml_context * meta = nullptr;
++    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
++    gguf_context_ptr gg { gguf_init_from_file(path, gp) };
++    if (!gg) {
++        LLAMA_LOG_WARN("%s: moe stream: G44: cannot read %s; ignored\n", __func__, path);
++        return;
++    }
++    ggml_context_ptr meta_ptr { meta };
++    const int64_t kd    = gguf_find_key(gg.get(), "g44.depth");
++    const int32_t depth = kd >= 0 ? (int32_t) gguf_get_val_u32(gg.get(), kd) : -1;
++    if (depth != g35_depth) {
++        LLAMA_LOG_WARN("%s: moe stream: G44: %s was fit for a lens %d calls ahead, G35 looks %d ahead; ignored\n",
++                __func__, path, depth, g35_depth);
++        return;
++    }
++    const size_t n_layer = layers.size();
++    ggml_init_params ip = {
++        /*.mem_size   =*/ ggml_tensor_overhead()*(n_layer + 1),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx { ggml_init(ip) };
++    std::vector<ggml_tensor *> lens(n_layer, nullptr);
++    std::vector<std::pair<ggml_tensor *, size_t>> todo; // the device tensor, its data's offset in the file
++    for (size_t il = 0; il < n_layer; ++il) {
++        const std::string name = format("g44.lens.%zu", il);
++        const ggml_tensor * src = ggml_get_tensor(meta, name.c_str());
++        if (src == nullptr) {
++            continue;
++        }
++        if (src->ne[0] != n_embd || src->ne[1] != n_expert || src->ne[2] != 1 || src->ne[3] != 1) {
++            LLAMA_LOG_WARN("%s: moe stream: G44: %s is %" PRId64 " x %" PRId64 ", the lens needs %" PRId64 " x %" PRId64
++                    "; ignored\n", __func__, name.c_str(), src->ne[0], src->ne[1], n_embd, n_expert);
++            return;
++        }
++        ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), src->type, n_embd, n_expert);
++        ggml_set_name(t, name.c_str());
++        lens[il] = t;
++        const int64_t ti = gguf_find_tensor(gg.get(), name.c_str());
++        todo.emplace_back(t, gguf_get_data_offset(gg.get()) + gguf_get_tensor_offset(gg.get(), ti));
++    }
++    if (todo.empty()) {
++        LLAMA_LOG_WARN("%s: moe stream: G44: no g44.lens.* tensors in %s; ignored\n", __func__, path);
++        return;
++    }
++    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
++    if (!buf) {
++        LLAMA_LOG_WARN("%s: moe stream: G44: cannot allocate the lens buffer in %s; ignored\n", __func__,
++                ggml_backend_buft_name(buft));
++        return;
++    }
++    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    llama_file f(path, "rb");
++    std::vector<uint8_t> data;
++    for (auto & [t, offs] : todo) {
++        data.resize(ggml_nbytes(t));
++        f.seek(offs, SEEK_SET);
++        f.read_raw(data.data(), data.size());
++        ggml_backend_tensor_set(t, data.data(), 0, data.size());
++    }
++    g44_lens = std::move(lens);
++    g44_ctx  = std::move(ctx);
++    g44_buf  = std::move(buf);
++    LLAMA_LOG_WARN("%s: moe stream: G44: the lens %d calls ahead corrected for %zu source layers from %s (%s, %s %.1f MiB)\n",
++            __func__, g35_depth, todo.size(), path, ggml_type_name(todo[0].first->type),
++            ggml_backend_buffer_name(g44_buf.get()), ggml_backend_buffer_get_size(g44_buf.get()) / 1024.0 / 1024.0);
++}
++
+ void llama_moe_stream::open_files(const std::vector<std::string> & paths) {
+     for (const auto & path : paths) {
+         if (path.empty()) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index f103ed8..5aac329 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -876,6 +876,23 @@ struct llama_moe_stream {
+     // reads fill the tier and compete with G35's reads ahead (runs.md 4.226: the extra drops of G40 are not its victims)
+     bool     g40_src_tier    = false;
+     std::vector<int32_t> g40_pick; // scratch of g35_speculate, under mtx
++    // SiegeLadder G44 (LLAMA_MOE_STREAM_G44=<gguf file>; theories G44, runs.md 4.266 / 4.270): G35's lens with a learned
++    // correction. For each pair S -> S + d a ridge fit (C17's dumps, 199K tokens) of the target router's logits over
++    // S's router input, folded into the target's router: the lens multiplies S's router input by W'_S = G_{S+d} +
++    // B_S^T instead of G_{S+d} - the same GEMV with another matrix (f16 [n_embd, n_expert] each, 149 MiB for d = 2 on
++    // V4.1, on the expert caches' device). G35's read-ahead and G40's staging both take it; offline (the tier model)
++    // -12% calls waiting for the drive, -31% drive reads, G40's precision 0.81 -> 0.93 at the same recall. The file
++    // holds g44.lens.S and the depth it was fit for (g44.depth): another G35 depth, no G35 or runahead leave it off.
++    // Off by default until measured
++    std::vector<ggml_tensor *> g44_lens; // [n_layer]: source layer S's corrected lens matrix, or null
++    ggml_context_ptr           g44_ctx;
++    ggml_backend_buffer_ptr    g44_buf;
++    ggml_tensor * g44_lens_of(int32_t il) const {
++        return il >= 0 && (size_t) il < g44_lens.size() ? g44_lens[il] : nullptr;
++    }
++    // reads LLAMA_MOE_STREAM_G44's file into a buffer of the expert caches' device (after alloc_bufs); a file that
++    // does not fit the lens, or a buffer that cannot be had, leaves G44 off with a warning
++    void load_g44(int64_t n_embd, int64_t n_expert);
+     // LLAMA_MOE_STREAM_G35_LAZY=1 (v3): layer L's lens is read by layer L + 1's first half, not by its own - posted a layer
+     // before, it never makes the host wait (a lens exists only for L + d < the last layer + 1, so L + 1 always exists);
+     // the read-ahead starts a layer later, so G35=3 with it leads as G35=2 without it. =2 (v4): layer L's own first half
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 4082fbf..1dd4faf 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2742,7 +2742,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+                 (uint32_t) (il + mstream->g35_depth) >= hparams.dsv4_hash_layer_count) {
+             const int    ilt = il + mstream->g35_depth;
+             const auto & lt  = model.layers[ilt];
+-            ggml_tensor * lg = ggml_mul_mat(ctx0, lt.ffn_gate_inp, cur);
++            // SiegeLadder G44: the target's router with the learned correction folded in, when loaded (g44_lens_of)
++            ggml_tensor * gw = mstream->g44_lens_of(il);
++            ggml_tensor * lg = ggml_mul_mat(ctx0, gw != nullptr ? gw : lt.ffn_gate_inp, cur);
+             ggml_mul_mat_set_prec(lg, GGML_PREC_F32);
+             ggml_tensor * sc  = ggml_sqrt(ctx0, ggml_softplus(ctx0, lg));                              // [n_expert, 1]
+             ggml_tensor * sb  = lt.ffn_exp_probs_b ? ggml_add(ctx0, sc, lt.ffn_exp_probs_b) : sc;     // the selection's

@@ -1,0 +1,29 @@
+From 2a7e6b67c9eca8ccf299ee802c3bdc0a51500711 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 00:26:38 +0000
+Subject: [PATCH 105/112] server : Ctrl+Break shuts down cleanly too
+ (SiegeLadder): bench stop() sends CTRL_BREAK_EVENT to the server's process
+ group and the default handler killed it before any destructor ran, so
+ LLAMA_MOE_STREAM_TRACE was never written from a server; now it is handled
+ like Ctrl+C (a second one still exits at once)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/server/server.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index aafb1f3..ac3524d 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -478,7 +478,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
+         sigaction(SIGTERM, &sigint_action, NULL);
+ #elif defined (_WIN32)
+         auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+-            return (ctrl_type == CTRL_C_EVENT) ? (signal_handler(SIGINT), true) : false;
++            // SiegeLadder: Ctrl+Break too (bench stop() sends it to the server's process group) - a clean exit runs the
++            // destructors, so LLAMA_MOE_STREAM_TRACE gets written (killed by the default handler, it never was)
++            return (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT) ? (signal_handler(SIGINT), true) : false;
+         };
+         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+ #endif

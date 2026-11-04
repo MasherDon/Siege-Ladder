@@ -1,0 +1,357 @@
+From 36d1ac8c486c0b5177ddfd1719a5b3d756a3d397 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 04:27:04 +0000
+Subject: [PATCH 099/112] batch + context : SiegeLadder D15 - two widths of
+ ubatch at long context (automatic by default: only when the whole model's
+ prompt graph does not fit at -ub; LLAMA_DSV4_UB_FULL=N - a fixed N, =0 -
+ off). Under P4 + C7 the whole model is needed only by a long prompt's last
+ ubatches (from C7's bound, the call's last 140 positions on): every ubatch
+ before them runs P4's encoder-only graph, which has no use for the decoder's
+ sparse plan - yet the compute buffers were reserved for the whole model at
+ -ub, 15 172 MiB at 1M and -ub 2048, so 1M ran at -ub 512 only. Now a call's
+ leading tokens that P4 runs encoder-only (no output, every sequence's
+ position below its p4_dec_start; a last wide ubatch shorter than p4_min goes
+ narrow) go in ubatches of -ub and the rest in ubatches of at most N
+ (llama_batch_allocr::set_widths / split_width;
+ llama_kv_cache_dsv4::init_batch takes its widths there, per-sequence streams
+ only narrow), and sched_reserve reserves the whole model at N and P4's
+ encoder-only graph at -ub, each with its non-sparse (D10) variant and D12's
+ cap - the buffers the largest of all; the log gives what each graph asks on
+ its own. Automatic: when the whole model's graph does not fit at -ub, its
+ width halves down to 256; where it fits no width plan is set and nothing
+ changes. At 1M: encoder only at 2048 6 964 MiB, the whole model at 512 5 828
+ (the automatic mode picks 512 itself). Logits byte for byte when the two
+ layouts coincide (prompt 2048 k + 140: the bound on a ubatch border),
+ otherwise closer to -ub 2048 than -ub 512 is (mean |d log p| 0.0045 against
+ 0.0077, no argmax change). The 1M document (945 619 tokens) at -ub 2048:
+ 470.7 tok/s against 194.8 at 512 (x2.42, 33.5 min against 81), 21.9 TB from
+ the drives against 65.7; agent turns on it read x1.66 (201 tok/s against
+ 121), answers the same (SiegeLadder runs.md 4.250)
+
+---
+ src/llama-batch.cpp         |  20 ++++++
+ src/llama-batch.h           |  11 +++
+ src/llama-context.cpp       | 137 ++++++++++++++++++++++++++++++++----
+ src/llama-context.h         |   8 +++
+ src/llama-kv-cache-dsv4.cpp |   8 ++-
+ 5 files changed, 169 insertions(+), 15 deletions(-)
+
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a55..e3daea8 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -473,6 +473,22 @@ void llama_batch_allocr::split_reset() {
+     used.resize(get_n_tokens(), false);
+ }
+ 
++void llama_batch_allocr::set_widths(uint32_t n_wide, uint32_t n_ub_wide, uint32_t n_ub_narrow) {
++    d15_n_wide    = n_wide;
++    d15_ub_wide   = n_ub_wide;
++    d15_ub_narrow = n_ub_narrow;
++}
++
++uint32_t llama_batch_allocr::split_width(uint32_t n_ubatch, bool in_order) const {
++    if (d15_ub_narrow == 0) {
++        return n_ubatch;
++    }
++    if (in_order && n_used < d15_n_wide) {
++        return std::min(d15_ub_wide, d15_n_wide - n_used);
++    }
++    return std::min(n_ubatch, d15_ub_narrow);
++}
++
+ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
+     // find the first unused token
+     uint32_t cur_idx = 0;
+@@ -744,6 +760,10 @@ void llama_batch_allocr::clear() {
+     seq_set_map.clear();
+ 
+     std::fill(seq_idx.begin(), seq_idx.end(), -1);
++
++    d15_n_wide    = 0;
++    d15_ub_wide   = 0;
++    d15_ub_narrow = 0;
+ }
+ 
+ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index a3d1889..03ed17e 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -110,6 +110,12 @@ public:
+     // sequence-set-wise split - each ubatch contains a single sequence-set
+     llama_ubatch split_seq(uint32_t n_ubatch);
+ 
++    // SiegeLadder D15 (llama_context::decode): the batch's first n_wide tokens go in ubatches of up to n_ub_wide, the
++    // rest in ubatches of up to n_ub_narrow - only for splits that take the tokens in order (in_order, split_simple);
++    // any other split takes n_ub_narrow throughout. No plan (the default, and after every init): the caller's width
++    void     set_widths(uint32_t n_wide, uint32_t n_ub_wide, uint32_t n_ub_narrow);
++    uint32_t split_width(uint32_t n_ubatch, bool in_order) const;
++
+     // a helper method for creating a well-defined ubatch of tokens
+     // TODO: support embeddings if needed in the future
+     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
+@@ -167,6 +173,11 @@ private:
+ 
+     uint32_t n_used;
+ 
++    // SiegeLadder D15: this batch's width plan (set_widths); d15_ub_narrow == 0 - none
++    uint32_t d15_n_wide    = 0;
++    uint32_t d15_ub_wide   = 0;
++    uint32_t d15_ub_narrow = 0;
++
+     // used[i] indicates if token i has already been used in a previous ubatch
+     std::vector<bool> used;
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 30b7071..ba0a946 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -635,6 +635,30 @@ llama_context::llama_context(
+             }
+         }
+ 
++        // SiegeLadder D15 (LLAMA_DSV4_UB_FULL=N - a fixed narrow width; unset - automatic, only when the whole model's
++        // prompt graph does not fit at -ub; =0 - off; see d15_ub_full in the header)
++        const char * uf = std::getenv("LLAMA_DSV4_UB_FULL");
++        d15_auto = uf == nullptr && p4_reach > 0;
++        if (uf != nullptr && atoi(uf) > 0) {
++            const uint32_t n   = (uint32_t) atoi(uf);
++            const char *   why = nullptr;
++            if (p4_reach <= 0) {
++                why = "P4 is off, so no ubatch runs the encoder only";
++            } else if (n >= cparams.n_ubatch) {
++                why = "N is not below -ub";
++            } else if (n < p4_min) {
++                why = "N is below LLAMA_DSV4_ENC_ONLY_MIN";
++            }
++            if (why != nullptr) {
++                LLAMA_LOG_WARN("%s: SiegeLadder D15 (LLAMA_DSV4_UB_FULL=%u) is off: %s\n", __func__, n, why);
++            } else {
++                d15_ub_full = n;
++                LLAMA_LOG_WARN("%s: SiegeLadder D15: a call's leading tokens that P4 runs encoder-only go in ubatches of "
++                        "-ub %u, the rest in ubatches of at most %u tokens; the compute buffers hold both graphs\n",
++                        __func__, cparams.n_ubatch, n);
++            }
++        }
++
+         sched_reserve();
+ 
+         // P1: the -ub buffers are reserved only when the first long prompt comes. Probe them now, with the head
+@@ -874,18 +898,34 @@ void llama_context::sched_reserve() {
+     int n_splits_tg = -1;
+     int n_nodes_tg  = -1;
+ 
+-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
++    // SiegeLadder D15: the whole model's pp graph at the narrow width, P4's encoder-only graph at n_tokens (below)
++    bool     d15      = d15_ub_full > 0 && n_tokens > d15_ub_full;
++    uint32_t n_tok_pp = d15 ? d15_ub_full : n_tokens;
++
++    uint32_t n_outputs_pp = std::min(n_tok_pp, cparams.n_outputs_max);
+ 
+     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+     {
+-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
++        auto * gf = graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(),
+                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
++        // SiegeLadder D15, automatic (see d15_auto): the whole model's graph does not fit at this width - its ubatches
++        // narrow by halves, down to 256 tokens, and P4's encoder-only ubatches keep -ub
++        while (!gf && d15_auto && !model.hparams.no_alloc && n_tok_pp/2 >= 256) {
++            d15_ub_full  = n_tok_pp/2;
++            d15          = true;
++            n_tok_pp     = d15_ub_full;
++            n_outputs_pp = std::min(n_tok_pp, cparams.n_outputs_max);
++            LLAMA_LOG_WARN("%s: SiegeLadder D15 (automatic; LLAMA_DSV4_UB_FULL=0 - off): the whole model's pp graph does "
++                    "not fit at %u tokens - its ubatches take at most %u, P4's encoder-only ones %u\n", __func__,
++                    n_tok_pp*2, n_tok_pp, n_tokens);
++            gf = graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get());
++        }
+         if (!gf) {
+             if (cparams.pipeline_parallel) {
+                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                 cparams.pipeline_parallel = false;
+                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
++                gf = graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get());
+             }
+             if (!gf) {
+                 throw std::runtime_error("failed to allocate compute pp buffers");
+@@ -1006,27 +1046,29 @@ void llama_context::sched_reserve() {
+     // sequence (positions below ~1024 on V4.1) cannot attend sparsely and take P13's chunks or the attention of before -
+     // a graph of another shape, larger or smaller depending on -ub and the context. The allocator only ever grows its
+     // buffers, so a reserve of that graph too leaves them at the larger of the two
+-    if ((model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) && llm_graph_dsv4_sparse_prefill()) {
++    const bool dsv4_dense = (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) &&
++            llm_graph_dsv4_sparse_prefill();
++    auto reserve_dense = [&](uint32_t n_tok, uint32_t n_out) {
+         std::vector<size_t> sizes_dense(backend_ptrs.size(), 0);
+ 
+         cparams.dsv4_reserve_dense = true;
+-        cparams.dsv4_dense_cap     = 0;
+-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
++        auto * gf = graph_reserve(n_tok, n_seqs, n_out, mctx.get(),
+                 model.hparams.no_alloc, model.hparams.no_alloc ? sizes_dense.data() : nullptr);
+ 
+         // SiegeLadder D12: at 512K+ that graph at the full compressed widths asks 8-10 GiB (runs.md 4.216), but on one
+         // sequence only its first ubatches - below ~1024 + -ub positions - ever take it: reserve it for them
+         if (!gf && !model.hparams.no_alloc && n_seqs == 1) {
+-            const uint32_t n_pos = llm_graph_dsv4_dense_bound(model.hparams, mctx.get(), n_tokens);
++            const uint32_t n_pos = llm_graph_dsv4_dense_bound(model.hparams, mctx.get(), n_tok);
+             if (n_pos > 0 && n_pos < cparams.n_ctx) {
+                 llm_graph_dsv4_set_dense_cap(mctx.get(), n_pos);
+-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
++                gf = graph_reserve(n_tok, n_seqs, n_out, mctx.get());
+                 llm_graph_dsv4_set_dense_cap(mctx.get(), 0);
+                 if (gf) {
+-                    cparams.dsv4_dense_cap = n_pos;
+-                    LLAMA_LOG_WARN("%s: SiegeLadder D12: the non-sparse pp graph does not fit at the full compressed "
++                    cparams.dsv4_dense_cap = std::max(cparams.dsv4_dense_cap, n_pos);
++                    LLAMA_LOG_WARN("%s: SiegeLadder D12: the non-sparse pp graph%s does not fit at the full compressed "
+                             "widths - reserved for positions below %u, where a sequence's first ubatches take it; a "
+-                            "non-sparse ubatch past them would need more\n", __func__, n_pos);
++                            "non-sparse ubatch past them would need more\n", __func__,
++                            cparams.dsv4_enc_only ? " (encoder only)" : "", n_pos);
+                 }
+             }
+         }
+@@ -1041,6 +1083,51 @@ void llama_context::sched_reserve() {
+                 backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_dense[i]);
+             }
+         }
++    };
++    cparams.dsv4_dense_cap = 0;
++    if (dsv4_dense) {
++        reserve_dense(n_tok_pp, n_outputs_pp);
++    }
++
++    // SiegeLadder D15: P4's encoder-only graph at the full -ub (and its non-sparse plan, as D10 above). The log gives
++    // what each graph asks on its own (a split-only reserve allocates nothing); the buffers are the larger of all
++    if (d15) {
++        const uint32_t n_out_enc = std::min(n_tokens, cparams.n_outputs_max);
++        std::vector<size_t> s_enc(backend_ptrs.size(), 0);
++        std::vector<size_t> s_full(backend_ptrs.size(), 0);
++        cparams.dsv4_enc_only = true;
++        graph_reserve(n_tokens, n_seqs, n_out_enc, mctx.get(), true, s_enc.data());
++        cparams.dsv4_enc_only = false;
++        graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(), true, s_full.data());
++        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++            if (s_enc[i] > 1 || s_full[i] > 1) {
++                LLAMA_LOG_WARN("%s: SiegeLadder D15: %10s pp graph - encoder only at %u tokens %8.1f MiB, the whole model "
++                        "at %u %8.1f MiB (sparse plans)\n", __func__, ggml_backend_buft_name(backend_buft[i]), n_tokens,
++                        s_enc[i]/1048576.0, n_tok_pp, s_full[i]/1048576.0);
++            }
++        }
++
++        std::vector<size_t> sizes_enc(backend_ptrs.size(), 0);
++        cparams.dsv4_enc_only = true;
++        auto * gf = graph_reserve(n_tokens, n_seqs, n_out_enc, mctx.get(),
++                model.hparams.no_alloc, model.hparams.no_alloc ? sizes_enc.data() : nullptr);
++        if (gf && dsv4_dense) {
++            try {
++                reserve_dense(n_tokens, n_out_enc);
++            } catch (...) {
++                cparams.dsv4_enc_only = false;
++                throw;
++            }
++        }
++        cparams.dsv4_enc_only = false;
++        if (!gf) {
++            throw std::runtime_error("failed to allocate compute pp buffers (SiegeLadder D15: the encoder-only graph)");
++        }
++        if (model.hparams.no_alloc) {
++            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_enc[i]);
++            }
++        }
+     }
+ 
+     // reserve with tg (token generation) graph to get the number of splits and nodes
+@@ -1060,7 +1147,7 @@ void llama_context::sched_reserve() {
+         //
+         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
+         //
+-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
++        auto * gf = graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+         if (!gf) {
+             throw std::runtime_error("failed to allocate compute pp buffers");
+         }
+@@ -2452,6 +2539,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         }
+     }
+ 
++    // SiegeLadder D15: the leading tokens of the call that P4 runs encoder-only - no output, every sequence's position below
++    // its p4_dec_start - go in ubatches of -ub, everything from the first other token on in ubatches of d15_ub_full. A last
++    // wide ubatch shorter than p4_min would run the whole model at a width the buffers may not hold: it goes narrow too
++    if (d15_ub_full > 0) {
++        uint32_t n_wide = 0;
++        if (p4_reach > 0) {
++            const llama_batch & b = balloc->get_batch();
++            for (int32_t i = 0; i < b.n_tokens; ++i) {
++                bool below = !b.logits[i];
++                for (int32_t s = 0; s < b.n_seq_id[i] && below; ++s) {
++                    const llama_pos lo = p4_dec_start[b.seq_id[i][s]];
++                    below = lo >= 0 && b.pos[i] < lo;
++                }
++                if (!below) {
++                    break;
++                }
++                n_wide++;
++            }
++            const uint32_t tail = n_wide % cparams.n_ubatch;
++            if (tail > 0 && tail < p4_min) {
++                n_wide -= tail;
++            }
++        }
++        balloc->set_widths(n_wide, cparams.n_ubatch, d15_ub_full);
++    }
++
+     // SiegeLadder P9: the expert stream's host tier holds what a prompt touches while it runs; a long call begins the
+     // holding (anew from position 0), a few short calls in a row end it - llama_moe_stream::batch_begin
+     if (auto * ms = model.moe_stream()) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index d28ca3c..0fbe93c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -380,6 +380,14 @@ private:
+     int64_t  p4_n_tokens = 0;              // ... and their tokens
+     bool p4_enc_only(const llama_ubatch & ubatch) const;
+ 
++    // SiegeLadder D15 (automatic by default; LLAMA_DSV4_UB_FULL=N - a fixed N, =0 - off): two widths of ubatch. At 1M the
++    // whole model's prompt graph at -ub 2048 asks ~15 GB (the sparse plan grows with N x ubatch), but under P4 + C7 it is
++    // needed only by the last ubatches of a long prompt: the leading tokens of a call that P4 would run encoder-only go
++    // in ubatches of -ub, the rest in ubatches of at most N, and the compute buffers are reserved for both graphs
++    // (sched_reserve). Automatic: N is set only when the whole model's graph does not fit at -ub (halving to 256)
++    uint32_t d15_ub_full = 0;              // N; 0 = off
++    bool     d15_auto    = false;          // LLAMA_DSV4_UB_FULL unset and P4 on
++
+     // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, on by default with K = 140 since 25.10, =0 - off, the exact preset sets 0;
+     // docs/v41/c7-design.md; DeepInfer's YoCo prefill truncation):
+     // per decode call and sequence, yoco_lo = min(first output + 1, the call's end) - K. When it lies past the sequence's
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index c604d2b..cbec0f0 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -1415,7 +1415,8 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
+ 
+         std::vector<llama_ubatch> ubatches;
+         while (true) {
+-            auto ubatch = balloc.split_simple(n_ubatch);
++            // SiegeLadder D15: a long prompt's encoder-only ubatches wide, the rest narrow (llama_batch_allocr::set_widths)
++            auto ubatch = balloc.split_simple(balloc.split_width(n_ubatch, true));
+             if (ubatch.n_tokens == 0) {
+                 break;
+             }
+@@ -1440,10 +1441,11 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
+         std::vector<llama_ubatch> ubatches;
+         while (true) {
+             llama_ubatch ubatch;
++            const uint32_t n_ub = balloc.split_width(n_ubatch, false); // D15: never wide here
+             if (has_coupled) {
+-                ubatch = balloc.split_seq(n_ubatch);
++                ubatch = balloc.split_seq(n_ub);
+             } else {
+-                ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, 0);
++                ubatch = balloc.split_equal(n_ub, raw_per_seq || comp_per_seq, 0);
+             }
+ 
+             if (ubatch.n_tokens == 0) {

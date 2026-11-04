@@ -1,7 +1,7 @@
 From 4dfcf40f68e857fffe60143acc734482f63b082e Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 16:07:52 +0000
-Subject: [PATCH 92/92] ggml-cuda + dsv4 : SiegeLadder P20 step 1 and P8 for
+Subject: [PATCH 092/112] ggml-cuda + dsv4 : SiegeLadder P20 step 1 and P8 for
  prompts - the per-turn costs of an agent's prompt (runs.md 4.231-4.232). (1)
  The pinned host blocks of 64 MiB and more are kept for reuse
  (GGML_CUDA_HOST_CACHE=0 - off): the head yield's reserve took the scheduler's

@@ -1,0 +1,457 @@
+From 68bb0df18584070c01fa07d096e4214bc9ecd6bc Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 08:52:00 +0000
+Subject: [PATCH 111/112] llama : SiegeLadder P19 stage B step 2 -
+ LLAMA_DSV4_LAYER_MAJOR_POOL=auto|N grows P11's shared pool to a whole layer
+ for a layer-major call with SEG_SCHED (L030); the wave plan keeps the base 64
+ slots (plan_slots) so the waves and the MMQ split stay as before; at k 1 a
+ layer's P11 table is kept between its ubatches (lead's fix); L031 review
+ fixes: the base pool is restored on an allocation failure, no expansion
+ without P11 or twice in one P11 session, plan_slots kept until p11_leave,
+ auto slot size = sum of the widest weights; off by default; 48K equal byte
+ for byte in exact and default at k 1 and 4, k 1 run hit rate 97.84% against
+ 87.33% without the pool (SiegeLadder runs.md 4.292)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp    |  36 ++++-
+ src/llama-context.h      |   3 +
+ src/llama-graph.cpp      |   5 +-
+ src/llama-moe-stream.cpp | 281 ++++++++++++++++++++++++++++++++++++++-
+ src/llama-moe-stream.h   |  17 +++
+ 5 files changed, 335 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7cf1635..bc9fd4b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -698,6 +698,16 @@ llama_context::llama_context(
+             if (const char * seg = std::getenv("LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED")) {
+                 lm_seg_sched_enable = atoi(seg) != 0;
+             }
++            if (const char * pool = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL")) {
++                if (std::strcmp(pool, "auto") == 0 || std::strcmp(pool, "AUTO") == 0) {
++                    lm_pool_slots = -1;
++                } else {
++                    lm_pool_slots = atoi(pool);
++                }
++            }
++            if (const char * pm = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_MARGIN_MIB")) {
++                lm_pool_margin_mib = (uint32_t) std::max(0, atoi(pm));
++            }
+         }
+ 
+         sched_reserve();
+@@ -3182,15 +3192,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const bool lm_seg_sched = lm_seg_sched_enable;
+             size_t     lm_seg_sched_buf_max = 0;
+             struct lm_seg_sched_restore {
+-                llama_context * self;
+-                bool            on;
+-                explicit lm_seg_sched_restore(llama_context * s, bool o) : self(s), on(o) {}
++                llama_context *  self;
++                bool             on;
++                llama_moe_stream * ms;
++                bool             pool;
++                explicit lm_seg_sched_restore(llama_context * s, bool o, llama_moe_stream * m, bool p)
++                        : self(s), on(o), ms(m), pool(p) {}
+                 ~lm_seg_sched_restore() {
++                    if (pool && ms != nullptr) {
++                        if (self->sched) {
++                            ggml_backend_sched_synchronize(self->sched.get());
++                        }
++                        ms->p19_lm_pool_end();
++                    }
+                     if (on) {
+                         self->sched_need_reserve = true;
+                     }
+                 }
+-            } seg_sched_guard(this, lm_seg_sched);
++            } seg_sched_guard(this, lm_seg_sched, nullptr, false);
+ 
+             if (lm_seg_sched) {
+                 const int64_t t0 = ggml_time_us();
+@@ -3202,6 +3221,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         __func__, buf_before / 1048576.0, buf_after / 1048576.0, (ggml_time_us() - t0) / 1000.0);
+             }
+ 
++            llama_moe_stream * ms_lm = model.moe_stream();
++            if (lm_seg_sched && lm_pool_slots != 0 && ms_lm != nullptr) {
++                const uint32_t target = lm_pool_slots > 0 ? (uint32_t) lm_pool_slots : 0;
++                if (ms_lm->p19_lm_pool_begin(target, 0, lm_pool_margin_mib)) {
++                    seg_sched_guard.ms   = ms_lm;
++                    seg_sched_guard.pool = true;
++                }
++            }
++
+             // one slot per ubatch of a superchunk: in - what the next group's graph reads (host bytes, shape, type; the
+             // graph fills in its input tensors), out - the tensors the group's graph exported. Each item has a pinned
+             // host buffer of its own, which grows as the item does (the candidate verdicts widen with the position)
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 1554e85..0e3ce2e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -445,6 +445,9 @@ private:
+     bool     lm_reserve_enable = false;
+     // P19 stage B: empty scheduler for layer-major call (LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED=1)
+     bool     lm_seg_sched_enable = false;
++    // P19 stage B step 2: expand the MoE pool for a layer-major call (LLAMA_DSV4_LAYER_MAJOR_POOL=N|auto)
++    int32_t  lm_pool_slots       = 0; // 0 = off, -1 = auto
++    uint32_t lm_pool_margin_mib  = 1536;
+ 
+     void lm_reserve_probe_at_load(
+             const llama_memory_context_i * mctx, uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0178f29..93f4583 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3493,8 +3493,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             skip_planned = skip_planned && lora.first->get_weight(down_exps) == nullptr;
+         }
+         // JigSaw: slots pinados nao sao reclamaveis pela vaga - o plano ve so os dinamicos
++        const uint32_t plan_ns = msl->mgr->plan_slots > 0 ? msl->mgr->plan_slots : msl->n_slots;
+         const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
+-                msl->n_slots - msl->mgr->pin_budget, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens,
++                plan_ns - msl->mgr->pin_budget, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens,
+                 skip_planned);
+         n_stream_waves  = wb.n_waves;
+         stream_wave_cap = wb.cap;
+@@ -3503,7 +3504,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         // remap while the card still reads the pool), and its slot table would be stale. A ubatch that fits in one
+         // pass runs as two waves, the second empty
+         if (msl->mgr->p11_active && n_stream_waves < 2) {
+-            const uint32_t n_dyn   = msl->n_slots - msl->mgr->pin_budget;
++            const uint32_t n_dyn   = plan_ns - msl->mgr->pin_budget;
+             const uint64_t n_touch = std::min<uint64_t>((uint64_t) n_expert, (uint64_t) n_tokens*n_expert_used);
+             stream_wave_cap = skip_planned ? n_dyn/2 : (n_dyn - (uint32_t) n_expert_used)/2;
+             n_stream_waves  = (uint32_t) std::max<uint64_t>(2, (n_touch + stream_wave_cap - 1)/stream_wave_cap);
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index a250d69..3f8a042 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -2660,9 +2660,281 @@ void llama_moe_stream::p11_leave() {
+         bufs.emplace_back(buf);
+     }
+     p11_active = false;
++    plan_slots = 0; // the expanded P19 pool is gone with P11
+     p11_t_us += ggml_time_us() - t0;
+ }
+ 
++// grow a layer's slot table to n_new slots; slots [0, n_old) keep their state, new ones are empty
++static void p19_lm_extend_layer_locked(llama_moe_stream_layer & sl, uint32_t n_old, uint32_t n_new) {
++    if (n_new <= n_old) {
++        sl.n_slots = n_new;
++        return;
++    }
++    sl.n_slots = n_new;
++    sl.slot_expert    .resize(n_new, -1);
++    sl.slot_state     .resize(n_new, LLAMA_MOE_STREAM_SLOT_EMPTY);
++    sl.slot_claimed   .resize(n_new, 0);
++    sl.slot_parts_left.resize(n_new, 0);
++    sl.slot_gen       .resize(n_new, 0);
++    sl.slot_last_use  .resize(n_new, 0);
++    sl.keep           .resize(n_new, 0);
++    if (!sl.slot_pinned.empty()) {
++        sl.slot_pinned.resize(n_new, 0);
++    }
++    sl.slot_staged.resize(n_new, 0);
++    sl.slot_src   .resize(n_new, 0);
++    sl.slot_t_res .resize(n_new, 0);
++    sl.slot_t_wait.resize(n_new, 0);
++    sl.slot_wanted.resize(n_new, 0);
++    for (uint32_t s = n_old; s < n_new; s++) {
++        sl.slot_state[s] = LLAMA_MOE_STREAM_SLOT_EMPTY;
++        sl.slot_expert[s] = -1;
++    }
++}
++
++bool llama_moe_stream::p19_lm_pool_begin(uint32_t target_slots, size_t seg_reserve_bytes, size_t margin_mib) {
++    if (p19_lm_pool_active) {
++        return true;
++    }
++    // P11 owns the shared pool and restores the decode cache. A prior output-less
++    // call may leave it expanded until p11_leave; retain its original wave plan.
++    if (!p11_active || plan_slots != 0) {
++        return false;
++    }
++    const llama_moe_stream_layer * ref = nullptr;
++    for (const auto & sl : layers) {
++        if (sl) {
++            ref = sl.get();
++            break;
++        }
++    }
++    if (ref == nullptr) {
++        return false;
++    }
++    p19_lm_base_slots = ref->n_slots;
++
++    std::vector<size_t> widest_bytes(ref->weights.size(), 0);
++    for (const auto & sl : layers) {
++        if (!sl || sl->weights.size() != widest_bytes.size()) {
++            continue;
++        }
++        for (size_t w = 0; w < sl->weights.size(); ++w) {
++            widest_bytes[w] = std::max(widest_bytes[w], (size_t) sl->weights[w].nb_expert);
++        }
++    }
++    size_t slot_bytes = 0;
++    for (size_t n : widest_bytes) {
++        slot_bytes += n;
++    }
++    if (slot_bytes == 0) {
++        return false;
++    }
++
++    uint32_t P = target_slots;
++    if (P == 0) {
++        const llama_wddm_budget wb = llama_wddm_query_budget();
++        if (!wb.ok || wb.local_budget <= wb.local_usage) {
++            return false;
++        }
++        size_t room = (size_t) (wb.local_budget - wb.local_usage);
++        const size_t margin = (margin_mib << 20) + seg_reserve_bytes;
++        if (room <= margin) {
++            return false;
++        }
++        room -= margin;
++        P = (uint32_t) std::min<uint64_t>(ref->n_expert + p19_lm_base_slots, room / slot_bytes);
++    }
++    P = std::max(p19_lm_base_slots, P);
++    P = std::min(ref->n_expert, P);
++    if (P <= p19_lm_base_slots) {
++        return false;
++    }
++
++    const int64_t t0 = ggml_time_us();
++    std::unique_lock<std::mutex> lk(mtx);
++    moe_p11_quiesce_locked(*this, lk);
++
++    const llama_wddm_budget wb0 = llama_wddm_query_budget();
++    const double            dxgi0 =
++            wb0.ok ? (wb0.local_budget - wb0.local_usage) / 1048576.0 : -1.0;
++
++    if (p11_active) {
++        std::vector<const ggml_tensor *> widest;
++        for (const auto & sl : layers) {
++            if (!sl) {
++                continue;
++            }
++            widest.resize(sl->weights.size(), nullptr);
++            for (size_t w = 0; w < sl->weights.size(); w++) {
++                const ggml_tensor * a = sl->weights[w].cache;
++                if (widest[w] == nullptr || a->nb[2] > widest[w]->nb[2]) {
++                    widest[w] = a;
++                }
++            }
++        }
++        for (auto & sl : layers) {
++            if (sl) for (auto & wt : sl->weights) {
++                wt.cache->data = nullptr;
++                wt.cache->buffer = nullptr;
++            }
++        }
++        p11_buf.reset();
++        p11_ctx.reset();
++        ggml_init_params params = {
++            /*.mem_size   =*/ ggml_tensor_overhead()*(widest.size() + 1),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        p11_ctx.reset(ggml_init(params));
++        std::vector<ggml_tensor *> pool;
++        for (const ggml_tensor * c : widest) {
++            ggml_tensor * t = ggml_new_tensor_3d(p11_ctx.get(), c->type, c->ne[0], c->ne[1], P);
++            pool.push_back(t);
++        }
++        ggml_backend_buffer_type_t buft = ctxs[0].first;
++        p11_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(p11_ctx.get(), buft));
++        const bool expanded = p11_buf != nullptr;
++        if (!expanded) {
++            // The old buffer is gone: restore the original pool before returning.
++            for (ggml_tensor * t : pool) {
++                t->ne[2] = p19_lm_base_slots;
++                t->nb[3] = t->nb[2] * p19_lm_base_slots;
++            }
++            p11_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(p11_ctx.get(), buft));
++            if (!p11_buf) {
++                GGML_ABORT("MoE expert streaming: could not restore P11 pool after P19 allocation failure");
++            }
++            P = p19_lm_base_slots;
++            LLAMA_LOG_WARN("%s: P19 LM pool allocation failed; restored empty P11 pool\n", __func__);
++        }
++        ggml_backend_buffer_set_usage(p11_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        ggml_backend_dev_t dev = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
++        for (auto & sl : layers) {
++            if (!sl) {
++                continue;
++            }
++            for (size_t w = 0; w < sl->weights.size(); w++) {
++                ggml_tensor * c = sl->weights[w].cache;
++                c->ne[2]  = P;
++                c->nb[3]  = c->nb[2] * P;
++                c->data   = pool[w]->data;
++                c->buffer = pool[w]->buffer;
++            }
++            p11_reset_layer_locked(*sl, P); // the replacement buffer is empty
++            if (slot_fence && dev != nullptr) {
++                if (sl->slot_up_event.size() < P) {
++                    const size_t n0 = sl->slot_up_event.size();
++                    sl->slot_up_event.resize(P, nullptr);
++                    sl->slot_up_seq.resize(P, 0);
++                    for (size_t s = n0; s < P; s++) {
++                        sl->slot_up_event[s] = ggml_backend_event_new(dev);
++                    }
++                }
++            }
++        }
++        if (!expanded) {
++            return false;
++        }
++    } else {
++        for (auto & [buft, ctx] : ctxs) {
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->ne[2] == (int64_t) p19_lm_base_slots) {
++                    t->ne[2] = P;
++                    t->nb[3]  = t->nb[2] * P;
++                }
++            }
++        }
++        bufs.clear();
++        for (auto & [buft, ctx] : ctxs) {
++            if (ggml_get_first_tensor(ctx.get()) == nullptr) {
++                continue;
++            }
++            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
++            if (buf == nullptr) {
++                LLAMA_LOG_WARN("%s: P19 LM pool: could not re-allocate per-layer cache for %u slots\n", __func__, P);
++                return false;
++            }
++            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++            bufs.emplace_back(buf);
++        }
++        for (auto & sl : layers) {
++            if (sl) {
++                p19_lm_extend_layer_locked(*sl, sl->n_slots, P);
++            }
++        }
++    }
++
++    plan_slots         = p19_lm_base_slots;
++    p19_lm_pool_n      = P;
++    p19_lm_pool_active = true;
++    p19_lm_last_il     = -1; // new memory: the first wave 0 of every layer resets its table
++    p19_lm_keep_tables = 0;
++    p19_lm_hits0       = stats.n_hit;
++    p19_lm_miss0       = stats.n_miss;
++    p19_lm_io_bytes0   = io[0].bytes.load();
++
++    const llama_wddm_budget wb1 = llama_wddm_query_budget();
++    const double            dxgi1 =
++            wb1.ok ? (wb1.local_budget - wb1.local_usage) / 1048576.0 : -1.0;
++    LLAMA_LOG_INFO("%s: P19 LM pool (LLAMA_DSV4_LAYER_MAJOR_POOL): slots %u -> %u (plan %u), slot %.2f MiB, pool %.1f MiB, "
++            "DXGI free %.1f -> %.1f MiB, %.1f ms\n", __func__, p19_lm_base_slots, P, plan_slots,
++            slot_bytes / 1048576.0, (double) (slot_bytes * P) / 1048576.0, dxgi0, dxgi1,
++            (ggml_time_us() - t0) / 1000.0);
++    return true;
++}
++
++void llama_moe_stream::p19_lm_pool_end() {
++    if (!p19_lm_pool_active) {
++        return;
++    }
++    const int64_t hits  = stats.n_hit - p19_lm_hits0;
++    const int64_t miss  = stats.n_miss - p19_lm_miss0;
++    const int64_t bytes = io[0].bytes.load() - p19_lm_io_bytes0;
++    if (p11_active) {
++        // p1_leave -> p11_leave restores p11_saved_slots and the per-layer cache; only clear planning state
++        LLAMA_LOG_INFO("%s: P19 LM pool (call end): slots=%u plan=%u hits=%" PRId64 " miss=%" PRId64 " demand_io_bytes=%" PRId64
++                " kept_tables=%" PRId64 " (delta vs call start; compare POOL off on the same prompt)\n", __func__,
++                p19_lm_pool_n, plan_slots, hits, miss, bytes, p19_lm_keep_tables);
++        // Keep the original plan until p11_leave restores the decode cache.
++        p19_lm_pool_active = false;
++        p19_lm_pool_n      = 0;
++        p19_lm_last_il     = -1;
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    std::unique_lock<std::mutex> lk(mtx);
++    moe_p11_quiesce_locked(*this, lk);
++    const uint32_t n = p19_lm_base_slots;
++    for (auto & [buft, ctx] : ctxs) {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++            if ((uint32_t) t->ne[2] == p19_lm_pool_n) {
++                t->ne[2] = n;
++                t->nb[3]  = t->nb[2] * n;
++            }
++        }
++    }
++    bufs.clear();
++    for (auto & [buft, ctx] : ctxs) {
++        if (ggml_get_first_tensor(ctx.get()) == nullptr) {
++            continue;
++        }
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
++        GGML_ASSERT(buf != nullptr);
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        bufs.emplace_back(buf);
++    }
++    for (auto & sl : layers) {
++        if (sl) {
++            p11_reset_layer_locked(*sl, n);
++        }
++    }
++    plan_slots         = 0;
++    p19_lm_pool_active = false;
++    p19_lm_pool_n      = 0;
++    LLAMA_LOG_INFO("%s: P19 LM pool: restored %u slots per layer, hits=%" PRId64 " miss=%" PRId64 " host_io_bytes=%" PRId64
++            ", %.1f ms\n", __func__, n, hits, miss, bytes, (ggml_time_us() - t0) / 1000.0);
++}
++
+ // spawn the I/O thread pool on first use (from the remap callback, under mtx)
+ void llama_moe_stream::start_workers_locked() {
+     if (workers_started) {
+@@ -6250,7 +6522,14 @@ void llama_moe_stream_wave_ids(ggml_tensor * dst, int ith, int nth, void * userd
+             if (mgr->compute_backend != nullptr) {
+                 ggml_backend_synchronize(mgr->compute_backend);
+             }
+-            mgr->p11_reset_layer_locked(*sl, sl->n_slots);
++            // SiegeLadder P19 stage B (L030): with the pool grown for a layer-major call at k 1, no other layer's waves
++            // ran in it since this layer's previous ubatch - its experts are where its table says, so they hit
++            if (mgr->p19_lm_pool_active && mgr->p19_lm_last_il == sl->il) {
++                mgr->p19_lm_keep_tables++;
++            } else {
++                mgr->p11_reset_layer_locked(*sl, sl->n_slots);
++            }
++            mgr->p19_lm_last_il = sl->il;
+         }
+         mgr->plan_waves_locked(*sl, ids, n, (uint32_t) a->ne[0]);
+         if (mgr->p11_active) {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index 3eb3a00..31efb81 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -645,6 +645,23 @@ struct llama_moe_stream {
+     uint32_t                p11_ahead   = 0;
+     int64_t                 p11_n_ahead = 0;  // experts queued ahead
+     void p11_read_ahead_locked(const llama_moe_stream_layer & sl);
++    // SiegeLadder P19 stage B step 2 (LLAMA_DSV4_LAYER_MAJOR_POOL): for a layer-major call with seg sched, a larger
++    // expert pool for the call while wave planning still sees plan_slots (the base cache size, usually 64)
++    uint32_t plan_slots           = 0; // 0 = use each layer's n_slots in llama_moe_stream_wave_plan
++    bool     p19_lm_pool_active   = false;
++    uint32_t p19_lm_pool_n        = 0;    // slots in the expanded pool
++    uint32_t p19_lm_base_slots    = 0;    // per-layer cache size before expand (plan_slots source)
++    int64_t  p19_lm_hits0         = 0;
++    int64_t  p19_lm_miss0         = 0;
++    int64_t  p19_lm_io_bytes0     = 0;
++    // the layer whose wave 0 last ran in P11's shared pool (-1: none, or the pool was just reallocated). With the pool
++    // grown for a layer-major call at k 1, the same layer's next ubatch finds its experts still there - P11's per-ubatch
++    // table reset (wave entry, w == 0) is skipped then, so they hit instead of loading again
++    int32_t  p19_lm_last_il       = -1;
++    int64_t  p19_lm_keep_tables   = 0;  // wave-0 entries that kept their table (layer-major pool hits possible)
++    // target_slots: 0 = auto from DXGI; seg_reserve_bytes = margin for segment graphs (POOL_MARGIN + peak sched buf)
++    bool p19_lm_pool_begin(uint32_t target_slots, size_t seg_reserve_bytes, size_t margin_mib);
++    void p19_lm_pool_end(); // shrink to p19_lm_base_slots; no-op when p11_leave will restore the cache
+     // SiegeLadder P4: the last layer whose experts the latest graph build runs (-1: every layer) - an encoder-only ubatch
+     // stops before the first decoder layer's FFN, and nothing reads ahead into a layer it will not run. Set at graph build
+     // (models/deepseek4.cpp); like the layers' build-time fields it belongs to the latest build (G23's n_build)

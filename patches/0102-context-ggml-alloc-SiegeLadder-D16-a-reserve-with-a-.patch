@@ -1,0 +1,232 @@
+From 602ff406cf598a609d8cfa190e8773a3601974b2 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 21:15:47 +0000
+Subject: [PATCH 102/112] context + ggml-alloc : SiegeLadder D16 - a reserve
+ with a fallback behind it is measured before it is allocated (on by default;
+ LLAMA_DSV4_FIT_MARGIN_MIB=M - keep M MiB back, -1 - off). D15's automatic
+ widths (the whole model's and P4's encoder-only), and D12's non-sparse graph
+ while its cap can follow, measure the graph first (a split-only reserve,
+ sizes kept per graph shape - tokens, outputs, encoder only, non-sparse, head
+ out, D12's caps - so a phase change of P1 measures nothing again) and
+ allocate it only when it fits the device's free memory plus what the
+ scheduler holds there; below 1 GiB the allocation decides, as before (under
+ WDDM the free memory reads low near the budget: 0 MiB free at 128K, -ub
+ 16384, yet the 334 MiB graph of the load's reserve allocates). No more failed
+ cudaMalloc in the reserves: at 128K -ub 8192 / 16384, 256K -ub 8192 and 1M
+ -ub 2048 the widths and the compute buffers are those of before (313 / 5866,
+ 334 / 5866, 581 / 8567, 2186 / 6964 MiB), each without its 2-3 failed
+ allocations of 9-19 GB; a real 128K session reads its document at 905 tok/s
+ against 909-916. ggml-alloc: a measuring reserve (no_alloc) no longer frees
+ the buffers smaller than its graph - a measure between two real reserves
+ dropped what the first had sized for (D15's size log did it before D16) - and
+ marks its plan stale (no node / leaf counts), so the next alloc_graph
+ re-reserves instead of placing tensors past a buffer's end. Not fixed by it:
+ 64K at -ub 16384 now loads in the load probe (3 of 3) but a real session
+ still died where it did (an out of memory reported by cudaStreamSynchronize
+ right after D15 narrowed the width) - the failed 12.4 GB cudaMalloc was not
+ the cause; -ub 8192 at 64K (the tools' default) stays the way (SiegeLadder
+ runs.md 4.271)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-alloc.c | 11 ++++++
+ src/llama-context.cpp | 87 ++++++++++++++++++++++++++++++++++++++-----
+ src/llama-context.h   | 14 +++++++
+ 3 files changed, 102 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 553d034..0498378 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -936,6 +936,17 @@ static bool ggml_gallocr_reserve_n_impl(
+         }
+     }
+ 
++    // SiegeLadder D16: a measuring reserve (no_alloc) leaves the buffers it found alone - it used to free every buffer
++    // smaller than its graph, so a measure between two real reserves dropped what the first had sized for (llama's
++    // sched_reserve measures D15's / D16's graphs between real reserves); the plan above is all a measure needs. The
++    // plan is for the measured graph and the buffers may be smaller: it is marked stale (no node / leaf counts), so the
++    // next ggml_gallocr_alloc_graph re-reserves instead of placing tensors past a buffer's end
++    if (no_alloc) {
++        galloc->n_nodes = 0;
++        galloc->n_leafs = 0;
++        return true;
++    }
++
+     // reallocate buffers if needed
+     for (int i = 0; i < galloc->n_buffers; i++) {
+         // if the buffer type is used multiple times, we reuse the same buffer
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4e669e4..1ff84b8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -658,6 +658,10 @@ llama_context::llama_context(
+                         __func__, cparams.n_ubatch, n);
+             }
+         }
++        // SiegeLadder D16 (see d16_margin_mib in the header)
++        if (const char * p = std::getenv("LLAMA_DSV4_FIT_MARGIN_MIB")) {
++            d16_margin_mib = atoi(p);
++        }
+ 
+         sched_reserve();
+ 
+@@ -906,11 +910,16 @@ void llama_context::sched_reserve() {
+ 
+     // reserve pp (prompt processing) graph first so that buffers are only allocated once
+     {
+-        auto * gf = graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(),
+-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
++        // SiegeLadder D16: with D15's halving behind it, a width whose graph would not fit is measured, not allocated
++        const auto d15_next = [&]() {
++            return d15_auto && !model.hparams.no_alloc && n_tok_pp/2 >= 256;
++        };
++        auto * gf = d15_next() && !d16_fits(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(), 0) ? nullptr :
++                graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(),
++                        model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+         // SiegeLadder D15, automatic (see d15_auto): the whole model's graph does not fit at this width - its ubatches
+         // narrow by halves, down to 256 tokens, and P4's encoder-only ubatches keep -ub
+-        while (!gf && d15_auto && !model.hparams.no_alloc && n_tok_pp/2 >= 256) {
++        while (!gf && d15_next()) {
+             d15_ub_full  = n_tok_pp/2;
+             d15          = true;
+             n_tok_pp     = d15_ub_full;
+@@ -918,7 +927,8 @@ void llama_context::sched_reserve() {
+             LLAMA_LOG_WARN("%s: SiegeLadder D15 (automatic; LLAMA_DSV4_UB_FULL=0 - off): the whole model's pp graph does "
+                     "not fit at %u tokens - its ubatches take at most %u, P4's encoder-only ones %u\n", __func__,
+                     n_tok_pp*2, n_tok_pp, n_tokens);
+-            gf = graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get());
++            gf = d15_next() && !d16_fits(n_tok_pp, n_seqs, n_outputs_pp, mctx.get(), 0) ? nullptr :
++                    graph_reserve(n_tok_pp, n_seqs, n_outputs_pp, mctx.get());
+         }
+         if (!gf) {
+             if (cparams.pipeline_parallel) {
+@@ -1060,8 +1070,17 @@ void llama_context::sched_reserve() {
+         cparams.dsv4_reserve_dense = true;
+         ggml_cgraph * gf = nullptr;
+         if (!capped_before) {
+-            gf = graph_reserve(n_tok, n_seqs, n_out, mctx.get(),
+-                    model.hparams.no_alloc, model.hparams.no_alloc ? sizes_dense.data() : nullptr);
++            // SiegeLadder D16: with D12's cap behind it, the full widths are measured first and not allocated if they
++            // would not fit
++            bool skip = false;
++            if (!model.hparams.no_alloc && n_seqs == 1) {
++                const uint32_t n_pos = llm_graph_dsv4_dense_bound(model.hparams, mctx.get(), n_tok);
++                skip = n_pos > 0 && n_pos < cparams.n_ctx && !d16_fits(n_tok, n_seqs, n_out, mctx.get(), 0);
++            }
++            if (!skip) {
++                gf = graph_reserve(n_tok, n_seqs, n_out, mctx.get(),
++                        model.hparams.no_alloc, model.hparams.no_alloc ? sizes_dense.data() : nullptr);
++            }
+         }
+ 
+         // SiegeLadder D12: at 512K+ that graph at the full compressed widths asks 8-10 GiB (runs.md 4.216), but on one
+@@ -1127,17 +1146,23 @@ void llama_context::sched_reserve() {
+ 
+         std::vector<size_t> sizes_enc(backend_ptrs.size(), 0);
+         cparams.dsv4_enc_only = true;
+-        auto * gf = graph_reserve(n_wide, n_seqs, n_out_enc, mctx.get(),
+-                model.hparams.no_alloc, model.hparams.no_alloc ? sizes_enc.data() : nullptr);
++        // SiegeLadder D16: as for the whole model's width above - measured first while a halving can follow
++        const auto wide_next = [&]() {
++            return d15_auto && !model.hparams.no_alloc && n_wide/2 >= n_tok_pp;
++        };
++        auto * gf = wide_next() && !d16_fits(n_wide, n_seqs, n_out_enc, mctx.get(), 0) ? nullptr :
++                graph_reserve(n_wide, n_seqs, n_out_enc, mctx.get(),
++                        model.hparams.no_alloc, model.hparams.no_alloc ? sizes_enc.data() : nullptr);
+         // automatic: the encoder-only graph does not fit at -ub either (256K at -ub 8192: 9.8 GB) - its width halves
+         // too, down to the whole model's
+-        while (!gf && d15_auto && !model.hparams.no_alloc && n_wide/2 >= n_tok_pp) {
++        while (!gf && wide_next()) {
+             n_wide      = n_wide/2;
+             n_out_enc   = std::min(n_wide, cparams.n_outputs_max);
+             d15_ub_wide = n_wide;
+             LLAMA_LOG_WARN("%s: SiegeLadder D15 (automatic): P4's encoder-only graph does not fit at %u tokens - its "
+                     "ubatches take %u\n", __func__, n_wide*2, n_wide);
+-            gf = graph_reserve(n_wide, n_seqs, n_out_enc, mctx.get());
++            gf = wide_next() && !d16_fits(n_wide, n_seqs, n_out_enc, mctx.get(), 0) ? nullptr :
++                    graph_reserve(n_wide, n_seqs, n_out_enc, mctx.get());
+         }
+         if (gf && dsv4_dense) {
+             try {
+@@ -3414,6 +3439,48 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
+     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+ }
+ 
++// SiegeLadder D16 (see d16_margin_mib in the header): would this reserve's buffers fit on every GPU device? The flags
++// set for the reserve (encoder only, non-sparse, head out) are read from cparams, as graph_reserve reads them
++bool llama_context::d16_fits(
++        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, uint32_t cap) {
++    if (d16_margin_mib < 0 || model.hparams.no_alloc) {
++        return true;
++    }
++    const std::array<uint32_t, 7> key = { n_tokens, n_outputs, cparams.dsv4_enc_only ? 1u : 0u,
++            cparams.dsv4_reserve_dense ? 1u : 0u, cparams.head_out ? 1u : 0u, cap, cparams.dsv4_dense_cap };
++    auto it = d16_sizes.find(key);
++    if (it == d16_sizes.end()) {
++        std::vector<size_t> need(backend_ptrs.size(), 0);
++        if (graph_reserve(n_tokens, n_seqs, n_outputs, mctx, true, need.data()) == nullptr) {
++            return false;
++        }
++        it = d16_sizes.emplace(key, std::move(need)).first;
++    }
++    const size_t margin = (size_t) d16_margin_mib << 20;
++    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
++        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++            continue;
++        }
++        size_t free = 0;
++        size_t total = 0;
++        ggml_backend_dev_memory(dev, &free, &total);
++        const size_t held = sched ? ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]) : 0;
++        const size_t room = free + held > margin ? free + held - margin : 0;
++        // below 1 GiB the allocation decides, as before: under WDDM the free memory reads low near the budget (128K at
++        // -ub 16384: 0 MiB free, yet the 334 MiB non-sparse graph of the load's reserve allocates) - and only the big
++        // requests ever broke the context
++        if (it->second[i] > room && it->second[i] >= ((size_t) 1 << 30)) {
++            LLAMA_LOG_WARN("%s: SiegeLadder D16: the pp graph at %u tokens%s%s asks %.1f MiB on %s - %.1f MiB free, %.1f "
++                    "held, %d kept back: not allocated (LLAMA_DSV4_FIT_MARGIN_MIB=-1 - try anyway)\n", __func__, n_tokens,
++                    cparams.dsv4_enc_only ? " (encoder only)" : "", cparams.dsv4_reserve_dense ? " (non-sparse)" : "",
++                    it->second[i]/1048576.0, ggml_backend_dev_name(dev), free/1048576.0, held/1048576.0, d16_margin_mib);
++            return false;
++        }
++    }
++    return true;
++}
++
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index a3cb1b9..1eecd6e 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -11,6 +11,7 @@
+ #include "ggml-cpp.h"
+ #include "ggml-opt.h"
+ 
++#include <array>
+ #include <map>
+ #include <set>
+ #include <vector>
+@@ -392,6 +393,19 @@ private:
+     uint64_t d15_logged  = 0;              // the width pair whose graph sizes were last logged
+     std::set<uint64_t> d12_capped;         // non-sparse pp graphs (width << 1 | encoder only) reserved capped once
+ 
++    // SiegeLadder D16 (LLAMA_DSV4_FIT_MARGIN_MIB=M, 0 by default; < 0 - off): a reserve with a fallback behind it (D15's
++    // automatic widths, D12's cap) is measured first - a split-only reserve allocates nothing - and allocated only when
++    // its buffers fit the device's free memory plus what the scheduler holds there, less M. On WDDM a cudaMalloc beyond
++    // the free memory (but under the card's) can fail and leave the CUDA context broken: 64K at -ub 16384 asked 12.4 GB
++    // with ~11-12 free, and the next synchronize died out of memory (runs.md 4.258). M = 0: only what the allocation
++    // would refuse anyway is not tried - with 128 the 256K non-sparse graph at 4096 (8.6 GB of 8.6 free) and the small
++    // one at load went capped, which they never were; and below 1 GiB the allocation decides as before (the free memory
++    // WDDM reports reads low near the budget). The sizes are kept per graph shape (tokens, outputs, encoder only,
++    // non-sparse, head out, D12's caps), so a phase change of P1 measures nothing again
++    int32_t d16_margin_mib = 0;
++    std::map<std::array<uint32_t, 7>, std::vector<size_t>> d16_sizes;
++    bool d16_fits(uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, uint32_t cap);
++
+     // SiegeLadder C7 (LLAMA_DSV4_YOCO=K, on by default with K = 140 since 25.10, =0 - off, the exact preset sets 0;
+     // docs/v41/c7-design.md; DeepInfer's YoCo prefill truncation):
+     // per decode call and sequence, yoco_lo = min(first output + 1, the call's end) - K. When it lies past the sequence's

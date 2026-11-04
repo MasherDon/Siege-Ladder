@@ -1,7 +1,7 @@
 # Siege-Ladder: the patch series over JigSawPT's llama.cpp fork (the DeepSeek-V4.1 port with SSD streaming)
 # upstream  https://github.com/JigSawPT/llama.cpp  branch dsv41-porte
 # base      8ce0968539b1a6795f3413c2783dfa5646b4688a  (2026-09-23)
-# patches   92, oldest first; exported from our branch at 4dfcf40
+# patches   112, oldest first; exported from our branch at 864b18a
 # apply     git checkout 8ce0968539b1a6795f3413c2783dfa5646b4688a && git am path/to/patches/*.patch
 # note      the commit messages quote their measurements and cite sections of our own measurement log
 #           (runs.md 4.xx), which is not published
@@ -98,3 +98,23 @@
 0090-dsv4-moe-stream-SiegeLadder-defaults-of-25.10-the-us.patch
 0091-moe-stream-SiegeLadder-17-I-O-threads-by-default-was.patch
 0092-ggml-cuda-dsv4-SiegeLadder-P20-step-1-and-P8-for-pro.patch
+0093-dsv4-graph-moe-stream-SiegeLadder-C7c-past-layer-20-.patch
+0094-model-SiegeLadder-P20-step-2-the-output-head-s-bytes.patch
+0095-graph-mmap-SiegeLadder-P8-a-prompt-s-Engram-pages-fa.patch
+0096-graph-mmap-model-SiegeLadder-P8c-a-prompt-s-Engram-r.patch
+0097-graph-mmap-model-SiegeLadder-P8d-the-Engram-tables-u.patch
+0098-ggml-cuda-SiegeLadder-D4-the-top-k-of-a-long-row-by-.patch
+0099-batch-context-SiegeLadder-D15-two-widths-of-ubatch-a.patch
+0100-context-SiegeLadder-D15-v2-a-call-s-last-N-tokens-al.patch
+0101-model-moe-stream-SiegeLadder-G44-G35-s-lens-with-a-l.patch
+0102-context-ggml-alloc-SiegeLadder-D16-a-reserve-with-a-.patch
+0103-moe-stream-model-SiegeLadder-G44-on-by-default-the-u.patch
+0104-moe-stream-SiegeLadder-G40-k-1-on-by-default-togethe.patch
+0105-server-Ctrl-Break-shuts-down-cleanly-too-SiegeLadder.patch
+0106-llama-SiegeLadder-P19-stage-A-layer-major-prefill-of.patch
+0107-llama-SiegeLadder-P19-the-host-tier-runs-CLOCK-for-a.patch
+0108-llama-SiegeLadder-P19-candidates-carried-as-block-in.patch
+0109-llama-SiegeLadder-M9-fit-LLAMA_MOE_STREAM_L2_WDDM_FI.patch
+0110-llama-SiegeLadder-P19-stage-B-step-1-LLAMA_DSV4_LAYE.patch
+0111-llama-SiegeLadder-P19-stage-B-step-2-LLAMA_DSV4_LAYE.patch
+0112-llama-SiegeLadder-P19-stage-B-step-3-the-layer-pool-.patch

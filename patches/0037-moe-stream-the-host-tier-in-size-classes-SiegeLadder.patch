@@ -1,38 +1,39 @@
 From d1bae471f7b068f015c3ef47f9a3aa687214d8c8 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 14:56:54 +0000
-Subject: [PATCH 37/92] moe-stream : the host tier in size classes (SiegeLadder
- M3), runahead's pass skips its pairs off the card, the drop rule's inputs in
- one tensor, and the pass's attention by part of the heads (G21, a
- measurement) - M3: a pool per slab length (gate / up 3 041 280 B in 3 051
- 520-byte slots, down 3 870 720 B in 3 878 912), each with its own CLOCK hand
- and sized by the slabs of its class in the model, slots numbered across the
- pools so a slot index means to every caller what it did; classes whose slots
- differ by less than 1/16 share a pool. 4 948 experts at 46 GiB instead of 4
- 244: drive reads -14.4%, L2 70.7 -> 74.8%, decode +2.2% (SiegeLadder runs.md
- 4.57 / 4.59, ABBA blocks; text = trace, the pools evict 2.07 times per slot
- both); LLAMA_MOE_STREAM_L2_CLASSES=0 = one pool. A pinned allocation that
- comes back as an ordinary CPU buffer (the CUDA host buffer type falls back to
- one quietly) no longer counts as the pinned tier - it is neither page-locked
- nor aligned for direct I/O - and the one-pool slot is rounded up to 4096 as
- well. LLAMA_MOE_STREAM_RA_SKIP (default on, 0 = before): runahead's first
- half gives the pass's pairs off the card the skip id instead of a borrowed
- resident slot, and the pass's down GEMM zeroes their rows (op_params[2] = 1)
- - the zeros weight 0 made, so the same guess; only where the pass ends in
- that mul_mat_id on a CUDA cache. Speed 0% with the order controlled (the pass
- keeps 87.7% of its pairs; an early +1.6% was the position in the pair).
- LLAMA_MOE_STREAM_DROP_PACK (default on, 0 = apart): the drop rule's expert
- ids ride as floats (exact below 2^24) next to the routing weights in one F32
- tensor [k, 2*n_tokens], one card input of the remap's CPU split instead of
- two, unpacked by remap_v / remap_issue - the deterministic DROP_VRAM_ONLY=3
- gives PPL, KL, max KLD, top-1 and 92 633 drops identical to the build before
- it, and no measurable gain (14.17 vs 14.19 tok/s: the second synchronize
- waits for an idle card). LLAMA_MOE_STREAM_RA_GROUPS=g (+ _SCALE=1, off by
- default): the pass's next-layer attention on the heads of the first g of the
- 8 output groups, through views of the same weights (wq_b rows, attn_sinks,
- wo_a slices, a strided view of wo_b's columns) - half the groups save 3.1 ms
- of GEMV per token but cut the guess's recall 92 -> 76% with 7x the false
- stages, -5.5% (runs.md 4.58)
+Subject: [PATCH 037/112] moe-stream : the host tier in size classes
+ (SiegeLadder M3), runahead's pass skips its pairs off the card, the drop
+ rule's inputs in one tensor, and the pass's attention by part of the heads
+ (G21, a measurement) - M3: a pool per slab length (gate / up 3 041 280 B in 3
+ 051 520-byte slots, down 3 870 720 B in 3 878 912), each with its own CLOCK
+ hand and sized by the slabs of its class in the model, slots numbered across
+ the pools so a slot index means to every caller what it did; classes whose
+ slots differ by less than 1/16 share a pool. 4 948 experts at 46 GiB instead
+ of 4 244: drive reads -14.4%, L2 70.7 -> 74.8%, decode +2.2% (SiegeLadder
+ runs.md 4.57 / 4.59, ABBA blocks; text = trace, the pools evict 2.07 times
+ per slot both); LLAMA_MOE_STREAM_L2_CLASSES=0 = one pool. A pinned allocation
+ that comes back as an ordinary CPU buffer (the CUDA host buffer type falls
+ back to one quietly) no longer counts as the pinned tier - it is neither
+ page-locked nor aligned for direct I/O - and the one-pool slot is rounded up
+ to 4096 as well. LLAMA_MOE_STREAM_RA_SKIP (default on, 0 = before):
+ runahead's first half gives the pass's pairs off the card the skip id instead
+ of a borrowed resident slot, and the pass's down GEMM zeroes their rows
+ (op_params[2] = 1) - the zeros weight 0 made, so the same guess; only where
+ the pass ends in that mul_mat_id on a CUDA cache. Speed 0% with the order
+ controlled (the pass keeps 87.7% of its pairs; an early +1.6% was the
+ position in the pair). LLAMA_MOE_STREAM_DROP_PACK (default on, 0 = apart):
+ the drop rule's expert ids ride as floats (exact below 2^24) next to the
+ routing weights in one F32 tensor [k, 2*n_tokens], one card input of the
+ remap's CPU split instead of two, unpacked by remap_v / remap_issue - the
+ deterministic DROP_VRAM_ONLY=3 gives PPL, KL, max KLD, top-1 and 92 633 drops
+ identical to the build before it, and no measurable gain (14.17 vs 14.19
+ tok/s: the second synchronize waits for an idle card).
+ LLAMA_MOE_STREAM_RA_GROUPS=g (+ _SCALE=1, off by default): the pass's
+ next-layer attention on the heads of the first g of the 8 output groups,
+ through views of the same weights (wq_b rows, attn_sinks, wo_a slices, a
+ strided view of wo_b's columns) - half the groups save 3.1 ms of GEMV per
+ token but cut the guess's recall 92 -> 76% with 7x the false stages, -5.5%
+ (runs.md 4.58)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---

@@ -1,13 +1,13 @@
 From c799839e764049504a022a5dc51051fbdd9ec3d0 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 12:47:37 +0000
-Subject: [PATCH 36/92] moe-stream : where decode loads come from and how long
- they take (SiegeLadder M12), the late drop, and the drop masks on the remap's
- host split - counters: every slot remembers its load's source (the host tier
- or the drive, from l2::has, which counts and marks nothing) and when it was
- reserved; print_stats splits the staged experts by source (ready / still
- loading / not asked for), the decode waits by what was in flight when they
- began (a drive read of the call's own, drive reads staged ahead only,
+Subject: [PATCH 036/112] moe-stream : where decode loads come from and how
+ long they take (SiegeLadder M12), the late drop, and the drop masks on the
+ remap's host split - counters: every slot remembers its load's source (the
+ host tier or the drive, from l2::has, which counts and marks nothing) and
+ when it was reserved; print_stats splits the staged experts by source (ready
+ / still loading / not asked for), the decode waits by what was in flight when
+ they began (a drive read of the call's own, drive reads staged ahead only,
  host-tier copies only: calls and seconds), and prints delivery times
  (reservation to the last copy enqueued) and the time left once a call waited,
  as histograms per class; the remap halves time their wait for mgr->mtx (G21).

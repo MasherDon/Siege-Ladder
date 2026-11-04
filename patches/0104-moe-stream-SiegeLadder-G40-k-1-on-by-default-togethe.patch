@@ -1,0 +1,99 @@
+From 1012413de926652d86f727f61e8204973b9ba9e1 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Tue, 03 Nov 2026 18:05:31 +0000
+Subject: [PATCH 104/112] moe-stream : SiegeLadder G40 k 1 on by default
+ together with G44 (the user's decision R17 of 04.11). With
+ LLAMA_MOE_STREAM_G40 unset G40 stages up to 1 of G35's corrected lens's best
+ into VRAM 2 calls ahead; next to an oracle or A' (they stage on their own) a
+ default G40 stays off, as runahead does there; the exact preset (runahead, no
+ lens) leaves it off as before; LLAMA_MOE_STREAM_G40=0 - off, =k asks for it
+ (alone too, as the fast preset has since 25.10). R17 took G40 with G44: a
+ default G40 is turned off again in load_g44 when the lens is not had (any
+ return of it; one line in the log). The 25.10 condition for the default -
+ rare experts predicted - is G44's: G40's precision 0.77 -> 0.90 (SiegeLadder
+ runs.md 4.270). Measured: over the default with G44 -2.41 ms a token (+5.1%,
+ 20.26 -> 21.30 tok/s; two A B B A blocks with the GPU scheduler, the worst
+ G40 run beats the best base; drops +1.8% - runs.md 4.274); quality of G40 k 1
+ + G44 against a fresh base +0.0020 / +0.0023 / +0.0002 nat on general-100 /
+ general-ru / router-112, all within the noise (4.273). Checked on og: default
+ - G40 and G44 both on with no keys; exact - both off without a word, runahead
+ on; LLAMA_MOE_STREAM_G44=0 - G40 off with its line
+
+---
+ src/llama-moe-stream.cpp | 22 ++++++++++++++++++++--
+ src/llama-moe-stream.h   | 10 +++++++---
+ 2 files changed, 27 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 12fb0ac..d06495d 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -754,7 +754,8 @@ bool llama_moe_stream_layer::matches(const ggml_tensor * gate, const ggml_tensor
+ // A preset only fills keys that are not set, so an explicit key still wins. exact - no drops (runahead K = 6 then takes
+ // over by itself, lossless; G35 gives way to it) and no C7 (LLAMA_DSV4_YOCO=0: the prefill truncation, on by default
+ // since 25.10, is lossy - exact stays the full model's math); default - the fork's own defaults (drop 0.14 with DROP_ALL,
+-// G31, G35 v2, C7 K 140 since 25.10, G44 since 04.11 - when its file is found next to the model, see load_g44);
++// G31, G35 v2, C7 K 140 since 25.10, G44 since 04.11 - when its file is found next to the model, see load_g44 - and
++// G40 k 1 with it since 04.11, R17);
+ // fast - the default plus C14 0.2 (late, N 1: +4.8...+5.2% over the default,
+ // general-100 dNLL about +0.005 more, 4.152 / 4.157) and G40 k 1 (G35's lens staged into VRAM: +3% on qd fast, k 2 the
+ // same within the spread with 14% more stagings - runs.md 4.224 / 4.229; the user's decision of 25.10: the fast preset
+@@ -1069,11 +1070,16 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G35_LAZY")) {
+         g35_lazy = std::max(0, std::min(2, atoi(p)));
+     }
+-    // SiegeLadder G40; see g40_k in the header (off by default; the fast preset sets it - the user's decision of 25.10)
++    // SiegeLadder G40; see g40_k in the header (on by default with k 1 and G44 since 04.11 - R17; the fast preset sets it
++    // explicitly, as since 25.10). The measurement modes that stage on their own - an oracle, A' (PRED_*) - keep a default
++    // G40 off, as they keep runahead
+     bool g40_asked = false;
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40")) {
+         g40_k     = std::max(0, std::min(64, atoi(p)));
+         g40_asked = g40_k > 0;
++    } else if (spec_oracle.empty() && pred_vram == 0 && pred_ram == 0 && pred_stage == 0) {
++        g40_k       = 1;
++        g40_default = true;
+     }
+     if (const char * p = std::getenv("LLAMA_MOE_STREAM_G40_H")) {
+         g40_h = (float) std::strtod(p, nullptr);
+@@ -1899,6 +1905,18 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+ }
+ 
+ void llama_moe_stream::load_g44(int64_t n_embd, int64_t n_expert, const std::string & model_path) {
++    // R17 put G40 into the default together with G44: a default G40 does not stay on when the lens is not had (every
++    // return below passes through here)
++    struct g40_without_g44 {
++        llama_moe_stream & s;
++        ~g40_without_g44() {
++            if (s.g40_default && s.g40_k > 0 && s.g44_lens.empty()) {
++                s.g40_k = 0;
++                LLAMA_LOG_WARN("load_g44: moe stream: G40 (on by default) stays off without G44's lens "
++                        "(LLAMA_MOE_STREAM_G40=1 asks for it alone)\n");
++            }
++        }
++    } g40_guard { *this };
+     const char * env = std::getenv("LLAMA_MOE_STREAM_G44");
+     if (env != nullptr && std::strcmp(env, "0") == 0) {
+         return;
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index ce42574..3eb3a00 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -865,10 +865,14 @@ struct llama_moe_stream {
+     // preset with the drop rule it adds ~5% drops (runs.md 4.225-4.227: general-100 +0.0040 against the default; the extra
+     // drops come from its stagings from the drive - G40d below takes them away, and half the gain with them); G40_TIER=1
+     // (G40c) takes a staging's victim only among slots whose expert the host tier holds whole (changes nothing: the
+-    // residents are tier-backed already). Off by default (k 0) - the user's decision of 25.10: on in the fast preset only
+-    // (the preset sets LLAMA_MOE_STREAM_G40), the default once rare experts are predicted; h 0.18 measured best; with G35
+-    // off or giving way to runahead (the exact preset) there is no lens, and G40 stays off
++    // residents are tier-backed already). Off by default until 04.11 (the user's decision of 25.10: the fast preset only,
++    // the default once rare experts are predicted); on by default with k 1 since 04.11 together with G44 (the user's
++    // decision R17; runs.md 4.273 / 4.274: +5.1% over the default with G44, quality within the noise on three API anchors,
++    // drops +1.8%) - a default G40 stays off without G44's lens (load_g44) and next to an oracle or A' (they stage on their
++    // own); LLAMA_MOE_STREAM_G40=0 - off, =k asks for it, alone too; h 0.18 measured best; with G35 off or giving way to
++    // runahead (the exact preset) there is no lens, and G40 stays off
+     int32_t  g40_k           = 0;
++    bool     g40_default     = false; // G40 on by default (R17), not asked for: load_g44 turns it off without the lens
+     float    g40_h           = 0.18f; // < 0: G35_H
+     bool     g40_low         = false;
+     bool     g40_tier        = false;

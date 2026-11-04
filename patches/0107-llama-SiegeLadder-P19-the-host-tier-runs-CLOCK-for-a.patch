@@ -1,0 +1,39 @@
+From f612338df738aa63efa404f7ec8989c5b72f21d7 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 04:42:25 +0000
+Subject: [PATCH 107/112] llama : SiegeLadder P19 - the host tier runs CLOCK
+ for a layer-major call (P9's prompt holding ended;
+ LLAMA_DSV4_LAYER_MAJOR_SCAN=1 keeps it): P9 lets a layer keep ~1/40 of the
+ tier, right for ubatch -> all layers, but here the next graph is the same
+ layers' for the next ubatch (SiegeLadder runs.md 4.282: 32K, k 1 - 165 GB
+ from the drive against 829 with P9)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4201c7d..507f106 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2941,6 +2941,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             dctx->lm_metadata_pass();
+             lm_copy_us = 0;
+ 
++            // P9's prompt holding (llama_moe_stream::batch_begin) lets a layer keep ~1/40 of the host tier and streams
++            // the rest through a ring - right for "ubatch -> all layers", where the next ubatch finds what each layer
++            // held; here the next graph is the same layers' for the next ubatch, so the tier runs CLOCK for this call
++            // (SiegeLadder runs.md 4.282: 32K, k 1 - 165 GB from the drive against 829 with P9 and 1117 with CLOCK at
++            // k 0). LLAMA_DSV4_LAYER_MAJOR_SCAN=1 keeps P9
++            static const bool lm_keep_scan = [] {
++                const char * s = std::getenv("LLAMA_DSV4_LAYER_MAJOR_SCAN");
++                return s != nullptr && atoi(s) != 0;
++            }();
++            if (auto * ms = model.moe_stream(); ms != nullptr && ms->l2 && ms->l2->scan && !lm_keep_scan) {
++                ms->l2->end_scan();
++            }
++
+             ggml_backend_buffer_type_t lm_host_buft = nullptr;
+             for (auto & backend : backends) {
+                 ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());

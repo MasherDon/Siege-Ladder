@@ -1,0 +1,263 @@
+From 1922bdcbf2936771d5a3ed89e1e407e925574e5c Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 08:13:44 +0000
+Subject: [PATCH 110/112] llama : SiegeLadder P19 stage B step 1 -
+ LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED=1 recreates the scheduler without a reserve
+ at the start of a layer-major call (as P1 does, CUDA pool trimmed), so the
+ buffers grow only to the segment graphs met (L029; 128K -ub 2048: 1184-1340
+ MiB per layer instead of 3015, 7.3-7.5 GiB VRAM free);
+ LLAMA_DSV4_LAYER_MAJOR_VRAM=1 per-layer VRAM probe (L027); both off by
+ default, 48K equal byte for byte in exact and default at k 1 and 4
+ (SiegeLadder runs.md 4.290)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 144 ++++++++++++++++++++++++++++++++++++++++++
+ src/llama-context.h   |   6 ++
+ 2 files changed, 150 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d2e1b95..7cf1635 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -11,6 +11,7 @@
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-stream.h"
++#include "llama-wddm.h"
+ #include "llama-ext.h"
+ #include "llama.h"
+ 
+@@ -22,6 +23,19 @@
+ #include <limits>
+ #include <stdexcept>
+ #include <string>
++#include <vector>
++
++// L027: scoped to one calling thread and one layer-major invocation.
++struct lm_vram_sample {
++    uint64_t usage = 0, free = UINT64_MAX;
++    size_t buffer = 0, samples = 0, failures = 0;
++};
++static thread_local std::vector<lm_vram_sample> * lm_vram_samples = nullptr;
++struct lm_vram_scope {
++    std::vector<lm_vram_sample> * previous;
++    explicit lm_vram_scope(std::vector<lm_vram_sample> * p) : previous(lm_vram_samples) { lm_vram_samples = p; }
++    ~lm_vram_scope() { lm_vram_samples = previous; }
++};
+ 
+ //
+ // llama_context
+@@ -681,6 +695,9 @@ llama_context::llama_context(
+             if (const char * resv = std::getenv("LLAMA_DSV4_LAYER_MAJOR_RESERVE")) {
+                 lm_reserve_enable = atoi(resv) != 0;
+             }
++            if (const char * seg = std::getenv("LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED")) {
++                lm_seg_sched_enable = atoi(seg) != 0;
++            }
+         }
+ 
+         sched_reserve();
+@@ -1406,6 +1423,44 @@ bool llama_context::p1_leave() {
+     return ok;
+ }
+ 
++size_t llama_context::lm_cuda0_sched_buffer() const {
++    for (ggml_backend_t backend : backend_ptrs) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++        const char *       name = dev != nullptr ? ggml_backend_dev_name(dev) : nullptr;
++        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && name != nullptr &&
++                std::strstr(name, "CUDA0") != nullptr) {
++            return sched ? ggml_backend_sched_get_buffer_size(sched.get(), backend) : 0;
++        }
++    }
++    return 0;
++}
++
++size_t llama_context::lm_cuda_pool_trim() {
++    size_t trimmed = 0;
++    for (auto & backend : backends) {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
++        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        auto * trim_fn = reg != nullptr ?
++                (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim") :
++                nullptr;
++        if (trim_fn != nullptr) {
++            trimmed += trim_fn(backend.get());
++        }
++    }
++    return trimmed;
++}
++
++void llama_context::lm_sched_recreate_without_reserve() {
++    synchronize();
++    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_reserve());
++    const size_t   max_nodes = graph_max_nodes(n_tokens);
++    gf_res_prev.reset(new llm_graph_result(max_nodes));
++    gf_res_reserve.reset(new llm_graph_result(max_nodes));
++    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes,
++            cparams.pipeline_parallel, cparams.op_offload));
++    lm_cuda_pool_trim();
++}
++
+ bool llama_context::p1_logits(int64_t row0, int64_t n_rows) {
+     // the head's own op on the rows the full graph would have fed it: ggml_mul_mat(output, normed hidden), one per
+     // ubatch as there, on the head's backend - its own small graph and allocator, so the scheduler is not involved
+@@ -2152,6 +2207,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
++    // Sample immediately after allocation (also on reuse), before inputs and compute.
++    if (lm_vram_samples && cparams.dsv4_lm_l0 >= 0) {
++        size_t cuda0 = 0;
++        bool found = false;
++        for (auto * backend : backend_ptrs) {
++            auto * dev = ggml_backend_get_device(backend);
++            const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
++            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU && name && std::strstr(name, "CUDA0")) {
++                cuda0 = ggml_backend_sched_get_buffer_size(sched.get(), backend);
++                found = true;
++                break;
++            }
++        }
++        const llama_wddm_budget wb = llama_wddm_query_budget();
++        for (int32_t il = cparams.dsv4_lm_l0; il < cparams.dsv4_lm_l1 && il < (int32_t) lm_vram_samples->size(); ++il) {
++            auto & v = (*lm_vram_samples)[il];
++            if (!wb.ok || !found) { ++v.failures; continue; }
++            ++v.samples;
++            v.buffer = std::max(v.buffer, cuda0);
++            v.usage = std::max(v.usage, wb.local_usage);
++            v.free = std::min(v.free, wb.local_budget > wb.local_usage ? wb.local_budget - wb.local_usage : uint64_t(0));
++        }
++    }
++
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -3100,6 +3179,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 }
+             }
+ 
++            const bool lm_seg_sched = lm_seg_sched_enable;
++            size_t     lm_seg_sched_buf_max = 0;
++            struct lm_seg_sched_restore {
++                llama_context * self;
++                bool            on;
++                explicit lm_seg_sched_restore(llama_context * s, bool o) : self(s), on(o) {}
++                ~lm_seg_sched_restore() {
++                    if (on) {
++                        self->sched_need_reserve = true;
++                    }
++                }
++            } seg_sched_guard(this, lm_seg_sched);
++
++            if (lm_seg_sched) {
++                const int64_t t0 = ggml_time_us();
++                const size_t  buf_before = lm_cuda0_sched_buffer();
++                lm_sched_recreate_without_reserve();
++                const size_t buf_after = lm_cuda0_sched_buffer();
++                lm_seg_sched_buf_max = std::max(buf_before, buf_after);
++                LLAMA_LOG_INFO("%s: layer-major seg sched (LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED): cuda0 before=%.2f MiB after=%.2f MiB recreate_ms=%.2f\n",
++                        __func__, buf_before / 1048576.0, buf_after / 1048576.0, (ggml_time_us() - t0) / 1000.0);
++            }
++
+             // one slot per ubatch of a superchunk: in - what the next group's graph reads (host bytes, shape, type; the
+             // graph fills in its input tensors), out - the tensors the group's graph exported. Each item has a pinned
+             // host buffer of its own, which grows as the item does (the candidate verdicts widen with the position)
+@@ -3203,6 +3305,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             };
+ 
+             auto run_ubatch_full = [&](size_t u) -> int {
++                const size_t buf_before = lm_seg_sched ? lm_cuda0_sched_buffer() : 0;
+                 dctx->lm_seek(u);
+                 const llama_ubatch & ubatch = dctx->get_ubatch();
+                 const lm_ub_plan &   p      = ub_plans[u];
+@@ -3249,9 +3352,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 if (!res) {
+                     return -3;
+                 }
++                if (lm_seg_sched) {
++                    const size_t buf_after = lm_cuda0_sched_buffer();
++                    lm_seg_sched_buf_max   = std::max(lm_seg_sched_buf_max, buf_after);
++                    LLAMA_LOG_INFO("%s: layer-major seg sched single-ubatch superchunk u=%zu cuda0 before=%.2f MiB after=%.2f MiB\n",
++                            __func__, u, buf_before / 1048576.0, buf_after / 1048576.0);
++                }
+                 return run_ubatch_outputs(ubatch, p.n_out, res);
+             };
+ 
++            const char * vram_env = std::getenv("LLAMA_DSV4_LAYER_MAJOR_VRAM");
++            const bool vram_enabled = vram_env && std::strcmp(vram_env, "1") == 0;
++            std::vector<lm_vram_sample> vram_samples(vram_enabled ? n_layer : 0);
++            lm_vram_scope vram_scope(vram_enabled ? &vram_samples : nullptr);
+             std::vector<lm_carry_slot> slots;
+             for (const auto & sc : superchunks) {
+                 if (sc.second - sc.first < 2) {
+@@ -3326,6 +3439,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         llm_graph_result * res     = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                                 mctx.get(), status, true);
+                         ++n_graphs;
++                        if (lm_seg_sched) {
++                            lm_seg_sched_buf_max = std::max(lm_seg_sched_buf_max, lm_cuda0_sched_buffer());
++                        }
+ 
+                         cparams.dsv4_enc_only     = false;
+                         cparams.dsv4_yoco_lo      = -1;
+@@ -3375,6 +3491,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 }
+             }
+ 
++            if (lm_seg_sched) {
++                lm_seg_sched_buf_max = std::max(lm_seg_sched_buf_max, lm_cuda0_sched_buffer());
++                LLAMA_LOG_INFO("%s: layer-major seg sched cuda0 buffer max=%.2f MiB (call end)\n", __func__,
++                        lm_seg_sched_buf_max / 1048576.0);
++            }
++
++            if (vram_enabled) {
++                std::vector<uint64_t> expert_bytes(n_layer, 0);
++                if (auto * ms = model.moe_stream()) {
++                    for (const auto & sl : ms->layers) {
++                        if (!sl || sl->il < 0 || sl->il >= n_layer) continue;
++                        for (const auto & wt : sl->weights) expert_bytes[sl->il] += wt.nb_expert * (uint64_t) sl->n_expert;
++                    }
++                }
++                size_t fits = 0, measured = 0;
++                for (int32_t il = 0; il < n_layer; ++il) {
++                    const auto & v = vram_samples[il];
++                    const bool valid = v.samples > 0 && v.failures == 0 && expert_bytes[il] > 0;
++                    const bool fit = valid && v.free >= expert_bytes[il];
++                    measured += valid ? 1 : 0;
++                    fits += fit ? 1 : 0;
++                    LLAMA_LOG_INFO("%s: layer-major vram layer=%d samples=%zu failures=%zu buffer_max_bytes=%" PRIu64 " usage_max_bytes=%" PRIu64 " free_min_bytes=%" PRIu64 " expert_bytes=%" PRIu64 " fit=%s\n",
++                            __func__, il, v.samples, v.failures, (uint64_t) v.buffer, v.usage,
++                            v.samples ? v.free : uint64_t(0), expert_bytes[il], valid ? (fit ? "yes" : "no") : "unknown");
++                }
++                LLAMA_LOG_INFO("%s: layer-major vram fit=%zu measured=%zu total=%d k=%d (no margin; grouped snapshots if k>1)\n", __func__, fits, measured, n_layer, lm_k);
++            }
++
+             LLAMA_LOG_INFO("%s: layer-major k=%d ubatches=%zu groups=%zu superchunks=%zu state est (largest superchunk) %.1f MiB, pinned peak "
+                     "%.1f MiB graphs=%lld pulls=%lld (%.1f MiB) kept=%lld cut=%lld carry_copy_ms=%.2f\n", __func__, lm_k,
+                     n_ub, groups.size(), superchunks.size(), state_bytes_total/1048576.0, lm_pinned_peak/1048576.0,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 57cd253..1554e85 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -443,6 +443,8 @@ private:
+     int64_t  lm_cost_sync_us   = 0;
+     // P19 segment reserve probe (LLAMA_DSV4_LAYER_MAJOR_RESERVE=1): measure only, no alloc change
+     bool     lm_reserve_enable = false;
++    // P19 stage B: empty scheduler for layer-major call (LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED=1)
++    bool     lm_seg_sched_enable = false;
+ 
+     void lm_reserve_probe_at_load(
+             const llama_memory_context_i * mctx, uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs,
+@@ -453,6 +455,10 @@ private:
+             int32_t lm_l0, int32_t lm_l1, bool enc_only, int32_t yoco_lo, int32_t yoco_cut,
+             const llama_memory_context_i * mctx);
+ 
++    size_t lm_cuda0_sched_buffer() const;
++    size_t lm_cuda_pool_trim();
++    void   lm_sched_recreate_without_reserve();
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 

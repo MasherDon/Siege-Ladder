@@ -1,0 +1,63 @@
+From b4ea7d73ceb446aae2abc6204b15b8c6ff494b32 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:29:41 +0000
+Subject: [PATCH 094/112] model : SiegeLadder P20 step 2 - the output head's
+ bytes kept in RAM from its first release on (LLAMA_HEAD_HOST_COPY=0 - off):
+ P1's restore after a prompt is one copy to the card instead of a direct read
+ of the model file, which the expert stream keeps busy (134 ms of a turn's
+ 264, SiegeLadder runs.md 4.231). The copy is pageable (the pinned budget is
+ the host tier's), so the head still comes back at ~3-4 GB/s: head back
+ 205-228 -> 162-196 ms a turn (-35 ms; 0.36 GB of RAM)
+
+---
+ src/llama-model.cpp | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index e77a99b..0f8043f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1050,6 +1050,9 @@ struct llama_model::impl {
+     size_t                     head_file_offs = 0;
+     bool                       head_released  = false;
+     int32_t                    head_pins      = 0; // contexts that use the head on their own (head_pin)
++    // SiegeLadder P20 step 2 (LLAMA_HEAD_HOST_COPY=0 - off): the head's bytes kept in RAM from its first release on, so
++    // that it comes back as one copy to the card, not a direct read of the model file (head_restore)
++    std::vector<uint8_t>       head_host;
+ 
+     std::vector<float> tensor_split_owned;
+ };
+@@ -2400,6 +2403,17 @@ void llama_model::head_release() const {
+     if (!head_yield_ready() || pimpl->head_released || pimpl->head_pins > 0) {
+         return;
+     }
++    // SiegeLadder P20 step 2: on its first release the head is copied off the card into RAM (pageable: the pinned budget
++    // is the host tier's) - every restore after it is one copy back instead of a read from the drive, which the expert
++    // stream keeps busy and which held the read at ~2.7 GB/s (134 ms of a turn's 264 for a 0.36 GB head, runs.md 4.231)
++    static const bool host_copy = [] {
++        const char * s = getenv("LLAMA_HEAD_HOST_COPY");
++        return s == nullptr || atoi(s) != 0;
++    }();
++    if (host_copy && pimpl->head_host.empty()) {
++        pimpl->head_host.resize(ggml_nbytes(output));
++        ggml_backend_tensor_get(output, pimpl->head_host.data(), 0, pimpl->head_host.size());
++    }
+     // ggml_backend_tensor_alloc wants both null again, and a graph that still referenced the head would now fail
+     // loudly (gallocr would try to place 1.2 GiB in the compute buffer) instead of reading freed memory
+     output->data   = nullptr;
+@@ -2421,8 +2435,13 @@ bool llama_model::head_restore(double * t_read_ms) const {
+     ggml_backend_buffer_set_usage(hb, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+     const int64_t t0 = ggml_time_us();
+     ggml_tensor * t = output;
+-    const bool ok = pimpl->moe_stream->read_bytes((uint32_t) pimpl->head_file_idx, pimpl->head_file_offs, ggml_nbytes(t),
+-            [t](const uint8_t * data, size_t off, size_t n) { ggml_backend_tensor_set(t, data, off, n); });
++    bool ok = true;
++    if (pimpl->head_host.size() == ggml_nbytes(t)) {
++        ggml_backend_tensor_set(t, pimpl->head_host.data(), 0, pimpl->head_host.size()); // P20 step 2: the copy in RAM
++    } else {
++        ok = pimpl->moe_stream->read_bytes((uint32_t) pimpl->head_file_idx, pimpl->head_file_offs, ggml_nbytes(t),
++                [t](const uint8_t * data, size_t off, size_t n) { ggml_backend_tensor_set(t, data, off, n); });
++    }
+     if (t_read_ms) {
+         *t_read_ms = (ggml_time_us() - t0)/1000.0;
+     }

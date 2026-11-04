@@ -1,0 +1,1240 @@
+From e12d298399fa5af2a1ef04370d03144bb7fe94a1 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 04:22:56 +0000
+Subject: [PATCH 106/112] llama : SiegeLadder P19 stage A - layer-major
+ prefill, off by default (LLAMA_DSV4_LAYER_MAJOR=k,
+ LLAMA_DSV4_LAYER_MAJOR_GIB=8)
+
+V4.1 only. A prompt call of two or more ubatches (one sequence, causal, no embeddings, n_rs_seq 0) runs "group of k
+layers -> every ubatch of a superchunk" instead of "ubatch -> all layers"; groups break at the first decoder layer (20),
+superchunks hold what the ubatches carry within the GiB budget. Every graph (group, ubatch) computes what the whole
+graph did on the same data with the same P11 wave plan, so the output is the same byte for byte.
+
+- KV: a metadata pass applies every ubatch once and snapshots the DSV4 contexts (raw ring cells, base / swa indices,
+  comp i_cur / n_kv); lm_seek(u) restores ubatch u before each graph (llama-kv-cache-dsv4, llama-kv-cache seek / snap).
+- Graph (deepseek4): layers [lm_l0, lm_l1); a segment past layer 0 takes the stream, the mix, the top-k and the
+  candidate verdicts as inputs in the shapes and types the segment before exported; computed exports are graph outputs,
+  a segment's own input (or C7c's view of it) stays host-side; past the cut only the positions are cut; C14 never
+  crosses a segment; graph_last_moe is the segment's last MoE layer (P4: the encoder's last); P4's group ends without
+  an export.
+- Context: per-ubatch slots with separate in / out carries, a pinned host buffer per item grown by ggml_nbytes; set
+  only for inputs the segment's graph allocated; graph reuse off for segments (allow_reuse compares the bounds);
+  outputs and n_tokens_prev in the last group (P4: its group); the scheduler's sync inside the loop.
+- Inputs: the C7 raw mask is built directly when a decoder-only segment has no plain mask; P13 rows / mask / C7 mask
+  are each filled when present; engram's eager path skips layers outside the segment.
+
+Checked (SiegeLadder queue105, bench/p19_check.py, llama-logits --score-file, consult C text 32 000 + 16 tokens,
+-ub 2048, RAM tier 40 GiB): k = 1 and k = 4 equal k = 0 byte for byte at all 16 target positions in exact and in
+default without drops (P4 and the C7c cut exercised). Drafted by Cursor (composer-2.5) in SiegeLadder lab card L019,
+fixed by the lead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp       | 496 +++++++++++++++++++++++++++++++++++-
+ src/llama-context.h         |   8 +-
+ src/llama-cparams.h         |  22 ++
+ src/llama-graph.cpp         |  47 +++-
+ src/llama-graph.h           |   3 +
+ src/llama-kv-cache-dsv4.cpp | 116 +++++++++
+ src/llama-kv-cache-dsv4.h   |  48 ++++
+ src/llama-kv-cache.cpp      |  30 +++
+ src/llama-kv-cache.h        |  15 ++
+ src/models/deepseek4.cpp    | 106 +++++++-
+ 10 files changed, 866 insertions(+), 25 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1ff84b8..4201c7d 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,7 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-kv-cache-dsv4.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-stream.h"
+@@ -663,6 +664,19 @@ llama_context::llama_context(
+             d16_margin_mib = atoi(p);
+         }
+ 
++        // SiegeLadder P19 layer-major prefill
++        if (model.hparams.dsv4_v41) {
++            if (const char * lm = std::getenv("LLAMA_DSV4_LAYER_MAJOR")) {
++                lm_k = atoi(lm);
++            }
++            if (const char * gib = std::getenv("LLAMA_DSV4_LAYER_MAJOR_GIB")) {
++                const int v = atoi(gib);
++                if (v > 0) {
++                    lm_budget_gib = (uint32_t) v;
++                }
++            }
++        }
++
+         sched_reserve();
+ 
+         // P1: the -ub buffers are reserved only when the first long prompt comes. Probe them now, with the head
+@@ -2037,8 +2051,8 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
+-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+-    if (mctx && !mctx->apply()) {
++llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool skip_apply) {
++    if (mctx && !skip_apply && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+         return nullptr;
+@@ -2055,7 +2069,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // is reused only if no other build on this model (a reserve, another context) came after it
+     auto * mstream = model.moe_stream();
+     llama_moe_stream_nvtx_push("graph_reuse");
+-    const bool reuse = !graph_reuse_disable && (mstream == nullptr || res->ms_build == mstream->n_build) &&
++    const bool reuse = !graph_reuse_disable && cparams.dsv4_lm_carry_in == nullptr && cparams.dsv4_lm_carry_out == nullptr &&
++            (mstream == nullptr || res->ms_build == mstream->n_build) &&
+             res->can_reuse(gparams);
+     llama_moe_stream_nvtx_pop();
+ 
+@@ -2109,6 +2124,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     {
+         //const auto t_start_us = ggml_time_us();
+ 
++        // SiegeLadder P19: a segment's carried state into the input tensors its graph made for it
++        if (cparams.dsv4_lm_carry_in != nullptr) {
++            const int64_t t0 = ggml_time_us();
++            // an input no op of this segment reads (the top-k or the verdicts before a layer that makes its own, P4's
++            // last group) is left out of the graph and has no buffer - its bytes stay the slot's for the next segment
++            for (const auto & it : cparams.dsv4_lm_carry_in->v) {
++                if (it.t != nullptr && it.t->buffer != nullptr) {
++                    GGML_ASSERT(it.host != nullptr);
++                    ggml_backend_tensor_set(it.t, it.host, 0, ggml_nbytes(it.t));
++                }
++            }
++            lm_copy_us += ggml_time_us() - t0;
++        }
++
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         llama_moe_stream_nvtx_push("set_inputs");
+         res->set_inputs(&ubatch);
+@@ -2780,6 +2809,466 @@ int llama_context::decode(const llama_batch & batch_inp) {
+     int64_t yoco_row_call = 0;
+     int64_t yoco_cut_call = 0; // C7c: the rows cut out after the first decoder layer
+ 
++    bool layer_major_done = false;
++
++    if (lm_k > 0) {
++        const char * lm_off = nullptr;
++        auto * dctx = dynamic_cast<llama_kv_cache_dsv4_context *>(mctx.get());
++
++        if (!model.hparams.dsv4_v41) {
++            lm_off = "not V4.1";
++        } else if (dctx == nullptr) {
++            lm_off = "memory is not DSV4 batch context";
++        } else if (dctx->n_ubatches() < 2) {
++            lm_off = "fewer than 2 ubatches";
++        } else if (!cparams.causal_attn) {
++            lm_off = "not causal";
++        } else if (cparams.n_rs_seq != 0) {
++            lm_off = "n_rs_seq != 0";
++        } else if (cparams.embeddings || cparams.embeddings_nextn) {
++            lm_off = "embeddings request";
++        } else {
++            for (bool e : cparams.embeddings_layer_inp) {
++                if (e) {
++                    lm_off = "embeddings_layer_inp";
++                    break;
++                }
++            }
++        }
++
++        if (lm_off == nullptr) {
++            const llama_batch & b = balloc->get_batch();
++            llama_seq_id seq_ref = -1;
++            for (int32_t i = 0; i < b.n_tokens; ++i) {
++                if (b.n_seq_id[i] != 1) {
++                    lm_off = "coupled sequences";
++                    break;
++                }
++                const llama_seq_id s = b.seq_id[i][0];
++                if (seq_ref < 0) {
++                    seq_ref = s;
++                } else if (seq_ref != s) {
++                    lm_off = "multiple sequences";
++                    break;
++                }
++            }
++        }
++
++        if (lm_off != nullptr) {
++            // said only for a call that could have gone layer-major (more than one ubatch); a token's call is quiet
++            if (n_tokens_all > (int64_t) cparams.n_ubatch) {
++                LLAMA_LOG_INFO("%s: layer-major off (%s)\n", __func__, lm_off);
++            }
++        } else {
++            const int32_t n_layer  = model.hparams.n_layer();
++            const int32_t dec      = model.hparams.dsv4_dec_first();
++            const auto    groups   = [&]() {
++                std::vector<std::pair<int32_t, int32_t>> g;
++                int32_t l0 = 0;
++                while (l0 < n_layer) {
++                    int32_t l1 = l0 + lm_k;
++                    if (l0 < dec && l1 > dec) {
++                        l1 = dec;
++                    } else {
++                        l1 = std::min(l1, n_layer);
++                    }
++                    g.emplace_back(l0, l1);
++                    l0 = l1;
++                }
++                return g;
++            }();
++
++            const uint64_t budget_bytes = (uint64_t) lm_budget_gib*1024ull*1024*1024;
++            const size_t   n_ub         = dctx->n_ubatches();
++            const int64_t  hc_m         = model.hparams.dsv4_hc_mult;
++            const int64_t  n_embd_m     = model.hparams.n_embd;
++
++            // the state a ubatch carries between groups, estimated before any graph runs (the slots take what the graphs
++            // export, see lm_slot_pull): the stream (n_embd x hc f32), the mix (hc f32), the top-k (indexer_top_k i32)
++            // and the candidate verdicts - one f32 per block of the densest compressed cache the ubatch's last position
++            // reaches, plus that cache's padding
++            uint32_t ratio_min = 0;
++            for (int32_t il = 0; il < n_layer; ++il) {
++                const uint32_t r = model.hparams.dsv4_compress_ratios[il];
++                if (r > 0 && (ratio_min == 0 || r < ratio_min)) {
++                    ratio_min = r;
++                }
++            }
++            const uint64_t cand_block = model.hparams.dsv4_candidate_block_size;
++            auto lm_state_bytes = [&](const llama_ubatch & ub) -> uint64_t {
++                llama_pos p_max = 0;
++                for (uint32_t i = 0; i < ub.n_tokens; ++i) {
++                    p_max = std::max(p_max, ub.pos[i]);
++                }
++                uint64_t per_pos = 4*(uint64_t) (hc_m*n_embd_m) + 4*(uint64_t) hc_m + 4*(uint64_t) model.hparams.indexer_top_k;
++                if (cand_block > 0 && ratio_min > 0) {
++                    per_pos += 4*((uint64_t) (p_max + 1)/ratio_min/cand_block + 256);
++                }
++                return per_pos*(uint64_t) ub.n_tokens;
++            };
++
++            std::vector<std::pair<size_t, size_t>> superchunks;
++            for (size_t u0 = 0; u0 < n_ub;) {
++                size_t u1 = u0;
++                uint64_t acc = 0;
++                while (u1 < n_ub) {
++                    const uint64_t add = lm_state_bytes(dctx->lm_ubatch(u1));
++                    if (u1 > u0 && acc + add > budget_bytes) {
++                        break;
++                    }
++                    acc += add;
++                    ++u1;
++                }
++                if (u1 == u0) {
++                    ++u1;
++                }
++                superchunks.emplace_back(u0, u1);
++                u0 = u1;
++            }
++
++            bool any_multi_ub_sc = false;
++            for (const auto & sc : superchunks) {
++                if (sc.second - sc.first >= 2) {
++                    any_multi_ub_sc = true;
++                    break;
++                }
++            }
++
++            if (!any_multi_ub_sc) {
++                LLAMA_LOG_INFO("%s: layer-major off (superchunks are single-ubatch under %u GiB budget)\n", __func__,
++                        lm_budget_gib);
++            } else {
++            dctx->lm_metadata_pass();
++            lm_copy_us = 0;
++
++            ggml_backend_buffer_type_t lm_host_buft = nullptr;
++            for (auto & backend : backends) {
++                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
++                if (dev != nullptr) {
++                    lm_host_buft = ggml_backend_dev_host_buffer_type(dev);
++                    if (lm_host_buft != nullptr) {
++                        break;
++                    }
++                }
++            }
++            if (lm_host_buft == nullptr) {
++                LLAMA_LOG_INFO("%s: layer-major off (no pinned host buffer type)\n", __func__);
++            } else {
++            struct lm_ub_plan {
++                int32_t  n_out     = 0;
++                bool     enc_only  = false;
++                int32_t  yoco_lo   = -1;
++                int32_t  yoco_cut  = 0;
++                int64_t  yoco_row0 = 0;
++            };
++            std::vector<lm_ub_plan> ub_plans(n_ub);
++            for (size_t u = 0; u < n_ub; ++u) {
++                dctx->lm_seek(u);
++                const llama_ubatch & ub = dctx->get_ubatch();
++                lm_ub_plan &         p   = ub_plans[u];
++                if (n_outputs_all == n_tokens_all) {
++                    p.n_out = ub.n_tokens;
++                } else {
++                    for (uint32_t i = 0; i < ub.n_tokens; i++) {
++                        p.n_out += (int32_t) (ub.output[i] != 0);
++                    }
++                }
++                p.enc_only = p4_enc_only(ub);
++                if (yoco_k > 0 && !p.enc_only) {
++                    p.yoco_lo = yoco_ubatch_lo(ub, p.yoco_row0);
++                    if (yoco_nobound) {
++                        p.yoco_lo = -1;
++                    }
++                    p.yoco_row0 = yoco_rows ? p.yoco_row0 : 0;
++                    if (yoco_cut && p.yoco_lo >= 0 && p.yoco_row0 > 0 &&
++                            (int64_t) ub.n_tokens - p.yoco_row0 >= yoco_cut_min) {
++                        bool out_before = false;
++                        for (int64_t i = 0; i < p.yoco_row0 && !out_before; ++i) {
++                            out_before = ub.output[i] != 0;
++                        }
++                        if (!out_before) {
++                            p.yoco_cut = (int32_t) p.yoco_row0;
++                        }
++                    }
++                }
++            }
++
++            // one slot per ubatch of a superchunk: in - what the next group's graph reads (host bytes, shape, type; the
++            // graph fills in its input tensors), out - the tensors the group's graph exported. Each item has a pinned
++            // host buffer of its own, which grows as the item does (the candidate verdicts widen with the position)
++            using lm_carry = llama_cparams::llama_dsv4_lm_carry;
++            struct lm_carry_slot {
++                ggml_backend_buffer_ptr buf[lm_carry::N];
++                size_t                  cap[lm_carry::N] = {};
++                lm_carry                in;
++                lm_carry                out;
++            };
++            size_t  lm_pinned      = 0; // pinned host bytes the slots hold
++            size_t  lm_pinned_peak = 0;
++            int64_t lm_n_pull = 0, lm_n_keep = 0, lm_n_cut = 0;
++            int64_t lm_pull_bytes = 0;
++
++            // after a group's graph: what it exported becomes the slot's state - a computed tensor is read from its
++            // backend; the graph's own input is the slot's bytes already; a view of one (C7c's cut) is its rows moved
++            // to the front of those bytes
++            auto lm_slot_pull = [&](lm_carry_slot & s) {
++                for (int k = 0; k < lm_carry::N; ++k) {
++                    auto &        in = s.in.v[k];
++                    ggml_tensor * t  = s.out.v[k].t;
++                    s.out.v[k].t = nullptr;
++                    if (t == nullptr) {
++                        in = {};
++                        continue;
++                    }
++                    GGML_ASSERT(ggml_is_contiguous(t));
++                    const size_t nb = ggml_nbytes(t);
++                    if (in.t != nullptr && t == in.t) {
++                        lm_n_keep++;
++                    } else if (in.t != nullptr && t->view_src == in.t) {
++                        GGML_ASSERT(t->view_offs + nb <= ggml_nbytes(in.t));
++                        memmove(in.host, (char *) in.host + t->view_offs, nb);
++                        lm_n_cut++;
++                    } else {
++                        for (const auto & o : s.in.v) {
++                            GGML_ASSERT(o.t == nullptr || (t != o.t && t->view_src != o.t));
++                        }
++                        if (nb > s.cap[k]) {
++                            lm_pinned -= s.cap[k];
++                            s.buf[k].reset(ggml_backend_buft_alloc_buffer(lm_host_buft, nb));
++                            GGML_ASSERT(s.buf[k] && "P19: no pinned host memory for the carried state");
++                            s.cap[k]        = nb;
++                            lm_pinned      += nb;
++                            lm_pinned_peak  = std::max(lm_pinned_peak, lm_pinned);
++                        }
++                        in.host = ggml_backend_buffer_get_base(s.buf[k].get());
++                        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++                        GGML_ASSERT(be != nullptr);
++                        ggml_backend_tensor_get_async(be, t, in.host, 0, nb);
++                        lm_n_pull++;
++                        lm_pull_bytes += (int64_t) nb;
++                    }
++                    in.type = t->type;
++                    for (int j = 0; j < 4; ++j) {
++                        in.ne[j] = t->ne[j];
++                    }
++                }
++                for (auto & it : s.in.v) {
++                    it.t = nullptr;
++                }
++            };
++
++            int64_t n_graphs = 0;
++            uint64_t state_bytes_total = 0;
++
++            auto run_ubatch_outputs = [&](const llama_ubatch & ubatch, int32_t n_out, llm_graph_result * res) -> int {
++                if (!res) {
++                    return -3;
++                }
++                n_outputs = n_out;
++
++                auto * t_logits  = res->get_logits();
++                auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
++                auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
++
++                if (t_embd && res->get_embd_pooled()) {
++                    t_embd = res->get_embd_pooled();
++                }
++
++                if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
++                    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++                    GGML_ASSERT(backend_res != nullptr);
++                    float * logits_out = logits.data + n_outputs_prev*n_vocab;
++                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
++                }
++
++                if (cparams.head_out && n_outputs > 0) {
++                    ggml_tensor * t_h = res->get_embd();
++                    GGML_ASSERT(t_h != nullptr && t_h->ne[0] == p1_n_embd && t_h->ne[1] == n_outputs);
++                    ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h);
++                    ggml_backend_tensor_get_async(backend_h, t_h, p1_hidden.data() + n_outputs_prev*p1_n_embd, 0,
++                            n_outputs*p1_n_embd*sizeof(float));
++                    p1_groups.emplace_back(n_outputs_prev, n_outputs);
++                }
++
++                n_outputs_prev += n_outputs;
++                n_tokens_prev  += ubatch.n_tokens;
++                return 0;
++            };
++
++            auto run_ubatch_full = [&](size_t u) -> int {
++                dctx->lm_seek(u);
++                const llama_ubatch & ubatch = dctx->get_ubatch();
++                const lm_ub_plan &   p      = ub_plans[u];
++                n_ub_call++;
++
++                n_outputs = p.n_out;
++                cparams.dsv4_enc_only = p.enc_only;
++                if (p.enc_only) {
++                    p4_ub_call++;
++                    p4_tok_call += ubatch.n_tokens;
++                }
++                cparams.dsv4_yoco_lo  = p.yoco_lo;
++                cparams.dsv4_yoco_cut = p.yoco_cut;
++                auto * yoco_ms = yoco_k > 0 ? model.moe_stream() : nullptr;
++                if (yoco_ms) {
++                    yoco_ms->c7_row0   = p.yoco_row0;
++                    yoco_ms->c7_layer0 = model.hparams.dsv4_dec_first();
++                    yoco_ms->c7_layer1 = p.yoco_cut > 0 ? model.hparams.dsv4_dec_first() + 1 : -1;
++                    if (p.yoco_lo >= 0) {
++                        yoco_ub_call++;
++                    }
++                    yoco_row_call += p.yoco_row0;
++                    if (p.yoco_cut > 0) {
++                        yoco_cut_call += p.yoco_cut;
++                    }
++                }
++
++                cparams.dsv4_lm_l0 = -1;
++                cparams.dsv4_lm_l1 = -1;
++                cparams.dsv4_lm_carry_in  = nullptr;
++                cparams.dsv4_lm_carry_out = nullptr;
++
++                ggml_status status = GGML_STATUS_SUCCESS;
++                llm_graph_result * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, true);
++
++                cparams.dsv4_enc_only = false;
++                cparams.dsv4_yoco_lo  = -1;
++                cparams.dsv4_yoco_cut = 0;
++                if (yoco_ms) {
++                    yoco_ms->c7_row0   = 0;
++                    yoco_ms->c7_layer1 = -1;
++                }
++
++                if (!res) {
++                    return -3;
++                }
++                return run_ubatch_outputs(ubatch, p.n_out, res);
++            };
++
++            std::vector<lm_carry_slot> slots;
++            for (const auto & sc : superchunks) {
++                if (sc.second - sc.first < 2) {
++                    if (run_ubatch_full(sc.first) != 0) {
++                        return -3;
++                    }
++                    continue;
++                }
++
++                const size_t n_sc = sc.second - sc.first;
++                if (slots.size() < n_sc) {
++                    slots.resize(n_sc);
++                }
++                uint64_t sc_est = 0;
++                for (size_t i = 0; i < n_sc; ++i) {
++                    slots[i].in  = {};
++                    slots[i].out = {};
++                    sc_est += lm_state_bytes(dctx->lm_ubatch(sc.first + i));
++                }
++                state_bytes_total = std::max(state_bytes_total, sc_est);
++                std::vector<bool> ub_counted(n_sc, false);
++
++                for (const auto & gr : groups) {
++                    const bool last_group = gr.second >= n_layer;
++                    for (size_t i = 0; i < n_sc; ++i) {
++                        const size_t       u = sc.first + i;
++                        const lm_ub_plan & p = ub_plans[u];
++                        // P4: an encoder-only ubatch ends with the source part of the first decoder layer - in the group
++                        // that starts there (the groups break at it), with nothing to carry on
++                        if (p.enc_only && gr.first > dec) {
++                            continue;
++                        }
++                        const bool p4_end = p.enc_only && gr.first <= dec && dec < gr.second;
++
++                        dctx->lm_seek(u);
++                        const llama_ubatch & ubatch = dctx->get_ubatch();
++                        if (!ub_counted[i]) {
++                            ub_counted[i] = true;
++                            n_ub_call++;
++                            if (p.enc_only) {
++                                p4_ub_call++;
++                                p4_tok_call += ubatch.n_tokens;
++                            }
++                            if (p.yoco_lo >= 0) {
++                                yoco_ub_call++;
++                            }
++                            yoco_row_call += p.yoco_row0;
++                            if (p.yoco_cut > 0) {
++                                yoco_cut_call += p.yoco_cut;
++                            }
++                        }
++
++                        n_outputs = p.n_out;
++                        cparams.dsv4_enc_only = p.enc_only;
++                        cparams.dsv4_yoco_lo  = p.yoco_lo;
++                        cparams.dsv4_yoco_cut = p.yoco_cut;
++                        auto * yoco_ms = yoco_k > 0 ? model.moe_stream() : nullptr;
++                        if (yoco_ms) {
++                            yoco_ms->c7_row0   = p.yoco_row0;
++                            yoco_ms->c7_layer0 = model.hparams.dsv4_dec_first();
++                            yoco_ms->c7_layer1 = p.yoco_cut > 0 ? model.hparams.dsv4_dec_first() + 1 : -1;
++                        }
++
++                        const bool carry_on = !last_group && !p4_end;
++                        slots[i].out = {};
++                        cparams.dsv4_lm_l0        = gr.first;
++                        cparams.dsv4_lm_l1        = gr.second;
++                        cparams.dsv4_lm_carry_in  = gr.first > 0 ? &slots[i].in  : nullptr;
++                        cparams.dsv4_lm_carry_out = carry_on     ? &slots[i].out : nullptr;
++
++                        ggml_status         status = GGML_STATUS_SUCCESS;
++                        llm_graph_result * res     = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
++                                mctx.get(), status, true);
++                        ++n_graphs;
++
++                        cparams.dsv4_enc_only     = false;
++                        cparams.dsv4_yoco_lo      = -1;
++                        cparams.dsv4_yoco_cut     = 0;
++                        cparams.dsv4_lm_l0        = -1;
++                        cparams.dsv4_lm_l1        = -1;
++                        cparams.dsv4_lm_carry_in  = nullptr;
++                        cparams.dsv4_lm_carry_out = nullptr;
++                        if (yoco_ms) {
++                            yoco_ms->c7_row0   = 0;
++                            yoco_ms->c7_layer1 = -1;
++                        }
++
++                        if (!res) {
++                            return -3;
++                        }
++
++                        if (carry_on) {
++                            // the graph first, then the copies alone (carry_copy_ms counts these and set_inputs' copies);
++                            // the scheduler's own wait - llama_context::synchronize() would close the call's timing
++                            ggml_backend_sched_synchronize(sched.get());
++                            const int64_t t0 = ggml_time_us();
++                            lm_slot_pull(slots[i]);
++                            ggml_backend_sched_synchronize(sched.get());
++                            lm_copy_us += ggml_time_us() - t0;
++                        } else {
++                            for (auto & it : slots[i].in.v) {
++                                it = {};
++                            }
++                            if (run_ubatch_outputs(ubatch, p.n_out, res) != 0) {
++                                return -3;
++                            }
++                        }
++                    }
++                }
++            }
++
++            LLAMA_LOG_INFO("%s: layer-major k=%d ubatches=%zu groups=%zu superchunks=%zu state est (largest superchunk) %.1f MiB, pinned peak "
++                    "%.1f MiB graphs=%lld pulls=%lld (%.1f MiB) kept=%lld cut=%lld carry_copy_ms=%.2f\n", __func__, lm_k,
++                    n_ub, groups.size(), superchunks.size(), state_bytes_total/1048576.0, lm_pinned_peak/1048576.0,
++                    (long long) n_graphs, (long long) lm_n_pull, lm_pull_bytes/1048576.0, (long long) lm_n_keep,
++                    (long long) lm_n_cut, lm_copy_us/1000.0);
++
++            layer_major_done = true;
++            }
++            }
++        }
++    }
++
++    if (!layer_major_done) {
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+         n_ub_call++;
+@@ -3019,6 +3508,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         n_outputs_prev += n_outputs;
+         n_tokens_prev  += ubatch.n_tokens;
+     } while (mctx->next());
++    }
+ 
+     if (p4_ub_call > 0) {
+         p4_n_ubatch += p4_ub_call;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 1eecd6e..d25c61c 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -140,7 +140,8 @@ struct llama_context {
+                 const llama_ubatch & ubatch,
+                     llm_graph_type   gtype,
+             llama_memory_context_i * mctx,
+-                       ggml_status & ret);
++                       ggml_status & ret,
++                           bool       skip_apply = false);
+ 
+     int encode(const llama_batch & batch_inp);
+     int decode(const llama_batch & batch_inp);
+@@ -428,6 +429,11 @@ private:
+     int64_t  yoco_n_calls = 0;             // calls with the bound active so far
+     int32_t  yoco_ubatch_lo(const llama_ubatch & ubatch, int64_t & row0) const;
+ 
++    // SiegeLadder P19 layer-major prefill (LLAMA_DSV4_LAYER_MAJOR=k)
++    int32_t  lm_k          = 0;    // 0 = off
++    uint32_t lm_budget_gib = 8;  // LLAMA_DSV4_LAYER_MAJOR_GIB
++    int64_t  lm_copy_us    = 0;    // P19: time of the carried state's copies (set_inputs and pulls), per decode call
++
+     ggml_backend_t backend_cpu = nullptr;
+     std::vector<ggml_backend_ptr> backends;
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index df38696..9886a6f 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -64,6 +64,28 @@ struct llama_cparams {
+     // SiegeLadder D12: the compute buffers hold the non-sparse plan only for positions below this (0 - for all)
+     uint32_t dsv4_dense_cap = 0;
+ 
++    // SiegeLadder P19 layer-major prefill: graph runs layers [dsv4_lm_l0, dsv4_lm_l1); -1 = full model span on that bound
++    int32_t dsv4_lm_l0 = -1;
++    int32_t dsv4_lm_l1 = -1;
++
++    // Host-side carry buffers for segment graphs (filled by llama_context between layer groups)
++    // what crosses a segment boundary: the hc stream (inpL), the mix the last FFN carried (hc_carry_v), the top-k of the
++    // last index source (topk_carry_v) and the candidate verdicts (cand_carry_v) - each as the graph had it at the
++    // boundary (C7c: past the cut, its rows from the cut). The input side holds the bytes in pinned host memory with
++    // their shape and type; the output side holds the tensors the segment exported
++    struct llama_dsv4_lm_carry {
++        enum { H = 0, HC, TOPK, CAND, N };
++        struct item {
++            void *        host  = nullptr;
++            ggml_type     type  = GGML_TYPE_F32;
++            int64_t       ne[4] = { 0, 0, 0, 0 }; // ne[0] == 0: not carried
++            ggml_tensor * t     = nullptr;        // the graph's input (carry_in) or its export (carry_out)
++        } v[N];
++    };
++
++    llama_dsv4_lm_carry * dsv4_lm_carry_in  = nullptr;
++    llama_dsv4_lm_carry * dsv4_lm_carry_out = nullptr;
++
+     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+ 
+     enum llama_context_type ctx_type;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 093a361..0178f29 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -326,6 +326,9 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+     const llama_moe_stream_nvtx_range nvtx_engram("engram"); // SiegeLadder G26: its share of set_inputs under Nsight
+ 
+     for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++        if (kv[e]->buffer == nullptr) {
++            continue; // SiegeLadder P19: a layer segment without this engram layer leaves its rows out of the graph
++        }
+         fill_layer(e, buf.data(), *ubatch);
+         ggml_backend_tensor_set(kv[e], buf.data(), 0, row*n_tokens*sizeof(float));
+     }
+@@ -1996,7 +1999,16 @@ static std::string dsv4_p13_list(const std::vector<int64_t> & values) {
+ // the mask follows the rules of the whole-ring mask (llama_kv_cache::set_input_kq_mask, causal, standard SWA)
+ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_ubatch & ubatch) {
+     const auto & plan = inp.p13;
+-    if (plan.n_chunk == 0 || !inp.p13_rows || !inp.p13_rows->buffer || !inp.p13_mask || !inp.p13_mask->buffer) {
++    if (plan.n_chunk == 0 || !inp.p13_rows || !inp.p13_mask) {
++        return;
++    }
++    // SiegeLadder P19: a layer segment's graph may hold the rows and the plain mask (encoder layers), the rows and C7's
++    // copy (decoder layers past the bound), or all three - each is filled when its graph has it; the copy is made from
++    // the plain mask's values, computed here even when the plain mask itself is not in the graph
++    const bool has_rows = inp.p13_rows->buffer != nullptr;
++    const bool has_mask = inp.p13_mask->buffer != nullptr;
++    const bool has_m7   = inp.c7_p13_mask && inp.c7_p13_mask->buffer && inp.c7_lo >= 0;
++    if (!has_rows && !has_mask && !has_m7) {
+         return;
+     }
+ 
+@@ -2006,8 +2018,8 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+     GGML_ASSERT(plan.t0.back() == nt);
+     GGML_ASSERT(inp.p13_rows->type == GGML_TYPE_I32 && inp.p13_rows->ne[0] == raw_len*plan.n_chunk);
+     GGML_ASSERT(inp.p13_mask->type == GGML_TYPE_F16 && inp.p13_mask->ne[0] == raw_len && inp.p13_mask->ne[1] == nt);
+-    GGML_ASSERT(ggml_backend_buffer_is_host(inp.p13_rows->buffer));
+-    GGML_ASSERT(ggml_backend_buffer_is_host(inp.p13_mask->buffer));
++    GGML_ASSERT(!has_rows || ggml_backend_buffer_is_host(inp.p13_rows->buffer));
++    GGML_ASSERT(!has_mask || ggml_backend_buffer_is_host(inp.p13_mask->buffer));
+ 
+     const llama_kv_cache_dsv4_raw_context * raw = inp.mctx->get_raw();
+ 
+@@ -2016,13 +2028,14 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+     const int64_t          off    = (int64_t) raw->get_stream()*raw->get_size();
+     const llama_pos        n_swa  = (llama_pos) inp.p13_n_swa;
+ 
+-    int32_t     * rows = (int32_t     *) inp.p13_rows->data;
+-    ggml_fp16_t * mask = (ggml_fp16_t *) inp.p13_mask->data;
++    int32_t     * rows = has_rows ? (int32_t     *) inp.p13_rows->data : nullptr;
++    ggml_fp16_t * mask = has_mask ? (ggml_fp16_t *) inp.p13_mask->data : nullptr;
++    std::vector<ggml_fp16_t> mask_row(has_mask ? 0 : (size_t) raw_len); // P19: the plain row when the mask is not in the graph
+ 
+     // SiegeLadder C7: the decoder layers' chunk mask with the bound, filled in the same pass (see c7_lo)
+     ggml_fp16_t *   mask7 = nullptr;
+     const llama_pos lo7   = inp.c7_lo;
+-    if (inp.c7_p13_mask && inp.c7_p13_mask->buffer && lo7 >= 0) {
++    if (has_m7) {
+         GGML_ASSERT(inp.c7_p13_mask->type == GGML_TYPE_F16 && ggml_nbytes(inp.c7_p13_mask) == ggml_nbytes(inp.p13_mask));
+         GGML_ASSERT(ggml_backend_buffer_is_host(inp.c7_p13_mask->buffer));
+         mask7 = (ggml_fp16_t *) inp.c7_p13_mask->data;
+@@ -2076,10 +2089,14 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+         for (int64_t r = 0; r < raw_len; ++r) {
+             if (r < n_rows) {
+                 const uint32_t j = cell[r];
+-                rows[c*raw_len + r] = (int32_t) (off + j);
++                if (rows) {
++                    rows[c*raw_len + r] = (int32_t) (off + j);
++                }
+                 cell_pos[r] = !cells.is_empty(j) && cells.seq_has(j, seq_id) ? cells.pos_get(j) : -1;
+             } else {
+-                rows[c*raw_len + r] = (int32_t) (off + (n_rows > 0 ? cell[0] : 0));
++                if (rows) {
++                    rows[c*raw_len + r] = (int32_t) (off + (n_rows > 0 ? cell[0] : 0));
++                }
+                 cell_pos[r] = -1;
+             }
+         }
+@@ -2087,7 +2104,7 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+         // a cell of the token's sequence, not after it, inside its window: p1 - p0 < n_swa (is_masked_swa, standard)
+         for (int64_t i = i0; i < i1; ++i) {
+             const llama_pos p1 = ubatch.pos[i];
+-            ggml_fp16_t * m = mask + i*raw_len;
++            ggml_fp16_t * m = mask ? mask + i*raw_len : mask_row.data();
+             for (int64_t r = 0; r < raw_len; ++r) {
+                 const llama_pos p0 = cell_pos[r];
+                 m[r] = p0 >= 0 && p0 <= p1 && p1 - p0 < n_swa ? f16_zero : f16_ninf;
+@@ -2250,10 +2267,16 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+     // bound for every query at or past it (one stream: the columns are the cells of the ubatch's sequence's ring)
+     if (c7_raw_mask && c7_raw_mask->buffer && c7_lo >= 0) {
+         const ggml_tensor * src = inp_raw->self_kq_mask;
+-        GGML_ASSERT(src && src->buffer && src->type == c7_raw_mask->type && ggml_nbytes(src) == ggml_nbytes(c7_raw_mask));
+-        GGML_ASSERT(ggml_backend_buffer_is_host(src->buffer) && ggml_backend_buffer_is_host(c7_raw_mask->buffer));
++        GGML_ASSERT(src && src->type == c7_raw_mask->type && ggml_nbytes(src) == ggml_nbytes(c7_raw_mask));
++        GGML_ASSERT(ggml_backend_buffer_is_host(c7_raw_mask->buffer));
+         GGML_ASSERT(c7_raw_mask->ne[3] == 1);
+-        memcpy(c7_raw_mask->data, src->data, ggml_nbytes(src));
++        if (src->buffer != nullptr) {
++            GGML_ASSERT(ggml_backend_buffer_is_host(src->buffer));
++            memcpy(c7_raw_mask->data, src->data, ggml_nbytes(src));
++        } else {
++            // SiegeLadder P19: a layer segment of decoder layers only has no reader of the plain mask - made here
++            inp_raw->mctx->set_input_kq_mask(c7_raw_mask, ubatch, inp_raw->cparams.causal_attn);
++        }
+ 
+         const llama_kv_cells & cells = mctx->get_raw()->get_cells(ubatch->seq_id[0][0]);
+         const int64_t          n_kv  = c7_raw_mask->ne[0];
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 298313a..9104ecc 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1076,6 +1076,9 @@ struct llm_graph_params {
+             (cparams.dsv4_yoco_lo >= 0)     == (other.cparams.dsv4_yoco_lo >= 0)     &&
+             // SiegeLadder C7c: the cut is the decoder's row count
+             cparams.dsv4_yoco_cut           == other.cparams.dsv4_yoco_cut           &&
++            // SiegeLadder P19: layer segment bounds
++            cparams.dsv4_lm_l0              == other.cparams.dsv4_lm_l0              &&
++            cparams.dsv4_lm_l1              == other.cparams.dsv4_lm_l1              &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index cbec0f0..6e686df 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -2392,3 +2392,119 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+ 
+     return reserve_plan_lid;
+ }
++
++//
++// SiegeLadder P19: layer-major KV seek / snapshot
++//
++
++void llama_kv_cache_dsv4_raw_context::lm_set_index(size_t u) {
++    GGML_ASSERT(u < ubatches.size());
++    i_next = u;
++    if (ctx_base_mem) {
++        if (auto * c = dynamic_cast<llama_kv_cache_context *>(ctx_base_mem.get())) {
++            c->seek(u);
++        }
++    }
++    if (ctx_swa_mem) {
++        if (auto * c = dynamic_cast<llama_kv_cache_context *>(ctx_swa_mem.get())) {
++            c->seek(u);
++        }
++    }
++}
++
++void llama_kv_cache_dsv4_raw_context::lm_snap(llama_dsv4_lm_snap & s) const {
++    s.cells_swa = kv_swa->cells_snapshot();
++    s.n_kv_raw  = n_kv;
++
++    if (ctx_base_mem) {
++        if (auto * c = dynamic_cast<llama_kv_cache_context *>(ctx_base_mem.get())) {
++            s.base_ub = c->ubatch_index();
++        }
++    }
++
++    if (ctx_swa_mem) {
++        if (auto * c = dynamic_cast<llama_kv_cache_context *>(ctx_swa_mem.get())) {
++            s.swa_ub = c->ubatch_index();
++        }
++    }
++}
++
++void llama_kv_cache_dsv4_raw_context::lm_restore(const llama_dsv4_lm_snap & s) {
++    kv_swa->cells_restore(s.cells_swa);
++    n_kv = s.n_kv_raw;
++
++    if (ctx_base_mem) {
++        if (auto * c = dynamic_cast<llama_kv_cache_context *>(ctx_base_mem.get())) {
++            c->seek(s.base_ub);
++        }
++    }
++
++    if (ctx_swa_mem) {
++        if (auto * c = dynamic_cast<llama_kv_cache_context *>(ctx_swa_mem.get())) {
++            c->seek(s.swa_ub);
++        }
++    }
++}
++
++void llama_kv_cache_dsv4_comp_context::lm_set_index(size_t u) {
++    if (ubatches.empty()) {
++        return;
++    }
++
++    GGML_ASSERT(u < ubatches.size());
++    i_cur = u;
++}
++
++void llama_kv_cache_dsv4_comp_context::lm_snap(llama_dsv4_lm_snap::comp_snap & s) const {
++    s.i_cur = i_cur;
++    s.n_kv  = n_kv;
++}
++
++void llama_kv_cache_dsv4_comp_context::lm_restore(const llama_dsv4_lm_snap::comp_snap & s) {
++    i_cur = s.i_cur;
++    n_kv  = s.n_kv;
++}
++
++void llama_kv_cache_dsv4_context::lm_seek_raw(size_t u) {
++    i_next = u;
++    ctx_raw->lm_set_index(u);
++    ctx_csa->lm_set_index(u);
++    ctx_hca->lm_set_index(u);
++    ctx_lid->lm_set_index(u);
++}
++
++void llama_kv_cache_dsv4_context::lm_restore_raw(const llama_dsv4_lm_snap & s) {
++    ctx_raw->lm_restore(s);
++    ctx_csa->lm_restore(s.csa);
++    ctx_hca->lm_restore(s.hca);
++    ctx_lid->lm_restore(s.lid);
++}
++
++void llama_kv_cache_dsv4_context::lm_snap_after_apply(size_t u, llama_dsv4_lm_snap & dst) const {
++    GGML_ASSERT(u < ubatches.size());
++    (void) u;
++    ctx_raw->lm_snap(dst);
++    ctx_csa->lm_snap(dst.csa);
++    ctx_hca->lm_snap(dst.hca);
++    ctx_lid->lm_snap(dst.lid);
++}
++
++void llama_kv_cache_dsv4_context::lm_metadata_pass() {
++    if (ubatches.empty()) {
++        return;
++    }
++
++    lm_snaps.assign(ubatches.size(), {});
++
++    for (size_t u = 0; u < ubatches.size(); ++u) {
++        lm_seek_raw(u);
++        apply();
++        lm_snap_after_apply(u, lm_snaps[u]);
++    }
++}
++
++void llama_kv_cache_dsv4_context::lm_seek(size_t u) {
++    GGML_ASSERT(u < lm_snaps.size());
++    lm_seek_raw(u);
++    lm_restore_raw(lm_snaps[u]);
++}
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index 696d5e8..1abf2b2 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -205,6 +205,25 @@ private:
+     void clear_compressed(llama_seq_id seq_id, bool data);
+ };
+ 
++class llama_kv_cache_dsv4_context;
++
++// SiegeLadder P19: per-ubatch KV metadata snapshot for layer-major seek
++struct llama_dsv4_lm_snap {
++    size_t   base_ub = 0; // ctx_base_mem / ctx_swa_mem ubatch index only (no 1M-cell snap)
++    size_t   swa_ub  = 0;
++    llama_kv_cells_vec                                  cells_swa;
++    uint32_t                                            n_kv_raw = 0;
++
++    struct comp_snap {
++        size_t   i_cur = 0;
++        uint32_t n_kv  = 0;
++    };
++
++    comp_snap csa;
++    comp_snap hca;
++    comp_snap lid;
++};
++
+ // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept
+ // for generic ISWA bookkeeping, but it has no DSV4 layers to expose here.
+ class llama_kv_cache_dsv4_raw_context : public llama_memory_context_i {
+@@ -251,6 +270,10 @@ public:
+     ggml_type get_type_k() const;
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
++    void lm_set_index(size_t u);
++    void lm_snap(llama_dsv4_lm_snap & s) const;
++    void lm_restore(const llama_dsv4_lm_snap & s);
++
+ private:
+     size_t i_next = 0;
+ 
+@@ -292,6 +315,10 @@ public:
+     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
+     void set_input_k_rot(ggml_tensor * dst) const;
+ 
++    void lm_set_index(size_t u);
++    void lm_snap(llama_dsv4_lm_snap::comp_snap & s) const;
++    void lm_restore(const llama_dsv4_lm_snap::comp_snap & s);
++
+ private:
+     llama_kv_cache * kv;
+ 
+@@ -413,6 +440,27 @@ public:
+     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
+     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
+ 
++    //
++    // SiegeLadder P19 layer-major prefill
++    //
++
++    size_t n_ubatches() const { return ubatches.size(); }
++    // the u-th ubatch of the call without moving to it (its size and positions only: no metadata is applied)
++    const llama_ubatch & lm_ubatch(size_t u) const { return ubatches[u]; }
++
++    void lm_metadata_pass();
++    void lm_seek(size_t u);
++    void lm_snap_after_apply(size_t u, llama_dsv4_lm_snap & dst) const;
++
++private:
++    friend class llama_kv_cache_dsv4_raw_context;
++    friend class llama_kv_cache_dsv4_comp_context;
++
++    void lm_seek_raw(size_t u);
++    void lm_restore_raw(const llama_dsv4_lm_snap & s);
++
++    std::vector<llama_dsv4_lm_snap> lm_snaps;
++
+ private:
+     size_t i_next = 0;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 3560a4c..0e07bf8 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1230,6 +1230,17 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+     return v_cells[seq_to_stream[seq_id]];
+ }
+ 
++llama_kv_cells_vec llama_kv_cache::cells_snapshot() const {
++    return *v_cells_impl;
++}
++
++void llama_kv_cache::cells_restore(const llama_kv_cells_vec & snap) {
++    GGML_ASSERT(snap.size() == v_cells.size());
++    for (size_t i = 0; i < v_cells.size(); ++i) {
++        v_cells[i] = snap[i];
++    }
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+@@ -2578,6 +2589,25 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
+     return n_kv;
+ }
+ 
++llama_kv_cache_context::llama_kv_cache_context_snap llama_kv_cache_context::snap() const {
++    llama_kv_cache_context_snap s;
++    s.i_cur  = i_cur;
++    s.n_kv   = n_kv;
++    s.cells  = kv->cells_snapshot();
++    return s;
++}
++
++void llama_kv_cache_context::restore(const llama_kv_cache_context_snap & s) {
++    i_cur = s.i_cur;
++    n_kv  = s.n_kv;
++    kv->cells_restore(s.cells);
++}
++
++void llama_kv_cache_context::seek(size_t u) {
++    GGML_ASSERT(u < ubatches.size());
++    i_cur = u;
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 6cb6dbd..d8d8890 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -166,6 +166,10 @@ public:
+ 
+     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+ 
++    // SiegeLadder P19: snapshot ring cell metadata for layer-major seek/restore
++    llama_kv_cells_vec cells_snapshot() const;
++    void              cells_restore(const llama_kv_cells_vec & snap);
++
+     //
+     // graph_build API
+     //
+@@ -366,6 +370,17 @@ public:
+ 
+     uint32_t get_n_kv() const;
+ 
++    struct llama_kv_cache_context_snap {
++        size_t              i_cur = 0;
++        int32_t             n_kv  = 0;
++        llama_kv_cells_vec  cells;
++    };
++
++    llama_kv_cache_context_snap snap() const;
++    void restore(const llama_kv_cache_context_snap & s);
++    void seek(size_t u);
++    size_t ubatch_index() const { return i_cur; }
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 1dd4faf..c7c7431 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -2330,16 +2330,26 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     // chain reaches back hparams.dsv4_dec_reach() positions (2413) from any logit or state the call hands back
+     const int32_t p4_src = cparams.dsv4_enc_only ? hparams.dsv4_dec_first() : -1;
+     GGML_ASSERT(!cparams.dsv4_enc_only || p4_src > 0);
++    const int32_t lm_l0 = cparams.dsv4_lm_l0 >= 0 ? cparams.dsv4_lm_l0 : 0;
++    const int32_t lm_l1 = cparams.dsv4_lm_l1 >= 0 ? cparams.dsv4_lm_l1 : (int32_t) n_layer;
++    GGML_ASSERT(lm_l0 >= 0 && lm_l1 > lm_l0 && lm_l1 <= (int32_t) n_layer);
+     // the MoE layers this graph runs: the 3a prediction and runahead's pass never reach past them, nor P11's read-ahead
+     const int64_t n_layer_moe = p4_src >= 0 ? (int64_t) p4_src : (int64_t) n_layer;
+     if (mstream != nullptr) {
+-        mstream->graph_last_moe = p4_src >= 0 ? p4_src - 1 : -1;
++        // P19: a layer segment's last MoE layer (of an encoder-only ubatch: no further than the encoder's last) - P11
++        // reads ahead no further than the graph goes; the whole model's graph keeps its bound as before
++        int32_t last_moe = -1;
++        for (int32_t il = lm_l0; il < lm_l1 && il < (int32_t) n_layer_moe; ++il) {
++            last_moe = il;
++        }
++        mstream->graph_last_moe = lm_l0 == 0 && lm_l1 == (int32_t) n_layer ? (p4_src >= 0 ? p4_src - 1 : -1) : last_moe;
+     }
+ 
+-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
++    const bool need_tok_inp = lm_l0 == 0 || lm_l0 < (int32_t) hparams.dsv4_hash_layer_count;
++    ggml_tensor * inp = (lm_l0 == 0 || need_tok_inp) ? build_inp_embd(model.tok_embd) : nullptr;
+     ggml_tensor * inp_pos = build_inp_pos();
+     // P4: no output rows - and an out_ids input left out of the graph would be unallocated at set_input
+-    ggml_tensor * inp_out_ids = p4_src >= 0 ? nullptr : build_inp_out_ids();
++    ggml_tensor * inp_out_ids = (p4_src >= 0 || lm_l1 < (int32_t) n_layer) ? nullptr : build_inp_out_ids();
+     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
+     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+     // SiegeLadder P13: with the attention in chunks of queries nothing reads the whole-ring mask ([ring, n_tokens] f16,
+@@ -2359,6 +2369,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+ 
+     llm_graph_input_engram * inp_engram = nullptr;
+     if (hparams.engram_n_layer > 0) {
++        bool engram_in_seg = false;
++        for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
++            const int32_t el = (int32_t) hparams.engram_layer_ids[e];
++            if (el >= lm_l0 && el < lm_l1) {
++                engram_in_seg = true;
++                break;
++            }
++        }
++        if (engram_in_seg) {
+         auto inp = std::make_unique<llm_graph_input_engram>(hparams, model, inp_dsv4->mctx);
+         inp->kv.resize(hparams.engram_n_layer);
+ 
+@@ -2398,6 +2417,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+ 
+         inp_engram = inp.get();
+         res->add_input(std::move(inp));
++        }
+     }
+ 
+     // V4.1 threads the hyper-connection mix one sublayer ahead; V4 collapses in place and
+@@ -2454,7 +2474,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     //   block boundary a compressed row) the real attention writes again before anything reads it; with rollback
+     //   snapshots (n_rs_seq > 0) a second build would shift them twice, so runahead stays off there. V4.1 only.
+     const bool runahead = mstream != nullptr && hparams.dsv4_v41 && mstream->runahead_k > 0 && n_tokens == 1 &&
+-                          cparams.n_rs_seq == 0;
++                          cparams.n_rs_seq == 0 && lm_l0 == 0 && lm_l1 == (int32_t) n_layer;
+     // SiegeLadder G32 (LLAMA_MOE_STREAM_G32; 0 - off, the default: only counted; 1 - on; 2 - built but never left out,
+     //   for A/B of its copies): when every pair of layer L was resident at the end of runahead's first half, the pass's
+     //   MoE of L is the exact one bit for bit (weight multipliers 1, the same rows - G30 reuses them - the same sum
+@@ -2546,10 +2566,46 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     };
+ 
+     const int64_t hc = hparams.dsv4_hc_mult;
+-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++    ggml_tensor * inpL = nullptr;
++    if (lm_l0 == 0) {
++        GGML_ASSERT(inp != nullptr);
++        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
++        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++    } else {
++        // SiegeLadder P19: a segment past layer 0 starts from what the segment before it exported, in the shapes and
++        // types it had there (llama_context::decode holds the bytes in pinned host memory between the two graphs)
++        auto * ci = cparams.dsv4_lm_carry_in;
++        GGML_ASSERT(ci != nullptr);
++        using lm_carry = llama_cparams::llama_dsv4_lm_carry;
++        auto take = [&](int k) -> ggml_tensor * {
++            auto & it = ci->v[k];
++            it.t = nullptr;
++            if (it.ne[0] == 0) {
++                return nullptr;
++            }
++            GGML_ASSERT(it.host != nullptr);
++            it.t = ggml_new_tensor(ctx0, it.type, 4, it.ne);
++            ggml_set_input(it.t);
++            return it.t;
++        };
++        inpL         = take(lm_carry::H);
++        hc_carry_v   = take(lm_carry::HC);
++        topk_carry_v = take(lm_carry::TOPK);
++        cand_carry_v = take(lm_carry::CAND);
++        GGML_ASSERT(inpL != nullptr && hc_carry_v != nullptr);
++    }
+     cb(inpL, "hc_init", -1);
+ 
++    // P19 + C7c: a segment that starts past the cut layer (dsv4_dec_first() + 1) gets the stream, the mix, the top-k and
++    // the verdicts already cut - the segment before it exported their rows from the cut; only the positions are cut here,
++    // as the cut layer would have done (the loop's own cut runs when the segment holds that layer)
++    if (inp_dsv4->c7c_cut > 0 && lm_l0 > (int32_t) hparams.dsv4_dec_first() + 1) {
++        const int64_t cut = inp_dsv4->c7c_cut;
++        const int64_t ntc = n_tokens - cut;
++        GGML_ASSERT(p4_src < 0 && inpL->ne[2] == ntc && hc_carry_v->ne[1] == ntc);
++        inp_pos = ggml_view_1d(ctx0, inp_pos, ntc, (size_t) cut*ggml_element_size(inp_pos));
++    }
++
+     // SiegeLadder C14, probe E1: the deferred pairs of the layer before, post_F (x) delta, for this layer's attention residual
+     // (DEPTH 2: c14_ffn, the same carried through this layer's attention mix, for its FFN residual)
+     ggml_tensor * c14_carry = nullptr;
+@@ -2557,7 +2613,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+     // C14 proper: the host op of the layer before that waits for its deferred copies, expanded right after this attention
+     ggml_tensor * c14_wait  = nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = lm_l0; il < lm_l1; ++il) {
+         // SiegeLadder C7c (cparams.dsv4_yoco_cut; llama_context::yoco_cut): past the first decoder layer only the rows from
+         // the cut go on - the rows before it are C7b's rows without consequence: no output, their decoder windows are read
+         // by no row past the bound (C7's masks), and the state a call leaves is its last rows, all past the bound. The first
+@@ -2623,7 +2679,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         // after the engram, as the reference does: it applies the engram before taking
+         // h.mean(dim=2) for the MTP. No target layer carries an engram in this checkpoint,
+         // so nothing changes today, but the two definitions now agree.
+-        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
++        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il] && lm_l0 == 0 && lm_l1 == (int32_t) n_layer) {
+             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
+             cb(res->t_layer_inp[il], "layer_inp", il);
+             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+@@ -2798,7 +2854,8 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         // SiegeLadder C14, probe E1 (c14_q in llama_moe_stream): may this layer's remap defer pairs - a one-token graph and a
+         // next layer in it to take their sum after its attention (c14_carry below)
+         if (mstream != nullptr && mstream->layer(il) != nullptr) {
+-            mstream->layer(il)->c14_ok = n_tokens == 1 && il + 1 < n_layer_moe && mstream->c14_layer_ok(il);
++            mstream->layer(il)->c14_ok = n_tokens == 1 && il + 1 < n_layer_moe && il + 1 < lm_l1 &&
++                    mstream->c14_layer_ok(il);
+         }
+ 
+         ggml_tensor * moe_out = build_moe_ffn(cur,
+@@ -2856,6 +2913,37 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
+         cb(inpL, "l_last", il);
+     }
+ 
++    // SiegeLadder P19: a segment that ends before the head hands its state to the next one. A computed tensor becomes an
++    // output of the graph (the allocator never reuses its memory; the context reads it once the graph is done); one of
++    // the segment's own inputs, or a view of one (C7c's cut), is left to the context, which still holds its bytes
++    if (lm_l1 < (int32_t) n_layer) {
++        auto * co = cparams.dsv4_lm_carry_out;
++        // (an encoder-only ubatch carries its state up to the group with the first decoder layer, where its graph ends)
++        if (co != nullptr && (p4_src < 0 || lm_l1 <= p4_src)) {
++            using lm_carry = llama_cparams::llama_dsv4_lm_carry;
++            const auto * ci = cparams.dsv4_lm_carry_in;
++            auto own_input = [&](const ggml_tensor * t) {
++                if (ci != nullptr) {
++                    for (const auto & it : ci->v) {
++                        if (it.t != nullptr && (t == it.t || t->view_src == it.t)) {
++                            return true;
++                        }
++                    }
++                }
++                return false;
++            };
++            ggml_tensor * const ex[lm_carry::N] = { inpL, hc_carry_v, topk_carry_v, cand_carry_v };
++            for (int k = 0; k < lm_carry::N; ++k) {
++                co->v[k].t = ex[k];
++                if (ex[k] != nullptr && !own_input(ex[k])) {
++                    ggml_set_output(ex[k]);
++                    ggml_build_forward_expand(gf, ex[k]);
++                }
++            }
++        }
++        return;
++    }
++
+     // SiegeLadder P4: an encoder-only graph is complete with the first decoder layer's cache writes - no output rows (the
+     // context chose a ubatch without any), no final collapse, no head; t_logits and t_embd stay null
+     if (p4_src >= 0) {

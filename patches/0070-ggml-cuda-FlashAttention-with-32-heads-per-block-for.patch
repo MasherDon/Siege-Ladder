@@ -1,9 +1,9 @@
 From 44518c469a21af28021f5ba8fed878ab95288956 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 22:41:56 +0000
-Subject: [PATCH 70/92] ggml-cuda : FlashAttention with 32 heads per block for
- one query per stream - the sparse prefill's streams (SiegeLadder D10 step 2,
- LLAMA_DSV4_SPARSE_FA_NCOLS2 = 8 / 16 / 32, default 32)
+Subject: [PATCH 070/112] ggml-cuda : FlashAttention with 32 heads per block
+ for one query per stream - the sparse prefill's streams (SiegeLadder D10 step
+ 2, LLAMA_DSV4_SPARSE_FA_NCOLS2 = 8 / 16 / 32, default 32)
 
 D10 gives every query its own stream with its own 768-row K. At 8 of the 64 heads per block each stream's K was read
 8 times, from DRAM: the stream-k blocks in flight on other streams thrash L2. Instances (512, 512, 1, 16) and

@@ -1,8 +1,8 @@
 From 5a6d49c4ffa76756463b8d3411647387050ef418 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 11 Oct 2026 19:47:43 +0000
-Subject: [PATCH 04/92] moe-stream : keep a tensor's claim after it loads, so a
- promoted slot is not published early
+Subject: [PATCH 004/112] moe-stream : keep a tensor's claim after it loads, so
+ a promoted slot is not published early
 
 A prefill wave that finds its slot still LOADING from the previous wave's preload queues
 every tensor of that slot again. The worker cleared a tensor's claim bit as soon as the

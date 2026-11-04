@@ -1,0 +1,88 @@
+From 403fe14a58b77610567145568152c3841d470f58 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 19:15:24 +0000
+Subject: [PATCH 095/112] graph + mmap : SiegeLadder P8 - a prompt's Engram
+ pages faulted in by T threads at once (LLAMA_ENGRAM_PP_THREADS=T, off by
+ default), each over its slice of a layer's rows; PrefetchVirtualMemory's
+ address looked up in a thread-safe static. With 8 threads layer 1 of a
+ 7.5K-token turn waits 0.65 s for its rows instead of 1.18 s and medium turns
+ read 5-10% faster, cold 8.9K +4%, but the biggest turn pages twice as much
+ (2.9 GB of 4 KB pages arrive early with 2-4 GB of RAM free and are evicted
+ before use) - no gain over agent turns 2-8 (A B B A: 51.0 / 54.7 s against
+ 51.7 / 51.0 s; SiegeLadder runs.md 4.237). The rows (256 + 8 bytes each, ~95
+ MB a big turn) want a reader of their own, not more page faults
+
+---
+ src/llama-graph.cpp | 29 ++++++++++++++++++++++++++++-
+ src/llama-mmap.cpp  | 14 +++++---------
+ 2 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ae12a8c..982fce2 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -371,10 +371,37 @@ void llm_graph_input_engram::pp_start(const llama_ubatch & ub) {
+         pp_done   = 0;
+         pp_active = true;
+     }
++    // SiegeLadder P8 (LLAMA_ENGRAM_PP_THREADS=T, off by default - one call per layer): a layer's pages are faulted in by
++    // T threads at once, each over its slice of the rows. A row is 256 bytes of FP8 and 8 of scale in another tensor - two
++    // scattered 4 KB pages - and one PrefetchVirtualMemory over a big turn's ~720K pages keeps few reads in flight: layer 1
++    // waited 1.18 s for them (runs.md 4.235). With 8 threads it waits 0.65 s and medium turns read 5-10% faster, but the
++    // biggest turn pages twice as much (2.9 GB of pages arrive early with 2-4 GB of RAM free, and are evicted before use):
++    // no gain over turns 2-8 (runs.md 4.237) - the rows want a reader of their own, not more page faults
++    static const size_t n_thr = [] {
++        const char * s = getenv("LLAMA_ENGRAM_PP_THREADS");
++        return (size_t) std::max(1, s != nullptr ? atoi(s) : 1);
++    }();
+     pp_thread = std::thread([this, addrs = std::move(addrs), sizes = std::move(sizes)]() {
+         for (size_t e = 0; e < addrs.size(); ++e) {
+             llama_moe_stream_nvtx_push("engram_pp");
+-            llama_prefetch_ranges(addrs[e].data(), sizes[e].data(), addrs[e].size());
++            const size_t n = addrs[e].size();
++            const size_t T = std::min(n_thr, std::max<size_t>(1, n/4096));
++            if (T <= 1) {
++                llama_prefetch_ranges(addrs[e].data(), sizes[e].data(), n);
++            } else {
++                std::vector<std::thread> ws;
++                ws.reserve(T);
++                for (size_t k = 0; k < T; ++k) {
++                    const size_t a = k*n/T;
++                    const size_t b = (k + 1)*n/T;
++                    ws.emplace_back([&addrs, &sizes, e, a, b] {
++                        llama_prefetch_ranges(addrs[e].data() + a, sizes[e].data() + a, b - a);
++                    });
++                }
++                for (auto & w : ws) {
++                    w.join();
++                }
++            }
+             llama_moe_stream_nvtx_pop();
+             {
+                 std::lock_guard<std::mutex> lk(pp_mtx);
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index e9ef241..fed5b03 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -1231,16 +1231,12 @@ void llama_prefetch_ranges(void * const * addrs, const size_t * sizes, size_t n)
+     }
+ #ifdef _WIN32
+ #if _WIN32_WINNT >= 0x602
+-    static BOOL (WINAPI *pPrefetchVirtualMemory)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG) = nullptr;
+-    static bool procurado = false;
+-    if (!procurado) {
+-        procurado = true;
++    // looked up once, thread-safe (SiegeLadder P8: the prompt's Engram pages are faulted in from several threads at once)
++    using prefetch_fn = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
++    static const prefetch_fn pPrefetchVirtualMemory = [] {
+         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+-        if (hKernel32) {
+-            pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *)
+-                GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+-        }
+-    }
++        return hKernel32 ? (prefetch_fn)(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory") : (prefetch_fn) nullptr;
++    }();
+     if (pPrefetchVirtualMemory == nullptr) {
+         return;
+     }
