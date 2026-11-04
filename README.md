@@ -25,41 +25,57 @@ Long context, up to 1M tokens, at a usable speed on a single consumer PC — not
 | Drives | NVMe Gen5 2 TB (~13.5 GB/s) for the model; NVMe Gen4 1 TB (~5 GB/s) holding a second copy of the expert files |
 | OS | Windows 11, CUDA 13.0 |
 
-## The model build
+## The model builds
 
-DeepSeek-V4.1-Flash-1017 does not fit in RAM + VRAM. Our build is 373 GB:
+DeepSeek-V4.1-Flash-1017 does not fit in RAM + VRAM. We use two builds with the same Q5_K dense part from
+ISTA-DASLab and official FP8 Engram tables. Both stream the routed experts from NVMe.
 
-| part | type | source |
+| build | routed experts | availability |
 |---|---|---|
-| routed experts, gate / up | IQ2_XS | prometheusAIR's 1017 GGUF |
-| routed experts, down | Q2_K | prometheusAIR's 1017 GGUF |
-| dense part (attention, shared experts, head) | Q5_K | ISTA-DASLab's 1017 GGUF |
-| Engram tables (203 GB) | FP8, byte for byte | DeepSeek's official 1017 release |
+| `og` (our current baseline) | our own GPTQ of all 40 layers on our calibration texts, with Maya-S's types: IQ2_XXS gate/up, IQ3_XXS down (IQ2_S / IQ3_S in layers 0–3 and 36–39) | not published yet |
+| `cd` (public assembly, 373 GB) | prometheusAIR's IQ2_XS gate/up and Q2_K down | assembled from public sources by the script below |
 
-The routed experts (~150 GiB at ~2.4 bits per weight) stream from NVMe; ~23 per layer sit in VRAM, a pinned RAM tier
-holds 43–46 GiB of them. No weights are redistributed here — only a script that assembles the build from the public
-repositories (see [Reproducing](#reproducing)).
+The public assembler does not produce `og` yet, so the `og` rows below can't be reproduced from this repository today;
+`cd`'s own numbers are listed after them. The fast-preset measurements use the lighter `qd` build (IQ2_XXS gate/up). No weights are redistributed here; see [Reproducing](#reproducing).
 
-## Numbers (the defaults of 25 October 2026)
+## Numbers (the defaults of 4 November 2026)
 
-| | |
+The current `default` includes the expert drop rule and YoCo; it is not the lossless `exact` preset. G44 and G40
+need a 149 MB lens file (a learned correction of the router lens) that is not published yet; without it the engine
+runs as it did before them. Dates below identify the measurements, not a claim that
+every row was remeasured on 4 November.
+
+| `og`, unless stated | measurement |
+|---|---|
+| short-context decode, teacher-forced | 21.30 tok/s with G44 and G40 (4 November) |
+| agent turns 2–8, server | 18.7 tok/s decode; 506–520 tok/s reading (28 October, before G44/G40) |
+| `qd` fast / fast + K5 | 23.46 / 24.97 tok/s, respectively; additional quality trade-offs (28 October, before G44) |
+| `qd` fast with G44 | 23.7 tok/s (3 November; low free RAM during the series) |
+| 1M-context document | 946,058 tokens at 365.78 tok/s; answer 14.38 tok/s (4 November; one run) |
+| quality, distance to API | approximately 0.091 / 0.054 / 0.072 nat/token on general-100 / Russian / router-112; HumanEval 160/164 (27–28 October, before G44/G40) |
+
+The publicly assembled `cd` with the defaults of 25–26 October (no G44 / G40):
+
+| `cd` | measurement |
 |---|---|
 | decode, short context | 20.3 tok/s (17–20 in real agent turns at 2–27K context) |
-| decode, fast preset | 23–24.7 tok/s (small measured quality cost) |
 | decode at 256K / 512K context | 16–20 tok/s |
 | reading agent turns (0.5–7.5K new tokens into a growing conversation, warm cache) | ~418 tok/s |
 | cold prompt 2.2K / 8.9K | 242 / 729 tok/s |
-| document 256K / 512K (measured before the two latest prefill changes) | 652 / 482 tok/s |
-| 1M context | loads at batch 512; a real 1M document not run yet |
-| quality | 0.09–0.11 nat/token behind the DeepSeek API on its own continuations (3 prompt sets; for scale, Q2 to Q4 is ~0.11); HumanEval 157/164 vs 158 for the API |
+| document 256K / 512K | 652 / 482 tok/s |
+| document in a 1M context (945,619 tokens, 26 October) | 470.7 tok/s (33.5 minutes); answers 13.8–15.15 tok/s |
+| quality | 0.09–0.11 nat/token behind the DeepSeek API on its own continuations; HumanEval 157/164 vs 158 for the API |
 
-On this PC with the same file (measured 2026-10-22): the original fork ~10 tok/s, Project Maya v1.1.21 3.9 tok/s.
+The `og` and `cd` rows are separate runs with different settings, not an isolated measurement of the quantization.
 
-**How it is measured.** Decode speed — teacher forcing over 3,072 tokens of real text (`llama-perplexity -ub 1`),
-arms in A B B A order, corrected for random drive stalls. Quality — negative log-likelihood of the DeepSeek API's own
-continuations on three prompt sets (general-100 from antirez's ds4 quality tests, a 112-prompt code and agent set, and
-a Russian set; continuations collected from the API for 1017), shown as the distance to the full model (smaller is
-better). Reading — the server's own prompt timings. Details: [docs/measuring.md](docs/measuring.md).
+On this PC with the `cd` file (measured 2026-10-22): the original fork ~10 tok/s, Project Maya v1.1.21 3.9 tok/s. Maya has
+shipped many releases since; these two numbers are from that day.
+
+**How it is measured.** Short-context decode uses teacher forcing, with YoCo disabled during that test, in A B B A
+order. Agent and document readings use server prompt timings. Quality is negative log-likelihood of the DeepSeek
+API's own continuations on three prompt sets; smaller distance to the API is better. The G44/G40 quality checks
+were within statistical uncertainty on these sets, but do not establish equivalence (4 November).
+Details: [docs/measuring.md](docs/measuring.md).
 
 ## What helped most
 
@@ -82,9 +98,17 @@ better). Reading — the server's own prompt timings. Details: [docs/measuring.m
      before the first kernel (bit-exact; +5.6% on agent turns, +9% / +6% on cold 2.2K / 8.9K prompts), and the pinned
      host blocks of the compute buffer are kept between prompts (+3.7% on agent turns).
 6. **Sparse attention in decode with a q8 KV cache:** decode stays at 16–20 tok/s from short context to 512K.
-7. **A quant mix from public GGUFs:** prometheusAIR's IQ2_XS gate/up + Q2_K down, ISTA-DASLab's lighter Q5_K dense part
+7. **The public `cd` quant mix:** prometheusAIR's IQ2_XS gate/up + Q2_K down, ISTA-DASLab's lighter Q5_K dense part
    (3 GB less VRAM, so more expert slots: +8.5% decode, and at least as close to the API as a plain 2-bit mix).
 
+8. **Updated expert prediction:** G44 improves the lens; with GPU scheduling enabled it gave +2.3% decode in
+   `default` (3 November; the two pairs differed). G40 stages one prediction into VRAM ahead of time:
+   +5.1% on top of G44 (4 November). G40 changes cache occupancy and can change drops on the measured
+   `default` path.
+9. **Long prompts and Engram:** two batch widths made the 1M `cd` document 2.42× faster than batch 512; direct
+   reads from unmapped Engram tables cut agent-turn reading time by 5.2%. Cutting decoder rows for YoCo cut it by
+   14% in its comparison. These are separate configurations, measured 26 October.
+   Keeping a host copy of the output head saved 35 ms per turn in a separate test.
 ## What didn't work
 
 - **Reading the next layer's experts ahead during prefill:** the RAM tier can't hold a prompt's working set, so
@@ -93,10 +117,17 @@ better). Reading — the server's own prompt timings. Details: [docs/measuring.m
 - **A published non-uniform quant (GSQ-RCO) instead of our mix:** lower error offline, worse on our API sets
   (+0.02 nat, +0.034 on Russian prompts) — the calibration text matters.
 - **Splitting expert reads into chunks, CUDA graph optimizations:** within noise.
+- **Routes from repeated text:** only 0.3–6% of disk-waiting calls removed, with 1.3–3.5× disk reads in an offline
+  trace (G42, 27 October).
+- **Substituting another expert for a dropped one:** 1.26–1.37× the output error of dropping in an offline test
+  (C23, 28 October).
+- **Layer-major prefill, first version:** 128K was 13.6% slower with groups of four; fewer disk reads did not remove
+  transfers and graph overhead (P19, 4 November; an incomplete A B B A). It remains experimental.
 
 ## Where the time goes
 
-Measured with Nsight Systems and the server's timings; the numbers behind each chart are in [docs/data](docs/data).
+Measured with Nsight Systems and the server's timings on the earlier configuration; the numbers behind each chart
+are in [docs/data](docs/data).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/decode-token-dark.svg">
@@ -123,13 +154,18 @@ environment switches](docs/switches.md).
 
 ## Where we're stuck — ideas welcome
 
-1. **Predicting which experts a token needs 1–2 layers ahead.** Perfect staging into VRAM would give 27–29 tok/s; our
-   lens reaches 76% precision at ~14% recall (it needs ≥65–70% precision at ≥50% recall to pay off).
+1. **Predicting which experts a token needs 1–2 layers ahead.** Perfect prediction on `og` would give 27.89 tok/s
+   against 20.30 for the 28 October default; the lens before G44 reached 76% precision at ~14% recall (it needs
+   ≥65–70% precision at ≥50% recall to pay off).
 2. **Overlapping compute with expert copies:** copies take ~30 ms per token, compute ~19 ms, and they overlap by 3 ms.
-3. **Short agent turns:** reading a turn costs ~5 s plus ~1 ms per new token, so even a 500-token turn takes 5.6 s.
-   Waiting for expert loads is 2–3 s of every turn whatever its size; the server also re-runs the prompt's last 4
-   tokens in a second call (0.34 s), and moving the output head back into VRAM takes 0.26 s.
-4. **1M context:** loads only at batch 512 — the sparse prefill plan wants 11.7–15 GiB at larger batches.
+3. **Short agent turns:** reading a turn costs ~5 s plus ~1 ms per new token (26 October), and 2–3 s of every turn is
+   waiting for expert loads.
+4. **Long-document prefill:** 1M now reads on both builds. A layer-major experiment at 512K read much less from disk,
+   but still reached only 457.96 tok/s versus 488.37 on the ordinary path (4 November; single instrumented
+   runs). Graph inputs, state transfers and GPU compute remain costly. At 128K, expert GEMMs at batch 2048 cost about
+   4.5× as much per layer-token as at 8192, an estimate from profiles. The layer-major path is off by default.
+5. **Long-context quality:** the short quality sets do not establish quality at 1M, or prove equivalence after the
+   latest prediction changes.
 
 Ideas, questions and results on other hardware are welcome in the issues.
 
@@ -216,7 +252,7 @@ python bench/tf_series.py out/tf                 # its summary, corrected for dr
 
 | path | what |
 |---|---|
-| `patches/` | 92 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order. The commit messages quote their measurements and cite sections of our own log (`runs.md 4.xx`), which is not published |
+| `patches/` | 112 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order. The commit messages quote their measurements and cite sections of our own log (`runs.md 4.xx`), which is not published |
 | `bench/` | the benchmark scripts: server runs, agent turns, long documents, teacher-forced decode, quality against the API, Nsight profiles |
 | `docs/` | [techniques](docs/techniques.md), [measuring](docs/measuring.md), [switches](docs/switches.md) |
 | `docs/img/`, `docs/data/` | the charts (light and dark) and the numbers behind them |

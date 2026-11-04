@@ -9,7 +9,7 @@ details of its measurement.
 ## The ladder: VRAM, RAM, NVMe
 
 DeepSeek-V4.1-Flash routes each token to 6 of 384 experts in each of 40 layers: 240 expert choices per token, ~10 MB
-each at ~2.4 bits. None of the 373 GB build fits; the experts stream.
+each at ~2.4 bits. The 373 GB public `cd` build does not fit in RAM + VRAM; the experts stream.
 
 - **VRAM expert cache** (JigSawPT's): ~23 slots per layer next to the dense part. Of the 240 choices of a decode
   token, ~160 hit VRAM, ~61 come from RAM, ~10 from the drive and ~10 are dropped (the drop rule below).
@@ -69,10 +69,21 @@ is on in the `default` preset; `exact` turns it off.
 - **C14, late experts:** up to one light pair per token (the drive's first) is not waited for; its copy is queued
   last and its weighted sum enters after the next layer's attention, which does not see it (+4.8-5.2%, about +0.005
   nat on general-100).
-- **G40:** G35's lens stages up to one confident guess per call into VRAM two calls ahead (+3%). The math is
+- **G40:** G35's lens stages up to one confident guess per call into VRAM two calls ahead (+3% in the earlier fast configuration). The math is
   untouched, but next to the drop rule ~5% more experts get dropped.
-- On the lighter `qd` build the fast preset decodes 23-23.7 tok/s; 5 experts per token instead of 6 (`K5`, a separate
-  switch) gives 24.7 for another +0.010-0.013 nat.
+- On the lighter `qd` build the fast preset decoded 23.46 tok/s on 28 October (before G44); 5 experts per token instead of 6 (`K5`, a separate
+  switch) gave 24.97 in that run, for another +0.010-0.013 nat in earlier quality tests.
+
+### New default prediction (4 November)
+
+- **G44:** a trained correction to the two-layer lens was +2.3% in `default` with GPU scheduling enabled, but its
+  two A B B A pairs differed (+4.7% and 0.0%; 3 November). It changes staging, not expert arithmetic;
+  in a drop-enabled path timing can change which experts are dropped. The same series measured `qd` fast with G44
+  at 23.7 tok/s (+4.5%); free RAM fell very low during the series.
+- **G40 k=1 with G44:** staging one confident prediction into VRAM gave 20.26 → 21.30 tok/s (+5.1%) in two
+  A B B A blocks on `og` (4 November). The drop count rose 1.8%. Quality differences versus the
+  previous default were within statistical uncertainty on three API sets, but the intervals do not establish
+  equivalence. Both changes are enabled in `default` when the correction file is available.
 
 ### Long context
 
@@ -105,14 +116,30 @@ A prompt runs in micro-batches through all 40 layers; every expert a batch route
   and more are kept between prompts instead of 1.66 GiB being allocated and freed on every turn (+3.7%).
 - **P17, a thinner compute buffer:** expert outputs are weighted in place (-215 MiB at batch 6144).
 - **D12, 512K:** the dense prefill plan is reserved only for the positions where a sequence can take it, so 512K
-  loads (a 451K-token document at 482 tok/s, answers 16-18 tok/s). 1M loads at batch 512 only.
+  loads (a 451K-token document at 482 tok/s, answers 16-18 tok/s). This was the earlier configuration.
 
-Reading agent turns went from 333 tok/s (before C7) to ~418 tok/s on 25 October; a short turn still costs ~5 s, 2-3 s
+- **C7c:** after the YoCo boundary, later decoder layers process only the needed rows. On the existing lossy YoCo
+  path, agent-turn reading time fell 14% (26 October); the row cut itself was checked against
+  that path, including numerical batch effects.
+- **P8d:** read Engram rows directly from unmapped files: agent-turn reading time -5.2%, with bit-identical logits
+  in the checks (26 October).
+- **P20, head copy:** retaining a host copy of the output head saved about 35 ms per turn (26 October).
+- **D15:** separate widths for encoder-only and full-model batches: the `cd` 1M-context document rose from 194.8
+  to 470.7 tok/s, 81 to 33.5 minutes (26 October). Different batch layouts can change numerical rounding.
+  On `og`, the 4 November default read 946,058 tokens at 365.78 tok/s (one run).
+- **D16:** a compute-buffer reserve that has a fallback is measured before it is allocated; a real 64K run at batch
+  16384 still failed, so that batch size is not a working default (29 October).
+- **P19 layer-major, experimental and disabled:** on 512K, a full-layer pool reached 457.96 tok/s against 488.37
+  on the ordinary path despite far fewer disk reads (individual instrumented runs). At batch 2048,
+  expert GEMM cost per layer-token was estimated at 4.5× that of batch 8192. Graph inputs and state
+  movement also cost time; the work is not part of the default prefill path.
+Reading agent turns went from 333 tok/s (before C7) to ~418 tok/s on 25 October; then a short turn cost ~5 s, 2-3 s
 of it waiting for expert loads.
 
 ## Quantization
 
-- **The build (`cd`):** prometheusAIR's IQ2_XS gate/up and Q2_K down for the experts, ISTA-DASLab's Q5_K dense part.
+- **`og` (current baseline):** our GPTQ experts, calibrated on our own data, use the same types as Maya-S; the public assembler does not build it. On 27–28 October, `og` default was about 0.091 / 0.054 / 0.072 nat/token from the API across the three sets and scored 160/164 on HumanEval (before G44/G40).
+- **The public build (`cd`):** prometheusAIR's IQ2_XS gate/up and Q2_K down for the experts, ISTA-DASLab's Q5_K dense part.
   The lighter dense part frees 3.0 GiB of VRAM - 6-8 more expert slots per layer - so `cd` decodes +8.5% against our
   first plain 2-bit mix and is no farther from the API (pooled over three sets ~0.008 nat closer, within error).
 - **`qd`** (IQ2_XXS gate/up, the same dense part): +16-18% decode for +0.004-0.005 nat - the fast preset's build.
@@ -137,9 +164,13 @@ of it waiting for expert loads.
 | lossless compression of the 2-bit weights | at most 4.46% (zlib 0.8%) |
 | computing RAM-resident experts on the 6-core CPU | a probe gave +3-5% at best; left for a bigger CPU |
 | a direct NVMe -> GPU path, TCC / MCDM, WSL2, a bigger page file, power plans | not available on Windows with a GeForce, or no change |
+| repeated-text routes (G42) | offline: only 0.3–6% fewer disk-waiting calls, 1.3–3.5× disk reads (27 October) |
+| replace a dropped expert with another (C23) | offline: 1.26–1.37× the output error of dropping, on the measured events (28 October) |
+| layer-major prefill, first version (P19) | 128K group-of-four 13.6% slower despite fewer reads; transfers and graph costs remain (4 November; incomplete A B B A) |
+| direct Engram reads while files are mapped (P8c) | a 3K prompt took 22 s instead of 12; unmapped files solved the coherence bottleneck (26 October) |
 
 ## Where the time is left
 
-Perfect expert prediction in this pipeline would give 27.5-29.3 tok/s against our 20.3; perfect staging into VRAM
+On 28 October, perfect expert prediction on `og` was 27.89 tok/s against the then-default 20.30; perfect staging into VRAM
 two calls ahead, 27.4. The lens reaches ~76% precision at ~14% recall; staging pays off from about 65-70% precision
 at 50% recall. See the main README's "Where we're stuck".
