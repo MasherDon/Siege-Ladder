@@ -129,10 +129,12 @@ A prompt runs in micro-batches through all 40 layers; every expert a batch route
   On `og`, the 4 November default read 946,058 tokens at 365.78 tok/s (one run).
 - **D16:** a compute-buffer reserve that has a fallback is measured before it is allocated; a real 64K run at batch
   16384 still failed, so that batch size is not a working default (29 October).
-- **P19 layer-major, experimental and disabled:** on 512K, a full-layer pool reached 457.96 tok/s against 488.37
-  on the ordinary path despite far fewer disk reads (individual instrumented runs). At batch 2048,
-  expert GEMM cost per layer-token was estimated at 4.5× that of batch 8192. Graph inputs and state
-  movement also cost time; the work is not part of the default prefill path.
+- **P19 layer-major prefill, on by default from 256K context (5 November):** each layer runs over the whole prompt
+  before the next one, so a layer's experts are read once for the document instead of once per batch. On `og`,
+  256K / 512K / 1M documents read at 1128.0 / 1042.99 / 887.93 tok/s (6 November, freshly rewritten Engram files;
+  930.01 / 866.78 / 777.62 on 5 November, before the rewrite) against 365.78 tok/s for 1M on the ordinary path
+  (4 November). The output matched the ordinary path byte for byte in a 48K check. Below 256K it is still slower
+  (128K), so the ordinary path stays there.
 Reading agent turns went from 333 tok/s (before C7) to ~418 tok/s on 25 October; then a short turn cost ~5 s, 2-3 s
 of it waiting for expert loads.
 
@@ -166,7 +168,7 @@ of it waiting for expert loads.
 | a direct NVMe -> GPU path, TCC / MCDM, WSL2, a bigger page file, power plans | not available on Windows with a GeForce, or no change |
 | repeated-text routes (G42) | offline: only 0.3–6% fewer disk-waiting calls, 1.3–3.5× disk reads (27 October) |
 | replace a dropped expert with another (C23) | offline: 1.26–1.37× the output error of dropping, on the measured events (28 October) |
-| layer-major prefill, first version (P19) | 128K group-of-four 13.6% slower despite fewer reads; transfers and graph costs remain (4 November; incomplete A B B A) |
+| layer-major prefill below 256K (P19) | 128K still slower than the ordinary path: transfers and graph costs remain (4–5 November); on by default only from 256K |
 | direct Engram reads while files are mapped (P8c) | a 3K prompt took 22 s instead of 12; unmapped files solved the coherence bottleneck (26 October) |
 
 ## Where the time is left

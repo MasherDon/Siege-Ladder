@@ -32,18 +32,21 @@ ISTA-DASLab and official FP8 Engram tables. Both stream the routed experts from 
 
 | build | routed experts | availability |
 |---|---|---|
-| `og` (our current baseline) | our own GPTQ of all 40 layers on our calibration texts, with Maya-S's types: IQ2_XXS gate/up, IQ3_XXS down (IQ2_S / IQ3_S in layers 0–3 and 36–39) | not published yet |
+| `og` (our current baseline) | our own GPTQ of all 40 layers on our calibration texts, with Maya-S's types: IQ2_XXS gate/up, IQ3_XXS down (IQ2_S / IQ3_S in layers 0–3 and 36–39) | [on Hugging Face](https://huggingface.co/MasherDon/DeepSeek-V4.1-Flash-1017-SiegeLadder-GGUF) (378 GB with the lens; not the final version) |
 | `cd` (public assembly, 373 GB) | prometheusAIR's IQ2_XS gate/up and Q2_K down | assembled from public sources by the script below |
 
-The public assembler does not produce `og` yet, so the `og` rows below can't be reproduced from this repository today;
-`cd`'s own numbers are listed after them. The fast-preset measurements use the lighter `qd` build (IQ2_XXS gate/up). No weights are redistributed here; see [Reproducing](#reproducing).
+`og` is published as it runs here: the 11 GGUF parts and the G44 lens file. It is not the final version: work on
+quantization quality continues, and better builds will replace it. `cd` is assembled from public sources by the
+script below; its own numbers are listed after `og`'s. The fast-preset measurements use the lighter `qd` build
+(IQ2_XXS gate/up). See [Reproducing](#reproducing).
 
-## Numbers (the defaults of 4 November 2026)
+## Numbers (the defaults of 5 November 2026)
 
 The current `default` includes the expert drop rule and YoCo; it is not the lossless `exact` preset. G44 and G40
-need a 149 MB lens file (a learned correction of the router lens) that is not published yet; without it the engine
-runs as it did before them. Dates below identify the measurements, not a claim that
-every row was remeasured on 4 November.
+need a 149 MB lens file (a learned correction of the router lens), published with the `og` weights; without it the
+engine runs as it did before them. From 256K context the prompt is read layer-major (on by default since
+5 November; see [What helped most](#what-helped-most)). Dates below identify the measurements, not a claim that
+every row was remeasured on the same day.
 
 | `og`, unless stated | measurement |
 |---|---|
@@ -51,7 +54,10 @@ every row was remeasured on 4 November.
 | agent turns 2–8, server | 18.7 tok/s decode; 506–520 tok/s reading (28 October, before G44/G40) |
 | `qd` fast / fast + K5 | 23.46 / 24.97 tok/s, respectively; additional quality trade-offs (28 October, before G44) |
 | `qd` fast with G44 | 23.7 tok/s (3 November; low free RAM during the series) |
-| 1M-context document | 946,058 tokens at 365.78 tok/s; answer 14.38 tok/s (4 November; one run) |
+| decode, short context, server | 18.44 / 18.80 tok/s (6 November, two runs of the Maya comparison below) |
+| document in a 256K context | 246,135 tokens at 1128.0 tok/s (6 November, mean of two runs) |
+| document in a 512K context | 478,928 tokens at 1042.99 tok/s (6 November, one run) |
+| document in a 1M context | 947,417 tokens at 887.93 tok/s; answer 15.23 tok/s (6 November, one run) |
 | quality, distance to API | approximately 0.091 / 0.054 / 0.072 nat/token on general-100 / Russian / router-112; HumanEval 160/164 (27–28 October, before G44/G40) |
 
 The publicly assembled `cd` with the defaults of 25–26 October (no G44 / G40):
@@ -71,11 +77,39 @@ The `og` and `cd` rows are separate runs with different settings, not an isolate
 On this PC with the `cd` file (measured 2026-10-22): the original fork ~10 tok/s, Project Maya v1.1.21 3.9 tok/s. Maya has
 shipped many releases since; these two numbers are from that day.
 
+Project Maya v1.1.54 on the same `og` file (6 November 2026; the same token ids, greedy decoding, A B B A against
+our `default`; both engines read only the Gen5 drive):
+
+| | Maya v1.1.54 | ours | ours / Maya |
+|---|---|---|---|
+| decode, short context, tok/s | 3.32 | 18.62 | ×5.6 |
+| decode after a 30K document | 3.7 | 15.0 | ×4.1 |
+| prompt 2K | 131.8 | 265.5 | ×2.0 |
+| prompt 8K | 472.4 | 797.4 | ×1.69 |
+| document 30K | 918.0 | 1050.4 | ×1.14 |
+
+Maya's best of four configurations: streaming on, a 40 GB RAM copy of the experts, `MAYA_DS4_Q8MV_TC=1`. It keeps
+284 of the 15,360 experts in VRAM and computes about half of the decode experts on the CPU; our engine computes all
+experts on the GPU.
+
 **How it is measured.** Short-context decode uses teacher forcing, with YoCo disabled during that test, in A B B A
 order. Agent and document readings use server prompt timings. Quality is negative log-likelihood of the DeepSeek
 API's own continuations on three prompt sets; smaller distance to the API is better. The G44/G40 quality checks
 were within statistical uncertainty on these sets, but do not establish equivalence (4 November).
 Details: [docs/measuring.md](docs/measuring.md).
+
+## Hardware notes
+
+- **PCIe 5.0.** With a PCIe 5.0 x16 card *and* slot, both prompt reading and decode should get faster with no code
+  change: copying experts over the bus is the largest part of a decode token. In an older profile the copies alone
+  took 27.1 ms of a 54 ms token; halving them gives about 24.7 instead of 18.5 tok/s (an estimate).
+- **A second NVMe** with a copy of the expert files helps prompt reading somewhat (+14–22% on cold prompts in an
+  older test) and decode very little. It is optional.
+- **Hot files slow down on the SSD.** The Engram tables take billions of small reads. After a few weeks, their 4 KiB
+  random reads on our Gen5 drive fell from ~400K to ~40K IOPS (other files on the same drive: ~235K), and the 512K
+  document read at 685 instead of 1051 tok/s. Rewriting the two Engram files restored them; it looks like read
+  disturb. If long documents slow down over time, check the drive before the code.
+- **Training.** Speed will also improve separately, by training the expert prediction, independently of the weights.
 
 ## What helped most
 
@@ -109,6 +143,13 @@ Details: [docs/measuring.md](docs/measuring.md).
    reads from unmapped Engram tables cut agent-turn reading time by 5.2%. Cutting decoder rows for YoCo cut it by
    14% in its comparison. These are separate configurations, measured 26 October.
    Keeping a host copy of the output head saved 35 ms per turn in a separate test.
+10. **Layer-major prefill for long documents** (on by default from 256K context, 5 November): each layer runs over
+    the whole prompt before the next one, so a layer's experts are read once for the document instead of once per
+    batch. The 1M document on `og` went from 365.78 tok/s on the ordinary path (4 November) to 777.62 layer-major
+    (5 November), and to 887.93 once the Engram files were rewritten (6 November; see [Hardware notes](#hardware-notes)).
+    The output matched the ordinary path byte for byte in a 48K check. Below 256K it is still slower, so the
+    ordinary path stays there.
+
 ## What didn't work
 
 - **Reading the next layer's experts ahead during prefill:** the RAM tier can't hold a prompt's working set, so
@@ -121,8 +162,8 @@ Details: [docs/measuring.md](docs/measuring.md).
   trace (G42, 27 October).
 - **Substituting another expert for a dropped one:** 1.26–1.37× the output error of dropping in an offline test
   (C23, 28 October).
-- **Layer-major prefill, first version:** 128K was 13.6% slower with groups of four; fewer disk reads did not remove
-  transfers and graph overhead (P19, 4 November; an incomplete A B B A). It remains experimental.
+- **Layer-major prefill below 256K:** at 128K it is still slower than the ordinary path (P19, 4–5 November), so it
+  switches on only from 256K context.
 
 ## Where the time goes
 
@@ -160,10 +201,8 @@ environment switches](docs/switches.md).
 2. **Overlapping compute with expert copies:** copies take ~30 ms per token, compute ~19 ms, and they overlap by 3 ms.
 3. **Short agent turns:** reading a turn costs ~5 s plus ~1 ms per new token (26 October), and 2–3 s of every turn is
    waiting for expert loads.
-4. **Long-document prefill:** 1M now reads on both builds. A layer-major experiment at 512K read much less from disk,
-   but still reached only 457.96 tok/s versus 488.37 on the ordinary path (4 November; single instrumented
-   runs). Graph inputs, state transfers and GPU compute remain costly. At 128K, expert GEMMs at batch 2048 cost about
-   4.5× as much per layer-token as at 8192, an estimate from profiles. The layer-major path is off by default.
+4. **Long-document prefill:** layer-major prefill reads 256K–1M documents at 887.93–1128.0 tok/s (6 November), but
+   below 256K it is still slower than the ordinary path: graph inputs, state transfers and GPU compute remain costly.
 5. **Long-context quality:** the short quality sets do not establish quality at 1M, or prove equivalence after the
    latest prediction changes.
 
@@ -204,7 +243,10 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_A
 cmake --build build --target llama-server llama-cli llama-perplexity llama-logits
 ```
 
-**2. The weights** — `tools/assemble.py` copies every tensor byte for byte from the public repositories at pinned
+**2. The weights.** `og`: download the 11 GGUF parts and `g44/1017-lens-d2.gguf` from [Hugging Face](https://huggingface.co/MasherDon/DeepSeek-V4.1-Flash-1017-SiegeLadder-GGUF).
+The engine looks for the lens in a folder named `g44` next to the model's folder: move `g44` one level up after the
+download, or point `LLAMA_MOE_STREAM_G44` at the file. `cd` and `qd`: `tools/assemble.py` copies every tensor byte
+for byte from the public repositories at pinned
 revisions (prometheusAIR's and ISTA-DASLab's GGUFs of 1017, DeepSeek's official 1017 release) into the 11 GGUF parts
 of our build, by HTTP range requests, so only the bytes the build uses are downloaded (373 GB, no full source files).
 Python 3 only, resumable; `template/` holds the parts' GGUF headers and a manifest with each tensor's source.
@@ -252,7 +294,7 @@ python bench/tf_series.py out/tf                 # its summary, corrected for dr
 
 | path | what |
 |---|---|
-| `patches/` | 112 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order. The commit messages quote their measurements and cite sections of our own log (`runs.md 4.xx`), which is not published |
+| `patches/` | 121 patches over JigSawPT's `dsv41-porte` @ `8ce0968`, oldest first; `series.txt` names the base and the order. The commit messages quote their measurements and cite sections of our own log (`runs.md 4.xx`), which is not published |
 | `bench/` | the benchmark scripts: server runs, agent turns, long documents, teacher-forced decode, quality against the API, Nsight profiles |
 | `docs/` | [techniques](docs/techniques.md), [measuring](docs/measuring.md), [switches](docs/switches.md) |
 | `docs/img/`, `docs/data/` | the charts (light and dark) and the numbers behind them |
