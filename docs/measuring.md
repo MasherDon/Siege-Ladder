@@ -20,7 +20,7 @@ token is the span between the log's "calculating perplexity" and "Final estimate
   published; any text of that length works - absolute speeds move a little with it, comparisons hold).
 - **Order.** A warm-up run, then the arms in A B B A order: the RAM tier and the drive's own caches warm up over a
   series, and ABBA cancels the trend.
-- **Drive stalls (D14).** Our Gen5 drive freezes for 35-50 ms about once a second in some runs, for minutes at a time
+- **Drive stalls.** Our Gen5 drive freezes for 35-50 ms about once a second in some runs, for minutes at a time
   (all reads in flight end within the same millisecond, apparently on the device's own clock; the copy on the second
   drive never stalls). The stalls land unevenly in the arms and cost ~2 ms per token, so raw means mislead. We count them
   (`SLOW_READ_MS` logs every read of 16 ms or more; reads ending within 5 ms of each other are one stall), fit one
@@ -59,7 +59,7 @@ We score how likely our build finds the full model's own answers:
    ~0.004.
 
 Prompt sets: **general-100** (100 short prompts from ds4's quality tests), **router-112** (112 code and agent prompts
-from ds4, up to 23K tokens), **general-ru** (ours: Russian prompts, not published) and **agent-long** (ours: 40 prompts
+from ds4, up to 23K tokens), **general-2** (ours, not published) and **agent-long** (ours: 40 prompts
 of 0.5-8K tokens of llama.cpp sources plus a question). The prompt sets of ds4 live in its repository; the API's
 answers are not redistributed here - collect your own with `api_collect.py` and a DeepSeek API key.
 

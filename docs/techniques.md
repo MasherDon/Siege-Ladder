@@ -15,11 +15,11 @@ each at ~2.4 bits. The 373 GB public `cd` build does not fit in RAM + VRAM; the 
   token, ~160 hit VRAM, ~61 come from RAM, ~10 from the drive and ~10 are dropped (the drop rule below).
 - **A pinned RAM tier** (`--moe-stream-l2`, JigSawPT's): we sized it to 43-46 GiB. Its ceiling is not Windows'
   needs but the WDDM budget of "shared GPU memory", which is RAM - 16 GB (48,245 MB on 64 GB); past ~46 GiB the
-  pinning silently fails and decode drops 15-20% (M1, M6). The tier's slots are sized per expert size (M3: 17% more
+  pinning silently fails and decode drops 15-20%. The tier's slots are sized per expert size (17% more
   experts in 46 GiB, drive reads -14%, +2.2%).
 - **Unbuffered NVMe reads, no memory mapping of the expert files.** An NTFS file that is also memory-mapped reads
-  about 3x slower unbuffered; the loader no longer maps or prefetches the expert files (M5: load 32 s -> 12-16 s).
-- **A copy of the expert files on a second NVMe** (P16): a read goes to the copy when the main drive has 4 reads in
+  about 3x slower unbuffered; the loader no longer maps or prefetches the expert files (load 32 s -> 12-16 s).
+- **A copy of the expert files on a second NVMe:** a read goes to the copy when the main drive has 4 reads in
   flight. The two drives together read 17.5-18.9 GB/s against 13.5 GB/s for one; cold prompts +11-22%. Decode does
   not gain: it waits for the latency of one critical read, not for bandwidth.
 - **17 I/O threads** (were 9): agent turns read +2.8%.
@@ -32,29 +32,29 @@ for only 3 ms, and idles 8 ms - 7 of them waiting for the drive. The bus is the 
 
 ### Off the critical path
 
-- **G16, the router's mailbox:** the GPU posts the router's choices into pinned host memory; the host remaps the
+- **The router's mailbox:** the GPU posts the router's choices into pinned host memory; the host remaps the
   experts without a synchronizing device-to-host copy (+6.2%).
-- **G22, the reply:** the host's answer (the VRAM slot of each expert) goes back the same way, read by the GPU at the
+- **The reply:** the host's answer (the VRAM slot of each expert) goes back the same way, read by the GPU at the
   next call: 43 -> 8 graph splits with CPU inputs, hand-offs 4.2 -> 1.9 ms per token (+2-5.5%).
-- **G24, one wake-up:** the I/O thread pool is woken once after the remap loop instead of at every miss; the first
+- **One wake-up:** the I/O thread pool is woken once after the remap loop instead of at every miss; the first
   copy starts 36 us earlier (+1.2%).
-- **G26 / G23, Engram rows:** the token's Engram rows are faulted in on a helper thread while the graph is built, then
+- **Engram rows:** the token's Engram rows are faulted in on a helper thread while the graph is built, then
   gathered right before the layer that reads them (+2.2%), and the decode graph is reused between tokens (+1.7%).
 - Together the host's part of a token went from ~7 ms to ~1 ms.
 
 ### Hiding the loads
 
-- **G2, runahead** (lossless): a layer's expert remap is split in two. Between the halves an approximate pass - the
+- **Runahead** (lossless): a layer's expert remap is split in two. Between the halves an approximate pass - the
   experts already resident, the others at weight 0 - runs the next layer's attention and router and stages its top 6
   experts into VRAM; then the exact layer runs unchanged. It caught ~91% of the misses at 0.1 wrong guesses per call
   (+11% at the time). It costs the GPU ~8 ms of compute per token, so it is the default only on the exact path.
-- **G31, split calls:** each MoE call computes the pairs whose experts are resident while the copies of the missing
+- **Split calls:** each MoE call computes the pairs whose experts are resident while the copies of the missing
   ones run (+2.8%).
-- **G35, heavy experts ahead:** the router of layer L+2 applied to layer L's input - "the lens", nearly free because
+- **Heavy experts ahead:** the router of layer L+2 applied to layer L's input - "the lens", nearly free because
   the GPU computes it in the mailbox - predicts the heavy experts that would come from the drive, and they are read
   into the RAM tier two layers early. +3-4% (+6.7% past 30K context); it gets ~55-60% of what a perfect predictor of
   the same experts would.
-- **G29 / G30:** a CSA mask view no longer forces a synchronous copy in every layer (+3.5% at 30K), and the exact
+- **Fewer synchronous copies:** a CSA mask view no longer forces a synchronous copy in every layer (+3.5% at 30K), and the exact
   expert GEMMs reuse the approximate pass's outputs (+1.3% on the exact path). Both bit-exact.
 
 ### The drop rule (lossy)
@@ -66,28 +66,28 @@ is on in the `default` preset; `exact` turns it off.
 
 ### The fast preset (lossy)
 
-- **C14, late experts:** up to one light pair per token (the drive's first) is not waited for; its copy is queued
+- **Late experts:** up to one light pair per token (the drive's first) is not waited for; its copy is queued
   last and its weighted sum enters after the next layer's attention, which does not see it (+4.8-5.2%, about +0.005
   nat on general-100).
-- **G40:** G35's lens stages up to one confident guess per call into VRAM two calls ahead (+3% in the earlier fast configuration). The math is
+- **Staging guesses into VRAM:** the lens stages up to one confident guess per call into VRAM two calls ahead (+3% in the earlier fast configuration). The math is
   untouched, but next to the drop rule ~5% more experts get dropped.
-- On the lighter `qd` build the fast preset decoded 23.46 tok/s on 28 October (before G44); 5 experts per token instead of 6 (`K5`, a separate
+- On the lighter `qd` build the fast preset decoded 23.46 tok/s on 28 October (before the lens correction); 5 experts per token instead of 6 (a separate
   switch) gave 24.97 in that run, for another +0.010-0.013 nat in earlier quality tests.
 
 ### New default prediction (4 November)
 
-- **G44:** a trained correction to the two-layer lens was +2.3% in `default` with GPU scheduling enabled, but its
+- **Lens correction:** a trained correction to the two-layer lens was +2.3% in `default` with GPU scheduling enabled, but its
   two A B B A pairs differed (+4.7% and 0.0%; 3 November). It changes staging, not expert arithmetic;
-  in a drop-enabled path timing can change which experts are dropped. The same series measured `qd` fast with G44
+  in a drop-enabled path timing can change which experts are dropped. The same series measured `qd` fast with the correction
   at 23.7 tok/s (+4.5%); free RAM fell very low during the series.
-- **G40 k=1 with G44:** staging one confident prediction into VRAM gave 20.26 → 21.30 tok/s (+5.1%) in two
+- **Staging with the corrected lens:** staging one confident prediction into VRAM gave 20.26 → 21.30 tok/s (+5.1%) in two
   A B B A blocks on `og` (4 November). The drop count rose 1.8%. Quality differences versus the
   previous default were within statistical uncertainty on three API sets, but the intervals do not establish
   equivalence. Both changes are enabled in `default` when the correction file is available.
 
 ### Long context
 
-- **D11, sparse attention in decode over a quantized KV cache:** the sparse path (top-512 indexer blocks plus the
+- **Sparse attention in decode over a quantized KV cache:** the sparse path (top-512 indexer blocks plus the
   window) used to require an f16 cache; with q8_0 / q4_0 it now gathers the same rows. 64K +32-41%, 128K x2.0-2.1;
   decode stays at 16-20 tok/s from short context to 512K.
 
@@ -98,57 +98,57 @@ A prompt runs in micro-batches through all 40 layers; every expert a batch route
 
 - **P1, the head yields:** the output head gives its VRAM to the compute buffers of a long prompt and is read back
   from its file afterwards (bit-exact).
-- **P9, the tier keeps the prompt's experts:** the RAM tier no longer evicts experts the prompt has touched; a ring
+- **The tier keeps the prompt's experts:** the RAM tier no longer evicts experts the prompt has touched; a ring
   takes what it reads past the tier's holding. A 23K prompt +25.5%, drive reads 1,473 -> 745 GB.
-- **P10, `-b` a multiple of `-ub`:** the server cut each chunk into 1536 + 512 at `-b 2048`: 64K +18.5%, drive -24%.
-- **P11, a shared pool:** a long prompt takes the VRAM of the expert cache and the waves of all layers share a pool
+- **`-b` a multiple of `-ub`:** the server cut each chunk into 1536 + 512 at `-b 2048`: 64K +18.5%, drive -24%.
+- **A shared pool:** a long prompt takes the VRAM of the expert cache and the waves of all layers share a pool
   of 64 slots: 64K and 128K +51%, cold 2.2K / 8.9K +37% / +79%.
-- **D10, sparse attention in prefill** as in decode (attention was 64% of the GPU's time at the end of a 128K
+- **Sparse attention in prefill** as in decode (attention was 64% of the GPU's time at the end of a 128K
   document); batch 8192 up to 32K.
-- **P4, encoder-only positions:** V4.1's decoder half (layers 20-39) reads nothing of a position but its window
+- **Encoder-only positions:** V4.1's decoder half (layers 20-39) reads nothing of a position but its window
   rings, so the positions of a call more than its reach before the first output run through the encoder only - half
   the experts, copies and compute of a long prompt. Bit-exact.
-- **C7, YoCo truncation** (DeepInfer's default for V4.1; lossy, within error on our three quality sets): the decoder
+- **YoCo truncation** (DeepInfer's default for V4.1; lossy, within error on our three quality sets): the decoder
   half computes only the last 140 positions. We skip its experts for the earlier rows (attention and dense layers
   still run on all of them): agent turns +13%, cold 2.2K / 8.9K +20% / +60%.
-- **P8 and P20 for agent turns:** a prompt's Engram rows are faulted in layer by layer under the compute of the
+- **Engram rows layer by layer and kept pinned blocks, for agent turns:** a prompt's Engram rows are faulted in layer by layer under the compute of the
   earlier layers instead of all before the first kernel (+5.6%; cold +9% / +6.3%), and pinned host blocks of 64 MiB
   and more are kept between prompts instead of 1.66 GiB being allocated and freed on every turn (+3.7%).
-- **P17, a thinner compute buffer:** expert outputs are weighted in place (-215 MiB at batch 6144).
-- **D12, 512K:** the dense prefill plan is reserved only for the positions where a sequence can take it, so 512K
+- **A thinner compute buffer:** expert outputs are weighted in place (-215 MiB at batch 6144).
+- **512K:** the dense prefill plan is reserved only for the positions where a sequence can take it, so 512K
   loads (a 451K-token document at 482 tok/s, answers 16-18 tok/s). This was the earlier configuration.
 
-- **C7c:** after the YoCo boundary, later decoder layers process only the needed rows. On the existing lossy YoCo
+- **Fewer decoder rows after YoCo:** after the YoCo boundary, later decoder layers process only the needed rows. On the existing lossy YoCo
   path, agent-turn reading time fell 14% (26 October); the row cut itself was checked against
   that path, including numerical batch effects.
-- **P8d:** read Engram rows directly from unmapped files: agent-turn reading time -5.2%, with bit-identical logits
+- **Direct Engram reads from unmapped files:** agent-turn reading time -5.2%, with bit-identical logits
   in the checks (26 October).
-- **P20, head copy:** retaining a host copy of the output head saved about 35 ms per turn (26 October).
-- **D15:** separate widths for encoder-only and full-model batches: the `cd` 1M-context document rose from 194.8
+- **Head copy:** retaining a host copy of the output head saved about 35 ms per turn (26 October).
+- **Two batch widths:** separate widths for encoder-only and full-model batches: the `cd` 1M-context document rose from 194.8
   to 470.7 tok/s, 81 to 33.5 minutes (26 October). Different batch layouts can change numerical rounding.
   On `og`, the 4 November default read 946,058 tokens at 365.78 tok/s (one run).
-- **D16:** a compute-buffer reserve that has a fallback is measured before it is allocated; a real 64K run at batch
+- **Measured reserves:** a compute-buffer reserve that has a fallback is measured before it is allocated; a real 64K run at batch
   16384 still failed, so that batch size is not a working default (29 October).
-- **P19 layer-major prefill, on by default from 256K context (5 November):** each layer runs over the whole prompt
+- **Layer-major prefill, on by default from 256K context (5 November):** each layer runs over the whole prompt
   before the next one, so a layer's experts are read once for the document instead of once per batch. On `og`,
   256K / 512K / 1M documents read at 1128.0 / 1042.99 / 887.93 tok/s (6 November, freshly rewritten Engram files;
   930.01 / 866.78 / 777.62 on 5 November, before the rewrite) against 365.78 tok/s for 1M on the ordinary path
   (4 November). The output matched the ordinary path byte for byte in a 48K check. Below 256K it is still slower
   (128K), so the ordinary path stays there.
-Reading agent turns went from 333 tok/s (before C7) to ~418 tok/s on 25 October; then a short turn cost ~5 s, 2-3 s
+Reading agent turns went from 333 tok/s (before YoCo truncation) to ~418 tok/s on 25 October; then a short turn cost ~5 s, 2-3 s
 of it waiting for expert loads.
 
 ## Quantization
 
-- **`og` (current baseline):** our GPTQ experts, calibrated on our own data, use the same types as Maya-S; the public assembler does not build it. On 27–28 October, `og` default was about 0.091 / 0.054 / 0.072 nat/token from the API across the three sets and scored 160/164 on HumanEval (before G44/G40).
+- **`og` (current baseline):** our GPTQ experts, calibrated on our own data, use the same types as Maya-S; the public assembler does not build it, and it is published on Hugging Face as it is. On 27–28 October, `og` default was about 0.091 / 0.054 / 0.072 nat/token from the API across the three sets and scored 160/164 on HumanEval (before the current expert prediction).
 - **The public build (`cd`):** prometheusAIR's IQ2_XS gate/up and Q2_K down for the experts, ISTA-DASLab's Q5_K dense part.
   The lighter dense part frees 3.0 GiB of VRAM - 6-8 more expert slots per layer - so `cd` decodes +8.5% against our
   first plain 2-bit mix and is no farther from the API (pooled over three sets ~0.008 nat closer, within error).
 - **`qd`** (IQ2_XXS gate/up, the same dense part): +16-18% decode for +0.004-0.005 nat - the fast preset's build.
 - prometheusAIR's whole IQ2_XS experts (IQ3_XXS down) were 0.031 nat closer to the API (~28% of the Q2 -> Q4 gap)
   at -11-13% decode; gate/up alone gave most of it, hence `cd`.
-- ISTA-DASLab's non-uniform GSQ-RCO experts lost to the plain mix on our API sets: +0.02 nat at "2.25" bits (+0.034
-  on Russian prompts), +0.12 at "2.00".
+- ISTA-DASLab's non-uniform GSQ-RCO experts lost to the plain mix on our API sets: +0.02 nat at "2.25" bits (up to +0.034
+  on one of the sets), +0.12 at "2.00".
 - Across all the builds and lossy switches we measured, speed and quality trade at about 0.002 nat per 1% of decode.
 
 ## What did not work
@@ -166,10 +166,10 @@ of it waiting for expert loads.
 | lossless compression of the 2-bit weights | at most 4.46% (zlib 0.8%) |
 | computing RAM-resident experts on the 6-core CPU | a probe gave +3-5% at best; left for a bigger CPU |
 | a direct NVMe -> GPU path, TCC / MCDM, WSL2, a bigger page file, power plans | not available on Windows with a GeForce, or no change |
-| repeated-text routes (G42) | offline: only 0.3–6% fewer disk-waiting calls, 1.3–3.5× disk reads (27 October) |
-| replace a dropped expert with another (C23) | offline: 1.26–1.37× the output error of dropping, on the measured events (28 October) |
-| layer-major prefill below 256K (P19) | 128K still slower than the ordinary path: transfers and graph costs remain (4–5 November); on by default only from 256K |
-| direct Engram reads while files are mapped (P8c) | a 3K prompt took 22 s instead of 12; unmapped files solved the coherence bottleneck (26 October) |
+| repeated-text routes | offline: only 0.3–6% fewer disk-waiting calls, 1.3–3.5× disk reads (27 October) |
+| replace a dropped expert with another | offline: 1.26–1.37× the output error of dropping, on the measured events (28 October) |
+| layer-major prefill below 256K | 128K still slower than the ordinary path: transfers and graph costs remain (4–5 November); on by default only from 256K |
+| direct Engram reads while files are mapped | a 3K prompt took 22 s instead of 12; unmapped files solved the coherence bottleneck (26 October) |
 
 ## Where the time is left
 

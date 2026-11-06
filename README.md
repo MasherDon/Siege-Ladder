@@ -35,32 +35,32 @@ ISTA-DASLab and official FP8 Engram tables. Both stream the routed experts from 
 | `og` (our current baseline) | our own GPTQ of all 40 layers on our calibration texts, with Maya-S's types: IQ2_XXS gate/up, IQ3_XXS down (IQ2_S / IQ3_S in layers 0–3 and 36–39) | [on Hugging Face](https://huggingface.co/MasherDon/DeepSeek-V4.1-Flash-1017-SiegeLadder-GGUF) (378 GB with the lens; not the final version) |
 | `cd` (public assembly, 373 GB) | prometheusAIR's IQ2_XS gate/up and Q2_K down | assembled from public sources by the script below |
 
-`og` is published as it runs here: the 11 GGUF parts and the G44 lens file. It is not the final version: work on
+`og` is published as it runs here: the 11 GGUF parts and the lens file. It is not the final version: work on
 quantization quality continues, and better builds will replace it. `cd` is assembled from public sources by the
 script below; its own numbers are listed after `og`'s. The fast-preset measurements use the lighter `qd` build
 (IQ2_XXS gate/up). See [Reproducing](#reproducing).
 
 ## Numbers (the defaults of 5 November 2026)
 
-The current `default` includes the expert drop rule and YoCo; it is not the lossless `exact` preset. G44 and G40
-need a 149 MB lens file (a learned correction of the router lens), published with the `og` weights; without it the
-engine runs as it did before them. From 256K context the prompt is read layer-major (on by default since
+The current `default` includes the expert drop rule and YoCo; it is not the lossless `exact` preset. The current
+expert prediction needs a 149 MB lens file (a learned correction of the router lens), published with the `og`
+weights; without the file the engine falls back to the older prediction. From 256K context the prompt is read layer-major (on by default since
 5 November; see [What helped most](#what-helped-most)). Dates below identify the measurements, not a claim that
 every row was remeasured on the same day.
 
 | `og`, unless stated | measurement |
 |---|---|
-| short-context decode, teacher-forced | 21.30 tok/s with G44 and G40 (4 November) |
-| agent turns 2–8, server | 18.7 tok/s decode; 506–520 tok/s reading (28 October, before G44/G40) |
-| `qd` fast / fast + K5 | 23.46 / 24.97 tok/s, respectively; additional quality trade-offs (28 October, before G44) |
-| `qd` fast with G44 | 23.7 tok/s (3 November; low free RAM during the series) |
+| short-context decode, teacher-forced | 21.30 tok/s with the current expert prediction (4 November) |
+| agent turns 2–8, server | 18.7 tok/s decode; 506–520 tok/s reading (28 October, before the current expert prediction) |
+| `qd` fast / fast with 5 experts per token | 23.46 / 24.97 tok/s, respectively; additional quality trade-offs (28 October, before the lens correction) |
+| `qd` fast with the lens correction | 23.7 tok/s (3 November; low free RAM during the series) |
 | decode, short context, server | 18.44 / 18.80 tok/s (6 November, two runs of the Maya comparison below) |
 | document in a 256K context | 246,135 tokens at 1128.0 tok/s (6 November, mean of two runs) |
 | document in a 512K context | 478,928 tokens at 1042.99 tok/s (6 November, one run) |
 | document in a 1M context | 947,417 tokens at 887.93 tok/s; answer 15.23 tok/s (6 November, one run) |
-| quality, distance to API | approximately 0.091 / 0.054 / 0.072 nat/token on general-100 / Russian / router-112; HumanEval 160/164 (27–28 October, before G44/G40) |
+| quality, distance to API | approximately 0.091 / 0.054 / 0.072 nat/token on general-100 / general-2 / router-112; HumanEval 160/164 (27–28 October, before the current expert prediction) |
 
-The publicly assembled `cd` with the defaults of 25–26 October (no G44 / G40):
+The publicly assembled `cd` with the defaults of 25–26 October (before the current expert prediction):
 
 | `cd` | measurement |
 |---|---|
@@ -94,8 +94,8 @@ experts on the GPU.
 
 **How it is measured.** Short-context decode uses teacher forcing, with YoCo disabled during that test, in A B B A
 order. Agent and document readings use server prompt timings. Quality is negative log-likelihood of the DeepSeek
-API's own continuations on three prompt sets; smaller distance to the API is better. The G44/G40 quality checks
-were within statistical uncertainty on these sets, but do not establish equivalence (4 November).
+API's own continuations on three prompt sets; smaller distance to the API is better. The quality checks of the current
+expert prediction were within statistical uncertainty on these sets, but do not establish equivalence (4 November).
 Details: [docs/measuring.md](docs/measuring.md).
 
 ## Hardware notes
@@ -135,10 +135,9 @@ Details: [docs/measuring.md](docs/measuring.md).
 7. **The public `cd` quant mix:** prometheusAIR's IQ2_XS gate/up + Q2_K down, ISTA-DASLab's lighter Q5_K dense part
    (3 GB less VRAM, so more expert slots: +8.5% decode, and at least as close to the API as a plain 2-bit mix).
 
-8. **Updated expert prediction:** G44 improves the lens; with GPU scheduling enabled it gave +2.3% decode in
-   `default` (3 November; the two pairs differed). G40 stages one prediction into VRAM ahead of time:
-   +5.1% on top of G44 (4 November). G40 changes cache occupancy and can change drops on the measured
-   `default` path.
+8. **Updated expert prediction:** a learned correction of the lens gave +2.3% decode in `default` with GPU
+   scheduling enabled (3 November; the two pairs differed). Staging one prediction into VRAM ahead of time added
+   +5.1% on top (4 November); it changes cache occupancy and can change drops on the measured `default` path.
 9. **Long prompts and Engram:** two batch widths made the 1M `cd` document 2.42× faster than batch 512; direct
    reads from unmapped Engram tables cut agent-turn reading time by 5.2%. Cutting decoder rows for YoCo cut it by
    14% in its comparison. These are separate configurations, measured 26 October.
@@ -156,13 +155,13 @@ Details: [docs/measuring.md](docs/measuring.md).
   read-ahead evicts what is still needed (≈0 even with a perfect oracle).
 - **"Free" guesses in the bus's idle time:** during decode there is none; each wrong staging into VRAM costs ~0.2 ms.
 - **A published non-uniform quant (GSQ-RCO) instead of our mix:** lower error offline, worse on our API sets
-  (+0.02 nat, +0.034 on Russian prompts) — the calibration text matters.
+  (+0.02 nat, up to +0.034 on one of the sets) — the calibration text matters.
 - **Splitting expert reads into chunks, CUDA graph optimizations:** within noise.
 - **Routes from repeated text:** only 0.3–6% of disk-waiting calls removed, with 1.3–3.5× disk reads in an offline
-  trace (G42, 27 October).
+  trace (27 October).
 - **Substituting another expert for a dropped one:** 1.26–1.37× the output error of dropping in an offline test
-  (C23, 28 October).
-- **Layer-major prefill below 256K:** at 128K it is still slower than the ordinary path (P19, 4–5 November), so it
+  (28 October).
+- **Layer-major prefill below 256K:** at 128K it is still slower than the ordinary path (4–5 November), so it
   switches on only from 256K context.
 
 ## Where the time goes
@@ -196,7 +195,7 @@ environment switches](docs/switches.md).
 ## Where we're stuck — ideas welcome
 
 1. **Predicting which experts a token needs 1–2 layers ahead.** Perfect prediction on `og` would give 27.89 tok/s
-   against 20.30 for the 28 October default; the lens before G44 reached 76% precision at ~14% recall (it needs
+   against 20.30 for the 28 October default; the lens before its learned correction reached 76% precision at ~14% recall (it needs
    ≥65–70% precision at ≥50% recall to pay off).
 2. **Overlapping compute with expert copies:** copies take ~30 ms per token, compute ~19 ms, and they overlap by 3 ms.
 3. **Short agent turns:** reading a turn costs ~5 s plus ~1 ms per new token (26 October), and 2–3 s of every turn is

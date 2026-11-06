@@ -49,7 +49,7 @@ def main():
     require_gpu()
     if port_busy():
         sys.exit(f"something already answers on port {PORT} - profile not started")
-    # the conversation of agent_turns.py (Russian): "You help make sense of code. Below are the tool outputs so far;
+    # the conversation of agent_turns.py: "You help make sense of code. Below are the tool outputs so far;
     # answer the last question." Each turn appends "### Tool output k", a chunk of C and "Question: ..."
     convo = "Ты помогаешь разбираться в коде. Ниже — выводы инструментов по ходу работы; отвечай на последний вопрос.\n"
     turns = []

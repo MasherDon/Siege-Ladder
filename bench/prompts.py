@@ -1,4 +1,4 @@
-"""Prompts of the server benchmarks, kept exactly as measured (two of them are in Russian, our working language)."""
+"""Prompts of the server benchmarks, kept exactly as measured."""
 
 CODE = '''class TTLCache:
     """LRU-кэш с временем жизни записи."""
