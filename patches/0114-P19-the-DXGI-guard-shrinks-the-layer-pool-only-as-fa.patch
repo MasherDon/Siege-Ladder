@@ -1,0 +1,144 @@
+From f0d416a19d5a48cb9554db80f3ace451f1ee5afe Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 16:35:38 +0000
+Subject: [PATCH 114/121] P19: the DXGI guard shrinks the layer pool only as
+ far as needed (lab L045)
+
+LLAMA_DSV4_LAYER_MAJOR_POOL_SHRINK=fit (off by default): when the guard fires, p19_lm_pool_shrink drops just enough
+slots to leave 512 MiB of headroom under budget - margin instead of falling back to the 64 base slots; the P24 plan
+follows the remaining pool; an allocation failure falls back to the base. The C7 boundary still shrinks to the base.
+1M document (SiegeLadder runs 4.303): the pool now lives to ubatch 459 of 464 in eight steps (384 -> 341 -> ... -> 64)
+instead of being cut at ubatch 192: 469.00 -> 511.30 tok/s. Byte for byte at 48K (exact and default, k 1 and 4).
+---
+ src/llama-context.cpp    | 12 +++++++++---
+ src/llama-moe-stream.cpp | 41 +++++++++++++++++++++++++++++++++++-----
+ src/llama-moe-stream.h   |  2 +-
+ 3 files changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e358b3c..b763260 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3320,7 +3320,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 if (ms_lm && ms_lm->p19_lm_pool_active) {
+                     ggml_backend_sched_synchronize(sched.get());
+                     gf_res_prev->reset(); // discard graph views of the old pool before any reuse
+-                    ms_lm->p19_lm_pool_shrink(reason, sc, layer, ub);
++                    ms_lm->p19_lm_pool_shrink(reason, sc, layer, ub, guard_mib);
+                     guard_pending = false;
+                 }
+             };
+@@ -3490,7 +3490,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 cparams.dsv4_lm_carry_in  = nullptr;
+                 cparams.dsv4_lm_carry_out = nullptr;
+ 
+-                if (guard_pending || p.yoco_lo >= 0) pool_shrink_before(guard_pending ? "guard" : "C7-full", u, 0, u);
++                if (guard_pending || p.yoco_lo >= 0) {
++                    const char * fit = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_SHRINK");
++                    const bool c7_first = fit && std::strcmp(fit, "fit") == 0 && p.yoco_lo >= 0;
++                    pool_shrink_before(c7_first ? "C7-full" : (guard_pending ? "guard" : "C7-full"), u, 0, u);
++                }
+                 ggml_status status = GGML_STATUS_SUCCESS;
+                 llm_graph_result * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, true);
+ 
+@@ -3603,7 +3607,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+                         if (guard_pending || (gr.first >= dec && p.yoco_lo >= 0)) {
+                             pending.finish();
+-                            pool_shrink_before(guard_pending ? "guard" : "C7-boundary", sc.first, gr.first, u);
++                            const char * fit = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_SHRINK");
++                            const bool c7_first = fit && std::strcmp(fit, "fit") == 0 && gr.first >= dec && p.yoco_lo >= 0;
++                            pool_shrink_before(c7_first ? "C7-boundary" : (guard_pending ? "guard" : "C7-boundary"), sc.first, gr.first, u);
+                         }
+                         ggml_status         status = GGML_STATUS_SUCCESS;
+                         llm_graph_result * res     = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 4c283d5..fea9c82 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -2885,11 +2885,11 @@ bool llama_moe_stream::p19_lm_pool_begin(uint32_t target_slots, size_t seg_reser
+     return true;
+ }
+ 
+-void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int layer, size_t ub) {
++void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int layer, size_t ub, size_t guard_mib) {
+     if (!p19_lm_pool_active || !p11_active) return;
+     std::unique_lock<std::mutex> lk(mtx);
+     moe_p11_quiesce_locked(*this, lk);
+-    const uint32_t P = p19_lm_base_slots;
++    uint32_t P = p19_lm_base_slots;
+     LLAMA_LOG_WARN("%s: P19 LM pool shrink reason=%s sc=%zu layer=%d ub=%zu hits=%" PRId64 " miss=%" PRId64 "\n",
+             __func__, reason, sc, layer, ub, stats.n_hit - p19_lm_hits0, stats.n_miss - p19_lm_miss0);
+         std::vector<const ggml_tensor *> widest;
+@@ -2905,6 +2905,21 @@ void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int la
+                 }
+             }
+         }
++        const char * fit = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_SHRINK");
++        const bool fit_guard = fit && std::strcmp(fit, "fit") == 0 && std::strcmp(reason, "guard") == 0;
++        const uint32_t old_p = p19_lm_pool_n;
++        size_t slot_bytes = 0;
++        for (const ggml_tensor * c : widest) slot_bytes += c->nb[2];
++        if (fit_guard && slot_bytes && old_p > p19_lm_base_slots) {
++            const llama_wddm_budget wb = llama_wddm_query_budget();
++            const uint64_t reserve = ((uint64_t) guard_mib + 512) * 1048576;
++            if (wb.ok) {
++                const uint64_t limit = wb.local_budget > reserve ? wb.local_budget - reserve : 0;
++                const uint64_t need = wb.local_usage > limit ? wb.local_usage - limit : 0;
++                const uint64_t drop = std::max<uint64_t>(1, need / slot_bytes + (need % slot_bytes != 0));
++                P = drop >= old_p - p19_lm_base_slots ? p19_lm_base_slots : old_p - (uint32_t) drop;
++            }
++        }
+         for (auto & sl : layers) {
+             if (sl) for (auto & wt : sl->weights) {
+                 wt.cache->data = nullptr;
+@@ -2926,7 +2941,21 @@ void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int la
+         }
+         ggml_backend_buffer_type_t buft = ctxs[0].first;
+         p11_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(p11_ctx.get(), buft));
++        if (!p11_buf && P > p19_lm_base_slots) {
++            P = p19_lm_base_slots;
++            for (ggml_tensor * t : pool) {
++                t->ne[2] = P;
++                t->nb[3] = t->nb[2] * P;
++            }
++            p11_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(p11_ctx.get(), buft));
++        }
+         if (!p11_buf) GGML_ABORT("P19 pool restore failed");
++        if (fit && std::strcmp(fit, "fit") == 0) {
++            const llama_wddm_budget after = llama_wddm_query_budget();
++            LLAMA_LOG_WARN("%s: P19 fit shrink reason=%s sc=%zu layer=%d ub=%zu slots=%u->%u pool_mib=%.2f->%.2f usage=%" PRIu64 " budget=%" PRIu64 " growth_mib=512\n",
++                    __func__, reason, sc, layer, ub, old_p, P, old_p * (double) slot_bytes / 1048576.0,
++                    P * (double) slot_bytes / 1048576.0, after.local_usage, after.local_budget);
++        }
+         ggml_backend_buffer_set_usage(p11_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+         ggml_backend_dev_t dev = compute_backend != nullptr ? ggml_backend_get_device(compute_backend) : nullptr;
+         for (auto & sl : layers) {
+@@ -2952,9 +2981,11 @@ void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int la
+                 }
+             }
+         }
+-    p19_lm_pool_active = false;
+-    plan_slots = p19_lm_base_slots; // the old pool and its graph views are gone
+-    p19_lm_pool_shrunk = true;
++    if (fit && std::strcmp(fit, "fit") == 0) p19_lm_pool_n = P;
++    p19_lm_pool_active = P > p19_lm_base_slots;
++    const char * pool_plan = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_PLAN");
++    plan_slots = p19_lm_pool_active && pool_plan && std::strcmp(pool_plan, "pool") == 0 ? P : p19_lm_base_slots;
++    p19_lm_pool_shrunk = !p19_lm_pool_active;
+     p19_lm_last_il = -1;
+ }
+ void llama_moe_stream::p19_lm_pool_end() {
+diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
+index ca5ebae..090dec2 100644
+--- a/src/llama-moe-stream.h
++++ b/src/llama-moe-stream.h
+@@ -662,7 +662,7 @@ struct llama_moe_stream {
+     // target_slots: 0 = auto from DXGI; seg_reserve_bytes = margin for segment graphs (POOL_MARGIN + peak sched buf)
+     bool p19_lm_pool_begin(uint32_t target_slots, size_t seg_reserve_bytes, size_t margin_mib);
+     bool p19_lm_pool_shrunk = false;
+-    void p19_lm_pool_shrink(const char * reason, size_t sc, int layer, size_t ub);
++    void p19_lm_pool_shrink(const char * reason, size_t sc, int layer, size_t ub, size_t guard_mib);
+     void p19_lm_pool_end(); // shrink to p19_lm_base_slots; no-op when p11_leave will restore the cache
+     // SiegeLadder P4: the last layer whose experts the latest graph build runs (-1: every layer) - an encoder-only ubatch
+     // stops before the first decoder layer's FFN, and nothing reads ahead into a layer it will not run. Set at graph build

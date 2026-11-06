@@ -1,7 +1,7 @@
 From 1922bdcbf2936771d5a3ed89e1e407e925574e5c Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 08:13:44 +0000
-Subject: [PATCH 110/112] llama : SiegeLadder P19 stage B step 1 -
+Subject: [PATCH 110/121] llama : SiegeLadder P19 stage B step 1 -
  LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED=1 recreates the scheduler without a reserve
  at the start of a layer-major call (as P1 does, CUDA pool trimmed), so the
  buffers grow only to the segment graphs met (L029; 128K -ub 2048: 1184-1340

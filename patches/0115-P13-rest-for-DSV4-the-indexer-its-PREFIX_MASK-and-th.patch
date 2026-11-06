@@ -1,0 +1,187 @@
+From f21a370f368683c4809d5f60f29f20873d89bf83 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 19:21:17 +0000
+Subject: [PATCH 115/121] P13 rest for DSV4: the indexer, its PREFIX_MASK and
+ the dense top-k mask per query chunk (lab L047)
+
+Under LLAMA_DSV4_ATTN_QCHUNK_LID=1, whenever P13 splits the queries (QCHUNK, or D10's own chunks), each chunk builds its
+own lid PREFIX_MASK rows (on the card with MASK_GPU, else views of the CPU input), runs build_lid_top_k on its rows and
+builds its dense top-k mask at full compressed width before slicing. The picks are concatenated for the top-k carry, and
+the D3 candidates are rebuilt as one SET_ROWS for P19's compact carry. C7c cuts stay consistent: lid_mask, cand_pin and
+positions come from c7c_cut, while mask_visible stays whole. Off by default; without the variable the graph is unchanged.
+
+48K (p19_check, -ub 2048, D10 chunks of 512): with LID=1 the normal path, layer-major k 1 and k 4, CPU and card masks,
+exact and default are all equal to each other byte for byte. Against LID=0 they are not: |d log p| mean 0.00008, max
+0.00085, no argmax change. The projections of the indexer now run per chunk, so their GEMMs see fewer rows. The same
+holds at -ub 8192 with QCHUNK 2048.
+
+1M layer-major with P24, L045 fit, GPU masks, pipe and async carry: 511.30 -> 705.60 tok/s (1.93x the normal path's
+365.78). The DXGI guard never fired and the layer pool lived through the whole document; compute is 111.7 ms per graph
+against 166.2 (SiegeLadder runs.md 4.307).
+---
+ src/models/deepseek4.cpp | 130 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index a222c7e..40059e0 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1152,8 +1152,98 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     ggml_tensor * top_k = nullptr;
+     if (topk_carry == nullptr || hparams.dsv4_is_index_source[il]) {
+         // the indexer wants the mask typed for itself; the attention keeps inp_csa.kq_mask
+-        top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.lid_mask,
+-                inp_csa.cand_pin, cand_carry, il);
++        const char * lid_chunk_env = getenv("LLAMA_DSV4_ATTN_QCHUNK_LID");
++        const auto & plan = inp_dsv4->p13;
++        const bool chunk_lid = parts && plan.n_chunk > 1 && lid_chunk_env && strcmp(lid_chunk_env, "1") == 0;
++        if (chunk_lid) {
++            const int64_t c0 = c7c ? inp_dsv4->c7c_chunk0 : 0;
++            const int64_t row0 = plan.t0[c0];
++            GGML_ASSERT(plan.t0.back() - row0 == cur->ne[1]);
++            int64_t max_cs = 0;
++            for (int64_t c = c0; c < plan.n_chunk; ++c) {
++                max_cs = std::max(max_cs, plan.t0[c + 1] - plan.t0[c]);
++            }
++            const auto width = [](const llm_graph_input_dsv4::comp_input & g) -> int64_t {
++                return g.kq_mask ? g.kq_mask->ne[0] : 0;
++            };
++            // Upper estimate for the unfused indexer's F32 KQ tensor; excludes backend workspaces.
++            const double kq_mib = double(inp_csa.lid_mask->ne[0])*double(max_cs)*
++                    double(hparams.indexer_n_head)*sizeof(float)/(1024.0*1024.0);
++            LLAMA_LOG_INFO("%s: L047 layer=%d chunks=%lld max_cs=%lld n_kv(csa/hca/lid)=%lld/%lld/%lld "
++                    "unfused_kq_est=%.1f MiB\n", __func__, il, (long long) (plan.n_chunk-c0),
++                    (long long) max_cs, (long long) width(inp_dsv4->get_csa()),
++                    (long long) width(inp_dsv4->get_hca()), (long long) inp_csa.lid_mask->ne[0], kq_mib);
++            ggml_tensor * incoming = cand_carry ? *cand_carry : nullptr;
++            ggml_tensor * published = nullptr;
++            ggml_tensor * published_idx = nullptr;
++            for (int64_t c = c0; c < plan.n_chunk; ++c) {
++                const int64_t off = plan.t0[c] - row0;
++                const int64_t n = plan.t0[c + 1] - plan.t0[c];
++                auto rows2 = [&](ggml_tensor * t) -> ggml_tensor * {
++                    if (!t) return nullptr;
++                    GGML_ASSERT(t->ne[3] == 1 && t->ne[2] == 1);
++                    return ggml_view_2d(ctx0, t, t->ne[0], n, t->nb[1], (size_t) off*t->nb[1]);
++                };
++                ggml_tensor * cq = rows2(qr);
++                ggml_tensor * cc = rows2(cur);
++                ggml_tensor * cp = ggml_view_1d(ctx0, inp_pos, n, (size_t) off*inp_pos->nb[0]);
++                ggml_tensor * mask = nullptr;
++                if (inp_csa.mask_visible) {
++                    ggml_tensor * visible = ggml_view_1d(ctx0, inp_csa.mask_visible, n,
++                            (size_t) plan.t0[c]*inp_csa.mask_visible->nb[0]);
++                    mask = ggml_prefix_mask(ctx0, visible, inp_csa.lid_mask->ne[0], 1, inp_csa.lid_mask->type);
++                    if (sched && ggml_backend_sched_get_n_backends(sched) > 1) {
++                        ggml_backend_t gpu = ggml_backend_sched_get_backend(sched, 0);
++                        if (gpu && gpu != backend_cpu && ggml_backend_supports_op(gpu, mask))
++                            ggml_backend_sched_set_tensor_backend(sched, mask, gpu);
++                    }
++                } else {
++                    mask = rows2(inp_csa.lid_mask);
++                }
++                ggml_tensor * pin = rows2(inp_csa.cand_pin);
++                ggml_tensor * candidate = nullptr;
++                if (incoming) {
++                    const int axis = incoming->ne[0] == 1 && incoming->ne[2] == cur->ne[1] ? 2 : 1;
++                    int64_t ne[4] = {incoming->ne[0], incoming->ne[1], incoming->ne[2], incoming->ne[3]};
++                    GGML_ASSERT(ne[axis] == cur->ne[1] && incoming->ne[3] == 1);
++                    ne[axis] = n;
++                    candidate = ggml_view_4d(ctx0, incoming, ne[0], ne[1], ne[2], ne[3],
++                            incoming->nb[1], incoming->nb[2], incoming->nb[3], (size_t) off*incoming->nb[axis]);
++                }
++                ggml_tensor * pick = build_lid_top_k(model, inp_dsv4, cq, cc, cp, mask, pin,
++                        cand_carry ? &candidate : nullptr, il);
++                // Materialize each result before building the next score graph.
++                ggml_build_forward_expand(gf, pick);
++                if (il == hparams.dsv4_candidate_source_layer && candidate) {
++                    if (dsv4_cand_compact() && n_tokens > 1) {
++                        GGML_ASSERT(candidate->op == GGML_OP_SET_ROWS && candidate->src[1]->type == GGML_TYPE_I32);
++                        ggml_tensor * idx = ggml_cont(ctx0, candidate->src[1]);
++                        ggml_build_forward_expand(gf, idx);
++                        published_idx = published_idx ? ggml_concat(ctx0, published_idx, idx, 1) : idx;
++                    } else {
++                        ggml_build_forward_expand(gf, candidate);
++                        published = published ? ggml_concat(ctx0, published, candidate, 1) : candidate;
++                    }
++                }
++                top_k = top_k ? ggml_concat(ctx0, top_k, pick, 1) : pick;
++            }
++            if (published_idx) {
++                // Preserve SET_ROWS so P19 can export src[1] as its compact candidate carry.
++                const int64_t nb = inp_csa.cand_pin->ne[0];
++                ggml_tensor * keep = ggml_repeat_4d(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1),
++                        nb, published_idx->ne[1], 1, published_idx->ne[2]);
++                keep = ggml_fill_inplace(ctx0, keep, -INFINITY);
++                keep = ggml_reshape_4d(ctx0, keep, 1, nb, published_idx->ne[1], published_idx->ne[2]);
++                ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, published_idx->ne[0],
++                        published_idx->ne[1], published_idx->ne[2]);
++                zeros = ggml_fill(ctx0, zeros, 0.0f);
++                published = ggml_set_rows(ctx0, keep, zeros, published_idx);
++            }
++            if (cand_carry && published) *cand_carry = published;
++        } else {
++            top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.lid_mask,
++                    inp_csa.cand_pin, cand_carry, il);
++        }
+         if (topk_carry) {
+             *topk_carry = top_k;
+         }
+@@ -1233,9 +1323,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         parts->q         = q;
+         parts->ring      = ring_w;
+         parts->comp_k    = csa_k;
+-        parts->comp_mask = sparse ? nullptr : build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
++        // L047: defer the dense top-k mask to each query chunk on explicit opt-in.
++        const char * lid_chunk_env = getenv("LLAMA_DSV4_ATTN_QCHUNK_LID");
++        const bool defer_mask = !sparse && p13.n_chunk > 1 &&
++                lid_chunk_env && strcmp(lid_chunk_env, "1") == 0;
++        parts->comp_mask = sparse ? nullptr : defer_mask ? inp_csa.kq_mask :
++                build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+         parts->k_rot     = k_rot;
+-        parts->top_k     = sparse ? top_k : nullptr;
++        parts->top_k     = sparse || defer_mask ? top_k : nullptr;
+         return nullptr;
+     }
+     GGML_ASSERT(raw_mask != nullptr); // C7c past the cut: c7c_raw_mask exists exactly when there is no P13 plan
+@@ -1998,7 +2093,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         }
+ 
+         // SiegeLadder D10: the flavour handed over the picks instead of their mask - this layer attends sparsely
+-        const bool sparse = pa.top_k != nullptr;
++        const bool sparse = pa.top_k != nullptr && pa.comp_mask == nullptr;
++        const bool chunk_top_mask = pa.top_k != nullptr && pa.comp_mask != nullptr;
+         GGML_ASSERT(pa.q != nullptr && pa.ring != nullptr);
+         GGML_ASSERT((widths != nullptr) == (pa.comp_k != nullptr));
+         GGML_ASSERT(sparse ? p13.sparse && sp_group >= 0 && pa.comp_k != nullptr && pa.comp_mask == nullptr
+@@ -2095,7 +2191,29 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+                     // F16, which the concatenation makes. The top-k mask is a GPU tensor of this layer, its view costs
+                     // nothing; V4's HCA mask is the graph input, sliced once per graph
+                     ggml_tensor * cm = nullptr;
+-                    if (comp_is_input) {
++                    if (chunk_top_mask) {
++                        // Keep full compressed width through set_rows: picks can be
++                        // outside w when fewer than top-k positions are visible.
++                        const auto & group = sp_group == 0 ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
++                        ggml_tensor * vis = nullptr;
++                        if (group.mask_visible) {
++                            ggml_tensor * nv = ggml_view_1d(ctx0, group.mask_visible, n,
++                                    (size_t) p13.t0[c]*group.mask_visible->nb[0]);
++                            vis = ggml_prefix_mask(ctx0, nv, pa.comp_mask->ne[0], 1, pa.comp_mask->type);
++                            if (sched && ggml_backend_sched_get_n_backends(sched) > 1) {
++                                ggml_backend_t gpu = ggml_backend_sched_get_backend(sched, 0);
++                                if (gpu && gpu != backend_cpu && ggml_backend_supports_op(gpu, vis))
++                                    ggml_backend_sched_set_tensor_backend(sched, vis, gpu);
++                            }
++                        } else {
++                            vis = ggml_view_2d(ctx0, pa.comp_mask, pa.comp_mask->ne[0], n,
++                                    pa.comp_mask->nb[1], (size_t) i0*pa.comp_mask->nb[1]);
++                        }
++                        ggml_tensor * picks = ggml_view_2d(ctx0, pa.top_k, pa.top_k->ne[0], n,
++                                pa.top_k->nb[1], (size_t) i0*pa.top_k->nb[1]);
++                        ggml_tensor * full = build_top_k_mask(vis, picks, "csa_top_k_mask_chunk", il);
++                        cm = ggml_view_2d(ctx0, full, w, n, full->nb[1], 0);
++                    } else if (comp_is_input) {
+                         cm = inp_dsv4->p13_hca_c[c];
+                     } else if (w == pa.comp_mask->ne[0] && n == nt) {
+                         cm = pa.comp_mask;

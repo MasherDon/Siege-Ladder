@@ -1,7 +1,7 @@
 From f612338df738aa63efa404f7ec8989c5b72f21d7 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 04:42:25 +0000
-Subject: [PATCH 107/112] llama : SiegeLadder P19 - the host tier runs CLOCK
+Subject: [PATCH 107/121] llama : SiegeLadder P19 - the host tier runs CLOCK
  for a layer-major call (P9's prompt holding ended;
  LLAMA_DSV4_LAYER_MAJOR_SCAN=1 keeps it): P9 lets a layer keep ~1/40 of the
  tier, right for ubatch -> all layers, but here the next graph is the same

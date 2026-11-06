@@ -1,7 +1,7 @@
 From b524d43eab12fb57ea3192acfad644f7901358df Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 20:34:36 +0000
-Subject: [PATCH 101/112] model + moe-stream : SiegeLadder G44 - G35's lens
+Subject: [PATCH 101/121] model + moe-stream : SiegeLadder G44 - G35's lens
  with a learned correction (LLAMA_MOE_STREAM_G44=<gguf file>, off by default).
  For each pair S -> S + 2 a ridge regression (strength 0.1 x the mean of the
  Gram matrix's diagonal; C17's dumps, 98 sequences, 199K tokens of router

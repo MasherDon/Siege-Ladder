@@ -1,7 +1,7 @@
 From 109eaa656a8d9f0528afb6cbf2ace41b92cb1f59 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 18:29:27 +0000
-Subject: [PATCH 093/112] dsv4 + graph + moe-stream : SiegeLadder C7c - past
+Subject: [PATCH 093/121] dsv4 + graph + moe-stream : SiegeLadder C7c - past
  layer 20 the ubatch holding C7's bound runs only its rows from the bound (on
  by default with C7b, LLAMA_DSV4_YOCO_CUT=0 - off; _CUT_MIN - the rows the cut
  must leave, 64). The rows before the bound are C7b's rows without

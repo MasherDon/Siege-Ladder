@@ -1,7 +1,7 @@
 From 864b18a944b79e5c398be85738db54d078362ce9 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 09:37:30 +0000
-Subject: [PATCH 112/112] llama : SiegeLadder P19 stage B step 3 - the layer
+Subject: [PATCH 112/121] llama : SiegeLadder P19 stage B step 3 - the layer
  pool shrinks back to P11's 64 slots before the graph of the ubatch holding
  the C7 bound reaches the decoder layers, where the 512K scheduler buffer
  grows to 5438 MiB, plus a DXGI guard (LLAMA_DSV4_LAYER_MAJOR_POOL_GUARD_MIB,

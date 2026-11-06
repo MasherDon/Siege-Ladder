@@ -1,0 +1,28 @@
+From fcc557f4e821e18fd628d0f349fd2f5634604e51 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 05 Nov 2026 05:53:17 +0000
+Subject: [PATCH 121/121] M21: llm_graph_input_engram owns its llama_hparams
+ copy - it held a reference to the graph builder's local llm_graph_params copy
+ (graph_reserve's gparams, process_ubatch's too), and the P8d read-ahead
+ thread read engram_layer_ids through it after that copy died: the silent load
+ deaths (0xC0000005 in read_rows during the first sched_reserve, caught by the
+ L049 reporter). Every other graph input already owns a copy. 48K byte for
+ byte; 18 loads at 512K/1M without a death (lab L052, Codex)
+
+---
+ src/llama-graph.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 5c00fcc..a1e6d77 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -830,7 +830,7 @@ public:
+     std::vector<std::vector<uint8_t>> dec_rows;
+     std::vector<std::vector<int64_t>> dec_idx;
+ 
+-    const llama_hparams & hparams;
++    const llama_hparams hparams; // owned: the graph builder's params are temporary
+     const llama_model   & model;
+ 
+     const llama_kv_cache_dsv4_context * mctx;

@@ -1,0 +1,170 @@
+From fbfd8a4253c6d9739bc9d272d044bf660e9844cd Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 05 Nov 2026 01:29:48 +0000
+Subject: [PATCH 118/121] R21 defaults: LID on unless
+ LLAMA_DSV4_ATTN_QCHUNK_LID=0; common turns layer-major on (unset variables
+ only: GIB 5, VRAM, SEG_SCHED, pool, plan, fit, masks on the card, pipe, async
+ carry, M9 with the 3840 MiB prompt reserve, QCHUNK 2048 above -ub 2048) when
+ -c >= LLAMA_DSV4_LAYER_MAJOR_AUTO_CTX (262144); alloc_l2 cuts the tier for
+ the pinned ubatch state (lab L050, Codex + lead)
+
+---
+ common/common.cpp        | 61 ++++++++++++++++++++++++++++++++++++++++
+ src/llama-moe-stream.cpp | 33 ++++++++++++++++++++++
+ src/models/deepseek4.cpp |  6 ++--
+ 3 files changed, 97 insertions(+), 3 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index 8b0eb8f..3dc7e4e 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -16,6 +16,7 @@
+ #include <cmath>
+ #include <chrono>
+ #include <cstdarg>
++#include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+ #include <filesystem>
+@@ -1231,11 +1232,71 @@ struct common_init_result::impl {
+     std::vector<llama_sampler_seq_config> samplers_seq_config;
+ };
+ 
++// R21: resolve before model loading, since the streamed L2 tier is allocated there.
++static void common_dsv4_r21_defaults(const common_params & params) {
++    long long threshold = 262144;
++    if (const char * value = std::getenv("LLAMA_DSV4_LAYER_MAJOR_AUTO_CTX")) {
++        char * end = nullptr;
++        const long long parsed = std::strtoll(value, &end, 10);
++        if (end != value && *end == '\0' && parsed > 0) {
++            threshold = parsed;
++        } else {
++            COM_WRN("R21 defaults: invalid AUTO_CTX '%s'; using 262144\n", value);
++        }
++    }
++    const char * lm = std::getenv("LLAMA_DSV4_LAYER_MAJOR");
++    if (lm != nullptr) {
++        COM_INF("R21 defaults: layer-major explicitly set to '%s'; LID defaults on unless set in env\n", lm);
++        return;
++    }
++    if (params.n_ctx <= 0 || params.n_ctx < threshold) {
++        COM_INF("R21 defaults: n_ctx %d below threshold %lld or unspecified, layer-major off; LID defaults on unless set in env\n",
++                params.n_ctx, threshold);
++        return;
++    }
++    std::string set, kept, failed;
++    auto set_default = [&](const char * name, const char * value) {
++        std::string * list = &kept;
++        if (std::getenv(name) == nullptr) {
++#ifdef _WIN32
++            const int rc = _putenv_s(name, value);
++#else
++            const int rc = setenv(name, value, 0);
++#endif
++            list = rc == 0 ? &set : &failed;
++        }
++        if (!list->empty()) *list += ", ";
++        *list += name;
++        *list += "=";
++        const char * actual = std::getenv(name);
++        *list += actual ? actual : "<unset>";
++    };
++    set_default("LLAMA_DSV4_LAYER_MAJOR", "1");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_GIB", "5");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_VRAM", "1");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_SEG_SCHED", "1");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_POOL", "auto");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_POOL_PLAN", "pool");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_POOL_SHRINK", "fit");
++    set_default("LLAMA_DSV4_MASK_GPU", "1");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_PIPE", "1");
++    set_default("LLAMA_DSV4_LAYER_MAJOR_CARRY_ASYNC", "1");
++    // M9 (L026): the prompt graph's pinned CUDA_Host buffers share the WDDM budget with the tier and the ubatch state;
++    // without this reserve the R21 cut in alloc_l2 leaves level 42 at ~40 GiB, over the budget at -ub 4096 (lead, 05.11)
++    set_default("LLAMA_MOE_STREAM_L2_WDDM_FIT", "1");
++    set_default("LLAMA_MOE_STREAM_L2_PP_HOST_MIB", "3840");
++    if (params.n_ubatch > 2048) set_default("LLAMA_DSV4_ATTN_QCHUNK", "2048");
++    COM_INF("R21 defaults: layer-major auto (n_ctx %d >= %lld): set %s; kept from env: %s; failed: %s; LID defaults on unless set in env\n",
++            params.n_ctx, threshold, set.c_str(), kept.c_str(), failed.c_str());
++}
++
+ common_init_result::common_init_result(common_params & params, bool model_only) :
+     pimpl(new impl{}) {
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
++    common_dsv4_r21_defaults(params);
++
+     if (params.fit_params) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index fea9c82..77ba2d7 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -564,6 +564,39 @@ void llama_moe_stream::alloc_l2(ggml_backend_buffer_type_t host_buft) {
+                     total_margin/1048576.0, (double) margin_base_mib, (double) margin_pp_mib,
+                     room_fit/1048576.0, want/1048576.0);
+         }
++        // R21: layer-major batch state also consumes the shared pinned budget.
++        // Include the M9 pp reserve only when its fit is enabled; this is an
++        // independent cut even when M9 fit is disabled.
++        const char * lm = std::getenv("LLAMA_DSV4_LAYER_MAJOR");
++        if (lm != nullptr && std::atoi(lm) != 0) {
++            int gib = 8; // matches llama_context's explicit-mode default
++            if (const char * s = std::getenv("LLAMA_DSV4_LAYER_MAJOR_GIB")) {
++                const int v = std::atoi(s);
++                if (v > 0) gib = v;
++            }
++            size_t pp = 0;
++            if (fit_env != nullptr && std::strtol(fit_env, nullptr, 10) != 0) {
++                if (const char * s = std::getenv("LLAMA_MOE_STREAM_L2_PP_HOST_MIB")) {
++                    pp = (size_t) std::max(0LL, atoll(s)) << 20;
++                }
++            }
++            const uint64_t batch_reserve = (uint64_t) gib << 30;
++            if (wb.ok) {
++                const uint64_t available = wb.nonlocal_budget > wb.nonlocal_usage ? wb.nonlocal_budget - wb.nonlocal_usage : 0;
++                // Subtract sequentially to avoid unsigned underflow when the budget is exhausted.
++                uint64_t room = available;
++                for (uint64_t reserve : { (uint64_t) margin, (uint64_t) pp, batch_reserve }) {
++                    room = room > reserve ? room - reserve : 0;
++                }
++                const size_t before = want;
++                if (room < want) want = (size_t) room;
++                LLAMA_LOG_INFO("%s: R21 WDDM: budget %.0f MiB, in_use %.0f, base %.0f, pp_host %.0f, layer-major %.0f; tier %.0f -> %.0f MiB\n",
++                        __func__, wb.nonlocal_budget/1048576.0, wb.nonlocal_usage/1048576.0,
++                        margin/1048576.0, pp/1048576.0, batch_reserve/1048576.0, before/1048576.0, want/1048576.0);
++            } else {
++                LLAMA_LOG_WARN("%s: R21 WDDM: budget unavailable; cannot reserve layer-major pinned state or cut L2\n", __func__);
++            }
++        }
+     }
+ 
+     bool classes = true;
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 35df6f2..81b3264 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1182,7 +1182,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         // the indexer wants the mask typed for itself; the attention keeps inp_csa.kq_mask
+         const char * lid_chunk_env = getenv("LLAMA_DSV4_ATTN_QCHUNK_LID");
+         const auto & plan = inp_dsv4->p13;
+-        const bool chunk_lid = parts && plan.n_chunk > 1 && lid_chunk_env && strcmp(lid_chunk_env, "1") == 0;
++        const bool chunk_lid = parts && plan.n_chunk > 1 && (lid_chunk_env == nullptr || strcmp(lid_chunk_env, "1") == 0);
+         if (chunk_lid) {
+             const int64_t c0 = c7c ? inp_dsv4->c7c_chunk0 : 0;
+             const int64_t row0 = plan.t0[c0];
+@@ -1364,10 +1364,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+         parts->q         = q;
+         parts->ring      = ring_w;
+         parts->comp_k    = csa_k;
+-        // L047: defer the dense top-k mask to each query chunk on explicit opt-in.
++        // L047: defer the dense top-k mask to each query chunk (LID=0 disables).
+         const char * lid_chunk_env = getenv("LLAMA_DSV4_ATTN_QCHUNK_LID");
+         const bool defer_mask = !sparse && p13.n_chunk > 1 &&
+-                lid_chunk_env && strcmp(lid_chunk_env, "1") == 0;
++                (lid_chunk_env == nullptr || strcmp(lid_chunk_env, "1") == 0);
+         parts->comp_mask = sparse ? nullptr : defer_mask ? inp_csa.kq_mask :
+                 build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+         parts->k_rot     = k_rot;

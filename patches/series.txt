@@ -1,7 +1,7 @@
 # Siege-Ladder: the patch series over JigSawPT's llama.cpp fork (the DeepSeek-V4.1 port with SSD streaming)
 # upstream  https://github.com/JigSawPT/llama.cpp  branch dsv41-porte
 # base      8ce0968539b1a6795f3413c2783dfa5646b4688a  (2026-09-23)
-# patches   112, oldest first; exported from our branch at 864b18a
+# patches   121, oldest first; exported from our branch at fcc557f
 # apply     git checkout 8ce0968539b1a6795f3413c2783dfa5646b4688a && git am path/to/patches/*.patch
 # note      the commit messages quote their measurements and cite sections of our own measurement log
 #           (runs.md 4.xx), which is not published
@@ -118,3 +118,12 @@
 0110-llama-SiegeLadder-P19-stage-B-step-1-LLAMA_DSV4_LAYE.patch
 0111-llama-SiegeLadder-P19-stage-B-step-2-LLAMA_DSV4_LAYE.patch
 0112-llama-SiegeLadder-P19-stage-B-step-3-the-layer-pool-.patch
+0113-P19-stage-B-P24-wave-plan-over-the-whole-layer-pool-.patch
+0114-P19-the-DXGI-guard-shrinks-the-layer-pool-only-as-fa.patch
+0115-P13-rest-for-DSV4-the-indexer-its-PREFIX_MASK-and-th.patch
+0116-server-drain-the-asynchronous-log-before-llama_serve.patch
+0117-P13-LID-byte-for-byte-indexer-projections-q-RoPE-hea.patch
+0118-R21-defaults-LID-on-unless-LLAMA_DSV4_ATTN_QCHUNK_LI.patch
+0119-M20-p1_leave-frees-the-layer-major-pipe-s-H-buffer-L.patch
+0120-common-crash-reporter-under-LLAMA_CRASH_REPORT-1-an-.patch
+0121-M21-llm_graph_input_engram-owns-its-llama_hparams-co.patch

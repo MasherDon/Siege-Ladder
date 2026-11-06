@@ -1,7 +1,7 @@
 From 6df8957a59fe489c37cb2aed7c74bd9ebaed9a14 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 06:24:42 +0000
-Subject: [PATCH 100/112] context : SiegeLadder D15 v2 - a call's last N tokens
+Subject: [PATCH 100/121] context : SiegeLadder D15 v2 - a call's last N tokens
  always go narrow, the automatic mode halves the encoder-only width too, and a
  reserve no longer repeats what failed before. (1) The plan's wide part ends N
  tokens before the call's end (and at P4's limit, as before): a call that fits

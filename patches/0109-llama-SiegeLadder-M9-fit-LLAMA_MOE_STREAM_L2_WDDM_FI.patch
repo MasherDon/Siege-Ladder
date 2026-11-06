@@ -1,7 +1,7 @@
 From e2cab3c194aeeb03dca9f248f1619a578f81542c Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 07:17:28 +0000
-Subject: [PATCH 109/112] llama : SiegeLadder M9 fit -
+Subject: [PATCH 109/121] llama : SiegeLadder M9 fit -
  LLAMA_MOE_STREAM_L2_WDDM_FIT=1 with LLAMA_MOE_STREAM_L2_PP_HOST_MIB=N keeps N
  MiB of the WDDM shared budget for the prompt graph's CUDA_Host buffer before
  the tier is laid out (L026: 512K at -ub 2048 and tier 42 failed at load,

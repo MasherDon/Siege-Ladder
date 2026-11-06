@@ -1,7 +1,7 @@
 From 1bda74ba9edf52864d579ce3791570fd35ab299a Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 20:35:39 +0000
-Subject: [PATCH 097/112] graph + mmap + model : SiegeLadder P8d - the Engram
+Subject: [PATCH 097/121] graph + mmap + model : SiegeLadder P8d - the Engram
  tables unmapped, every row read straight from the model files (on by default,
  LLAMA_ENGRAM_UNMAPPED=0 - off). At load the files that hold nothing
  host-resident but engram tables (on 1017: the two 98 GB FP8 tables and layer

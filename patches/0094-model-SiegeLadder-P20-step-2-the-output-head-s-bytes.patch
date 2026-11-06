@@ -1,7 +1,7 @@
 From b4ea7d73ceb446aae2abc6204b15b8c6ff494b32 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 18:29:41 +0000
-Subject: [PATCH 094/112] model : SiegeLadder P20 step 2 - the output head's
+Subject: [PATCH 094/121] model : SiegeLadder P20 step 2 - the output head's
  bytes kept in RAM from its first release on (LLAMA_HEAD_HOST_COPY=0 - off):
  P1's restore after a prompt is one copy to the card instead of a direct read
  of the model file, which the expert stream keeps busy (134 ms of a turn's

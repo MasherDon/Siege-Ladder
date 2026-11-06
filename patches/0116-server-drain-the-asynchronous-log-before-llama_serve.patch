@@ -1,0 +1,30 @@
+From bd06cce0220103740bc77e6808eb53daffc602ab Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 20:32:32 +0000
+Subject: [PATCH 116/121] server: drain the asynchronous log before
+ llama_server returns - failed loads exited with their error lines still
+ queued (SiegeLadder runs 4.308)
+
+---
+ tools/server/server.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index ac3524d..03ac053 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -109,7 +109,13 @@ int llama_server(int argc, char ** argv) {
+     llama_backend_init();
+     llama_numa_init(params.numa);
+ 
+-    return llama_server(params, argc, argv);
++    // SiegeLadder: drain the asynchronous log before returning. The logger is a leaked singleton in llama-common.dll,
++    // so lines still queued when the process exits are lost: failed loads returned 1 with all their error lines unwritten
++    // (runs 4.308). Here the worker thread is still alive; pause() writes the queue and joins it, and later lines are
++    // dropped. A TerminateProcess (the bench stopping the server) skips this, as before.
++    const int rc = llama_server(params, argc, argv);
++    common_log_pause(common_log_main());
++    return rc;
+ }
+ 
+ int llama_server(common_params & params, int argc, char ** argv) {

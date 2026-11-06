@@ -1,7 +1,7 @@
 From 2a7e6b67c9eca8ccf299ee802c3bdc0a51500711 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 00:26:38 +0000
-Subject: [PATCH 105/112] server : Ctrl+Break shuts down cleanly too
+Subject: [PATCH 105/121] server : Ctrl+Break shuts down cleanly too
  (SiegeLadder): bench stop() sends CTRL_BREAK_EVENT to the server's process
  group and the default handler killed it before any destructor ran, so
  LLAMA_MOE_STREAM_TRACE was never written from a server; now it is handled

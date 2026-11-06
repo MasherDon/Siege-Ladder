@@ -1,7 +1,7 @@
 From 602ff406cf598a609d8cfa190e8773a3601974b2 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 28 Oct 2026 21:15:47 +0000
-Subject: [PATCH 102/112] context + ggml-alloc : SiegeLadder D16 - a reserve
+Subject: [PATCH 102/121] context + ggml-alloc : SiegeLadder D16 - a reserve
  with a fallback behind it is measured before it is allocated (on by default;
  LLAMA_DSV4_FIT_MARGIN_MIB=M - keep M MiB back, -1 - off). D15's automatic
  widths (the whole model's and P4's encoder-only), and D12's non-sparse graph

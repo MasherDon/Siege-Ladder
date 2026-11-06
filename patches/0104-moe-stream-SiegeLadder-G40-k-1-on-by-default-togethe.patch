@@ -1,7 +1,7 @@
 From 1012413de926652d86f727f61e8204973b9ba9e1 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Tue, 03 Nov 2026 18:05:31 +0000
-Subject: [PATCH 104/112] moe-stream : SiegeLadder G40 k 1 on by default
+Subject: [PATCH 104/121] moe-stream : SiegeLadder G40 k 1 on by default
  together with G44 (the user's decision R17 of 04.11). With
  LLAMA_MOE_STREAM_G40 unset G40 stages up to 1 of G35's corrected lens's best
  into VRAM 2 calls ahead; next to an oracle or A' (they stage on their own) a

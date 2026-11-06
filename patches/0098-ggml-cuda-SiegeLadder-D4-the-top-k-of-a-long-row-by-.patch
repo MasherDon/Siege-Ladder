@@ -1,7 +1,7 @@
 From d6713a4a9b64f340602c31da16ed491d3fbfa10e Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 22:27:59 +0000
-Subject: [PATCH 098/112] ggml-cuda : SiegeLadder D4 - the top k of a long row
+Subject: [PATCH 098/121] ggml-cuda : SiegeLadder D4 - the top k of a long row
  by radix select instead of a sort of the whole row (on by default,
  GGML_CUDA_TOPK_SELECT=0 - the sort). With CCCL 3.0 (no DeviceTopK) TOP_K on a
  row past 1024 sorted the row with cub and kept its first k; DeepSeek-V4.1's

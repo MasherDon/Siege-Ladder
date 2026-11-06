@@ -1,0 +1,254 @@
+From 6121ee9bde3b47e4bd51a58431604fefadc0df8c Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 05 Nov 2026 03:47:20 +0000
+Subject: [PATCH 120/121] common: crash reporter under LLAMA_CRASH_REPORT=1 -
+ an unhandled-exception filter, SIGABRT, terminate, invalid-parameter and
+ pure-call handlers print the code, module+RVA, thread and up to 48 unwound
+ frames straight to stderr (no CRT stdio, no heap); optional minidump with
+ LLAMA_CRASH_REPORT_DUMP=<dir>; self-test with
+ LLAMA_CRASH_REPORT_TEST=av|so|abort|terminate. Off by default: nothing is
+ installed without the variable (lab L049, Codex; the lead fixed the dump-name
+ literal)
+
+Silent load deaths exit 0xC0000005 inside the first sched_reserve (SiegeLadder runs 4.313); this finds the place.
+---
+ common/CMakeLists.txt   |   2 +
+ common/common.cpp       |   2 +
+ common/crash-report.cpp | 183 ++++++++++++++++++++++++++++++++++++++++
+ common/crash-report.h   |   4 +
+ 4 files changed, 191 insertions(+)
+ create mode 100644 common/crash-report.cpp
+ create mode 100644 common/crash-report.h
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 799d227..a8a81fb 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -67,6 +67,8 @@ add_library(${TARGET}
+     chat.h
+     common.cpp
+     common.h
++    crash-report.cpp
++    crash-report.h
+     console.cpp
+     console.h
+     debug.cpp
+diff --git a/common/common.cpp b/common/common.cpp
+index 3dc7e4e..a86389e 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "build-info.h"
+ #include "common.h"
++#include "crash-report.h"
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
+@@ -384,6 +385,7 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
+ }
+ 
+ void common_init() {
++    common_crash_report_init();
+ #if defined(_WIN32)
+     SetConsoleOutputCP(CP_UTF8);
+     SetConsoleCP(CP_UTF8);
+diff --git a/common/crash-report.cpp b/common/crash-report.cpp
+new file mode 100644
+index 0000000..a844db5
+--- /dev/null
++++ b/common/crash-report.cpp
+@@ -0,0 +1,183 @@
++#include "crash-report.h"
++
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <windows.h>
++#include <dbghelp.h> // types only; MiniDumpWriteDump is resolved dynamically
++#include <csignal>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <eh.h>
++#include <stdlib.h>
++
++namespace {
++// All output formatting uses bounded stack buffers and bypasses the asynchronous logger.
++struct line {
++    char data[1024];
++    unsigned n = 0;
++    void ch(char c) { if (n < sizeof(data)) data[n++] = c; }
++    void str(const char * s) { if (s) while (*s && n < sizeof(data)) ch(*s++); }
++    void hex(unsigned long long v, unsigned width = 1) {
++        char tmp[16]; unsigned i = 0;
++        do { tmp[i++] = "0123456789ABCDEF"[v & 15]; v >>= 4; } while (v && i < sizeof(tmp));
++        while (i < width && i < sizeof(tmp)) tmp[i++] = '0';
++        while (i) ch(tmp[--i]);
++    }
++    void dec(unsigned long v) {
++        char tmp[24]; unsigned i = 0;
++        do { tmp[i++] = char('0' + v % 10); v /= 10; } while (v && i < sizeof(tmp));
++        while (i) ch(tmp[--i]);
++    }
++    void output() {
++        ch('\n'); DWORD done = 0;
++        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
++        if (h && h != INVALID_HANDLE_VALUE) WriteFile(h, data, n, &done, nullptr);
++    }
++};
++
++volatile LONG reporting = 0;
++wchar_t dump_dir[MAX_PATH] = {};
++typedef BOOL (WINAPI * dump_fn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
++        PMINIDUMP_EXCEPTION_INFORMATION, PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
++dump_fn write_dump = nullptr;
++
++void module(line & l, DWORD64 pc) {
++    HMODULE mod = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                           reinterpret_cast<LPCWSTR>(static_cast<uintptr_t>(pc)), &mod)) {
++        l.str("unknown+0x"); l.hex(pc); return;
++    }
++    wchar_t path[MAX_PATH];
++    DWORD n = GetModuleFileNameW(mod, path, MAX_PATH);
++    if (!n || n >= MAX_PATH) { l.str("unknown"); }
++    else {
++        DWORD start = 0;
++        for (DWORD i = 0; i < n; ++i) if (path[i] == L'\\' || path[i] == L'/') start = i + 1;
++        // Preserve ASCII module names; mark non-ASCII code units without allocating.
++        for (DWORD i = start; i < n; ++i) l.ch(path[i] < 128 ? char(path[i]) : '?');
++    }
++    l.str("+0x"); l.hex(pc - reinterpret_cast<uintptr_t>(mod));
++}
++
++void frames(CONTEXT ctx) {
++#if defined(_M_X64) || defined(__x86_64__)
++    for (unsigned i = 0; i < 48 && ctx.Rip; ++i) {
++        line l; l.str("CRASH-REPORT frame "); l.dec(i); l.ch(' '); module(l, ctx.Rip); l.output();
++        DWORD64 base = 0;
++        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
++        DWORD64 old_rip = ctx.Rip, old_rsp = ctx.Rsp;
++        if (fn) {
++            PVOID handler_data = nullptr; DWORD64 establisher = 0;
++            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
++        } else {
++            ctx.Rip = *reinterpret_cast<DWORD64 *>(ctx.Rsp);
++            ctx.Rsp += sizeof(DWORD64);
++        }
++        if (ctx.Rsp <= old_rsp || (ctx.Rip == old_rip && ctx.Rsp == old_rsp)) break;
++    }
++#else
++    (void) ctx;
++#endif
++}
++
++void dump(EXCEPTION_POINTERS * ep) {
++    if (!write_dump || !dump_dir[0]) return;
++    wchar_t path[MAX_PATH]; unsigned n = 0;
++    while (dump_dir[n] && n + 64 < MAX_PATH) { path[n] = dump_dir[n]; ++n; }
++    if (dump_dir[n]) return;
++    if (n && path[n-1] != L'\\' && path[n-1] != L'/') path[n++] = L'\\';
++    const wchar_t prefix[] = L"llama-crash-";
++    for (unsigned i = 0; prefix[i]; ++i) path[n++] = prefix[i];
++    DWORD ids[] = {GetCurrentProcessId(), GetCurrentThreadId(), GetTickCount()};
++    for (unsigned j = 0; j < 3; ++j) {
++        wchar_t digits[10]; unsigned k = 0; DWORD v = ids[j];
++        do { digits[k++] = wchar_t(L'0' + v % 10); v /= 10; } while (v);
++        while (k) path[n++] = digits[--k];
++        path[n++] = j == 2 ? L'.' : L'-';
++    }
++    path[n++] = L'd'; path[n++] = L'm'; path[n++] = L'p'; path[n] = 0;
++    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file == INVALID_HANDLE_VALUE) { line l; l.str("CRASH-REPORT dump create failed error="); l.dec(GetLastError()); l.output(); return; }
++    MINIDUMP_EXCEPTION_INFORMATION info = {}; info.ThreadId = GetCurrentThreadId(); info.ExceptionPointers = ep; info.ClientPointers = FALSE;
++    BOOL ok = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
++        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory),
++        ep ? &info : nullptr, nullptr, nullptr);
++    DWORD err = ok ? 0 : GetLastError(); CloseHandle(file);
++    line l; l.str(ok ? "CRASH-REPORT dump written" : "CRASH-REPORT dump failed error="); if (!ok) l.dec(err); l.output();
++}
++
++LONG WINAPI unhandled(EXCEPTION_POINTERS * ep) {
++    if (InterlockedCompareExchange(&reporting, 1, 0) != 0) return EXCEPTION_CONTINUE_SEARCH;
++    line l; l.str("CRASH-REPORT code=0x"); l.hex(ep->ExceptionRecord->ExceptionCode, 8);
++    l.str(" addr=0x"); l.hex(reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress)); l.ch(' ');
++    module(l, reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress));
++    l.str(" thread="); l.dec(GetCurrentThreadId()); l.output();
++#if defined(_MSC_VER)
++    __try { frames(*ep->ContextRecord); } __except (EXCEPTION_EXECUTE_HANDLER) {
++        line bad; bad.str("CRASH-REPORT stack unwind failed"); bad.output();
++    }
++#else
++    frames(*ep->ContextRecord);
++#endif
++    dump(ep);
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++void simple(const char * reason, const char * detail = nullptr) {
++    if (InterlockedCompareExchange(&reporting, 1, 0) != 0) return;
++    line l; l.str("CRASH-REPORT "); l.str(reason); l.str(" thread="); l.dec(GetCurrentThreadId());
++    if (detail) { l.str(" what="); l.str(detail); } l.output();
++    CONTEXT ctx = {}; RtlCaptureContext(&ctx);
++#if defined(_MSC_VER)
++    __try { frames(ctx); } __except (EXCEPTION_EXECUTE_HANDLER) {
++        line bad; bad.str("CRASH-REPORT stack unwind failed"); bad.output();
++    }
++#else
++    frames(ctx);
++#endif
++    dump(nullptr);
++}
++void on_abort(int) { simple("SIGABRT"); std::signal(SIGABRT, SIG_DFL); std::abort(); }
++void on_terminate() {
++    const char * what = nullptr;
++    try { auto p = std::current_exception(); if (p) std::rethrow_exception(p); }
++    catch (const std::exception & e) { what = e.what(); simple("terminate", what); std::abort(); }
++    catch (...) { what = "non-std exception"; }
++    simple("terminate", what); std::abort();
++}
++void __cdecl on_invalid(const wchar_t *, const wchar_t *, const wchar_t *, unsigned, uintptr_t) { simple("invalid parameter"); std::abort(); }
++void __cdecl on_purecall() { simple("pure virtual call"); std::abort(); }
++#if defined(_MSC_VER)
++__declspec(noinline) void overflow(volatile unsigned * p) { volatile char pad[4096]; pad[0] = char(*p); ++*p; overflow(p); if (pad[0] == 42) *p = 0; }
++#endif
++}
++
++void common_crash_report_init() {
++    char enabled[4] = {};
++    if (GetEnvironmentVariableA("LLAMA_CRASH_REPORT", enabled, sizeof(enabled)) != 1 || enabled[0] != '1') return;
++    ULONG guarantee = 64 * 1024;
++    SetThreadStackGuarantee(&guarantee); // Applies only to this thread.
++    DWORD n = GetEnvironmentVariableW(L"LLAMA_CRASH_REPORT_DUMP", dump_dir, MAX_PATH);
++    if (n && n < MAX_PATH) {
++        HMODULE dll = LoadLibraryW(L"dbghelp.dll");
++        if (dll) write_dump = reinterpret_cast<dump_fn>(GetProcAddress(dll, "MiniDumpWriteDump"));
++    } else dump_dir[0] = 0;
++    SetUnhandledExceptionFilter(unhandled);
++    std::signal(SIGABRT, on_abort);
++    std::set_terminate(on_terminate);
++    _set_invalid_parameter_handler(on_invalid);
++    _set_purecall_handler(on_purecall);
++    char test[16] = {};
++    n = GetEnvironmentVariableA("LLAMA_CRASH_REPORT_TEST", test, sizeof(test));
++    if (!n || n >= sizeof(test)) return;
++    if (std::strcmp(test, "av") == 0) { *reinterpret_cast<volatile int *>(0) = 1; }
++#if defined(_MSC_VER)
++    else if (std::strcmp(test, "so") == 0) { volatile unsigned count = 0; overflow(&count); }
++#endif
++    else if (std::strcmp(test, "abort") == 0) std::abort();
++    else if (std::strcmp(test, "terminate") == 0) std::terminate();
++}
++#else
++void common_crash_report_init() {}
++#endif
+diff --git a/common/crash-report.h b/common/crash-report.h
+new file mode 100644
+index 0000000..a4a83a6
+--- /dev/null
++++ b/common/crash-report.h
+@@ -0,0 +1,4 @@
++#pragma once
++
++// No-op unless explicitly enabled on Windows.
++void common_crash_report_init();

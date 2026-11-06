@@ -1,7 +1,7 @@
 From 68bb0df18584070c01fa07d096e4214bc9ecd6bc Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 08:52:00 +0000
-Subject: [PATCH 111/112] llama : SiegeLadder P19 stage B step 2 -
+Subject: [PATCH 111/121] llama : SiegeLadder P19 stage B step 2 -
  LLAMA_DSV4_LAYER_MAJOR_POOL=auto|N grows P11's shared pool to a whole layer
  for a layer-major call with SEG_SCHED (L030); the wave plan keeps the base 64
  slots (plan_slots) so the waves and the MMQ split stay as before; at k 1 a

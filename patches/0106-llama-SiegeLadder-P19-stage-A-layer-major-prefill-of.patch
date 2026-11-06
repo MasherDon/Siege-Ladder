@@ -1,7 +1,7 @@
 From e12d298399fa5af2a1ef04370d03144bb7fe94a1 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 04:22:56 +0000
-Subject: [PATCH 106/112] llama : SiegeLadder P19 stage A - layer-major
+Subject: [PATCH 106/121] llama : SiegeLadder P19 stage A - layer-major
  prefill, off by default (LLAMA_DSV4_LAYER_MAJOR=k,
  LLAMA_DSV4_LAYER_MAJOR_GIB=8)
 

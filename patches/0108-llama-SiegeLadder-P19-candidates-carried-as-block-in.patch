@@ -1,7 +1,7 @@
 From b3ea452a9c9bf898715312b44db4c2e51893860c Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Wed, 04 Nov 2026 06:56:41 +0000
-Subject: [PATCH 108/112] llama : SiegeLadder P19 - candidates carried as block
+Subject: [PATCH 108/121] llama : SiegeLadder P19 - candidates carried as block
  indices (L020: the f32 mask rebuilt in the receiving graph by the source's
  own ops, a computed -inf template; equal byte for byte at 48K, exact and
  default), LLAMA_DSV4_LAYER_MAJOR_COST=1 per-graph cost split (L021),

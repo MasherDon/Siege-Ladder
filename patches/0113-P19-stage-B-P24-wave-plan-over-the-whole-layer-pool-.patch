@@ -1,0 +1,1049 @@
+From 56af2892b7f9d6f3af2bc88a75177a1e3033e891 Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Wed, 04 Nov 2026 15:25:08 +0000
+Subject: [PATCH 113/121] P19 stage B: P24 wave plan over the whole layer pool,
+ P26 (a)/(b) graph inputs on the card, input-cost probes (lab L034-L039)
+
+All under environment variables, off by default; byte for byte at 48K (exact and default, k 1 and 4) against the
+normal path (SiegeLadder runs 4.295-4.299).
+- L039 LLAMA_DSV4_LAYER_MAJOR_POOL_PLAN=pool: the P11 wave plan sees the whole layer pool (384 slots, 2 waves per layer
+  instead of ~14.5); shrink and call end return it to the base. 512K 508.65 -> 691.22 tok/s, 1.42x the normal path.
+- L037 GGML_OP_PREFIX_MASK (last in the enum, CPU and CUDA) + LLAMA_DSV4_MASK_GPU=1: the compressed-KV masks are built
+  on the device from n_visible; the lead pins the PREFIX_MASK nodes to backend 0 (the scheduler left them on the CPU).
+- L038 LLAMA_DSV4_LAYER_MAJOR_PIPE=1: the H carry input lives in a CUDA buffer outside the allocator; with
+  L035 LLAMA_DSV4_LAYER_MAJOR_CARRY_ASYNC=1 it is filled on the graph's stream (carry_in 5.9 -> 0.17 ms per graph).
+- L034 LLAMA_DSV4_LAYER_MAJOR_INPUT_CACHE=1|2 (mask cache, not to be enabled) and per-tensor input cost lines under
+  LLAMA_DSV4_LAYER_MAJOR_COST=2.
+- L036 test-backend-ops MUL_MAT_ID perf cases (384 experts, 6 used, uniform ids) for P25.
+---
+ ggml/include/ggml.h             |   7 ++
+ ggml/src/ggml-cpu/ggml-cpu.c    |   5 +
+ ggml/src/ggml-cpu/ops.cpp       |  17 +++
+ ggml/src/ggml-cpu/ops.h         |   1 +
+ ggml/src/ggml-cuda/fill.cu      |  20 ++++
+ ggml/src/ggml-cuda/fill.cuh     |   1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |   4 +
+ ggml/src/ggml.c                 |  20 +++-
+ src/llama-context.cpp           | 115 ++++++++++++++++--
+ src/llama-context.h             |   7 +-
+ src/llama-graph.cpp             | 199 ++++++++++++++++++++++++++++++--
+ src/llama-graph.h               |   6 +
+ src/llama-moe-stream.cpp        |   7 +-
+ tests/test-backend-ops.cpp      |  58 +++++++++-
+ 14 files changed, 438 insertions(+), 29 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 263a578..78281db 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -592,6 +592,8 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        GGML_OP_PREFIX_MASK, // SiegeLadder L037: last, so no other op's number moves
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -2396,6 +2398,11 @@ extern "C" {
+             enum ggml_tri_type    type);
+ 
+     // Fill tensor a with constant c
++    // [n_kv, n_tokens/n_stream, 1, n_stream], 0 before each I32 prefix, -inf after.
++    GGML_API struct ggml_tensor * ggml_prefix_mask(
++            struct ggml_context * ctx, struct ggml_tensor * visible,
++            int64_t n_kv, int64_t n_stream, enum ggml_type type);
++
+     GGML_API struct ggml_tensor * ggml_fill(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index e2bf68b..c6c7a14 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1997,6 +1997,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_fill(params, tensor);
+             } break;
++        case GGML_OP_PREFIX_MASK:
++            {
++                ggml_compute_forward_prefix_mask(params, tensor);
++            } break;
+         case GGML_OP_FLASH_ATTN_EXT:
+             {
+                 ggml_compute_forward_flash_attn_ext(params, tensor);
+@@ -2281,6 +2285,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_CUMSUM:
+         case GGML_OP_TRI:
+         case GGML_OP_FILL:
++        case GGML_OP_PREFIX_MASK:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 202fa09..9fe613e 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -2232,6 +2232,23 @@ static void ggml_compute_forward_gelu(
+ 
+ // ggml_compute_fill
+ 
++void ggml_compute_forward_prefix_mask(const ggml_compute_params * params, ggml_tensor * dst) {
++    const int32_t * visible = (const int32_t *) dst->src[0]->data;
++    const int64_t rows = ggml_nelements(dst->src[0]);
++    const int64_t width = dst->ne[0];
++    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(dst->src[0]));
++    for (int64_t row = params->ith; row < rows; row += params->nth) {
++        for (int64_t j = 0; j < width; ++j) {
++            if (dst->type == GGML_TYPE_F16) {
++                ((uint16_t *) dst->data)[row*width + j] = j < visible[row] ? 0x0000 : 0xfc00;
++            } else {
++                GGML_ASSERT(dst->type == GGML_TYPE_F32);
++                ((float *) dst->data)[row*width + j] = j < visible[row] ? 0.0f : -INFINITY;
++            }
++        }
++    }
++}
++
+ static void ggml_compute_forward_fill_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+     const float c = ggml_get_op_params_f32(dst, 0);
+ 
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 4c1642a..4755b0c 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -87,6 +87,7 @@ void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struc
+ void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_prefix_mask(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_flash_attn_back(
+         const struct ggml_compute_params * params,
+diff --git a/ggml/src/ggml-cuda/fill.cu b/ggml/src/ggml-cuda/fill.cu
+index 739062c..15a2842 100644
+--- a/ggml/src/ggml-cuda/fill.cu
++++ b/ggml/src/ggml-cuda/fill.cu
+@@ -3,6 +3,26 @@
+ 
+ #define CUDA_FILL_BLOCK_SIZE 256
+ 
++template <typename T>
++static __global__ void prefix_mask_kernel(T * dst, const int32_t * visible, int64_t width, int64_t count) {
++    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
++    if (i < count) {
++        dst[i] = i % width < visible[i / width] ? (T) 0.0f : (T) (-INFINITY);
++    }
++}
++
++void ggml_cuda_op_prefix_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(dst->src[0]));
++    const int64_t n = ggml_nelements(dst);
++    const int64_t blocks = (n + CUDA_FILL_BLOCK_SIZE - 1) / CUDA_FILL_BLOCK_SIZE;
++    if (dst->type == GGML_TYPE_F16) {
++        prefix_mask_kernel<<<blocks, CUDA_FILL_BLOCK_SIZE, 0, ctx.stream()>>>((half *) dst->data, (const int32_t *) dst->src[0]->data, dst->ne[0], n);
++    } else {
++        GGML_ASSERT(dst->type == GGML_TYPE_F32);
++        prefix_mask_kernel<<<blocks, CUDA_FILL_BLOCK_SIZE, 0, ctx.stream()>>>((float *) dst->data, (const int32_t *) dst->src[0]->data, dst->ne[0], n);
++    }
++}
++
+ template <typename T>
+ static __global__ void fill_kernel(T * dst, const int64_t k, const T value) {
+     const int64_t i = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+diff --git a/ggml/src/ggml-cuda/fill.cuh b/ggml/src/ggml-cuda/fill.cuh
+index 8443c83..81ecb21 100644
+--- a/ggml/src/ggml-cuda/fill.cuh
++++ b/ggml/src/ggml-cuda/fill.cuh
+@@ -1,3 +1,4 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_prefix_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 12e1d2f..10cc7ea 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2520,6 +2520,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_FILL:
+             ggml_cuda_op_fill(ctx, dst);
+             break;
++        case GGML_OP_PREFIX_MASK:
++            ggml_cuda_op_prefix_mask(ctx, dst);
++            break;
+         case GGML_OP_LIGHTNING_INDEXER:
+             ggml_cuda_lightning_indexer(ctx, dst);
+             break;
+@@ -5412,6 +5415,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_OPT_STEP_ADAMW:
+         case GGML_OP_OPT_STEP_SGD:
+         case GGML_OP_FILL:
++        case GGML_OP_PREFIX_MASK:
+         case GGML_OP_CUMSUM:
+         case GGML_OP_TRI:
+         case GGML_OP_DIAG:
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index b9dd1d7..86b01f7 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1100,9 +1100,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "PREFIX_MASK",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1217,9 +1219,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "prefix_mask(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5380,6 +5384,18 @@ struct ggml_tensor * ggml_tri(
+ 
+ // ggml_fill
+ 
++struct ggml_tensor * ggml_prefix_mask(struct ggml_context * ctx, struct ggml_tensor * visible,
++        int64_t n_kv, int64_t n_stream, enum ggml_type type) {
++    GGML_ASSERT(visible->type == GGML_TYPE_I32 && ggml_is_contiguous(visible));
++    GGML_ASSERT(ggml_is_vector(visible) && n_kv > 0 && n_stream > 0);
++    GGML_ASSERT(visible->ne[0] % n_stream == 0);
++    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, n_kv, visible->ne[0]/n_stream, 1, n_stream);
++    result->op = GGML_OP_PREFIX_MASK;
++    result->src[0] = visible;
++    return result;
++}
++
+ static struct ggml_tensor * ggml_fill_impl(
+     struct ggml_context * ctx,
+     struct ggml_tensor  * a,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8383288..e358b3c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2137,7 +2137,7 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
+-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool skip_apply) {
++llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool skip_apply, void (* before_inputs)(void *), void * before_inputs_data) {
+     if (mctx && !skip_apply && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -2204,6 +2204,42 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        // L038 draft: retain the existing completion barriers. Only H is placed
++        // on CUDA; input staging is still synchronous, so this is not a pipeline.
++        const char * pipe_env = std::getenv("LLAMA_DSV4_LAYER_MAJOR_PIPE");
++        if (pipe_env && std::strcmp(pipe_env, "1") == 0 && cparams.dsv4_lm_carry_in) {
++            auto & h = cparams.dsv4_lm_carry_in->v[llama_cparams::llama_dsv4_lm_carry::H];
++            ggml_backend_t cuda = nullptr;
++            int n_gpu = 0;
++            for (auto * be : backend_ptrs) {
++                auto * dev = ggml_backend_get_device(be);
++                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
++                    ++n_gpu;
++                    if (std::strncmp(ggml_backend_name(be), "CUDA", 4) == 0) cuda = be;
++                }
++            }
++            if (h.t && cuda && n_gpu == 1) {
++                auto * buft = ggml_backend_get_default_buffer_type(cuda);
++                const size_t need = ggml_backend_buft_get_alloc_size(buft, h.t);
++                if (need > lm_pipe_h_capacity) {
++                    ggml_backend_sched_synchronize(sched.get());
++                    lm_pipe_h_buffer.reset();
++                    lm_pipe_h_capacity = 0;
++                    lm_pipe_h_buffer.reset(ggml_backend_buft_alloc_buffer(buft, need));
++                    if (!lm_pipe_h_buffer) {
++                        ret = GGML_STATUS_ALLOC_FAILED;
++                        return nullptr;
++                    }
++                    lm_pipe_h_capacity = need;
++                }
++                if (ggml_backend_tensor_alloc(lm_pipe_h_buffer.get(), h.t,
++                        ggml_backend_buffer_get_base(lm_pipe_h_buffer.get())) != GGML_STATUS_SUCCESS) {
++                    ret = GGML_STATUS_ALLOC_FAILED;
++                    return nullptr;
++                }
++            }
++        }
++
+         llama_moe_stream_nvtx_push("graph_alloc");
+         const int64_t t_alloc0 = lm_cost_seg ? ggml_time_us() : 0;
+         const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+@@ -2242,6 +2278,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         }
+     }
+ 
++    // Complete the preceding carry before inputs can overwrite its source.
++    if (before_inputs) before_inputs(before_inputs_data);
++
+     // set the input data for the input tensors
+     {
+         //const auto t_start_us = ggml_time_us();
+@@ -2257,7 +2296,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+                     GGML_ASSERT(it.host != nullptr);
+                     const size_t nb = ggml_nbytes(it.t);
+                     const int64_t kind_t0 = lm_cost_seg && lm_cost_detail ? ggml_time_us() : 0;
+-                    ggml_backend_tensor_set(it.t, it.host, 0, nb);
++                    // L035 draft: enqueue on the graph backend so CPU input preparation
++                    // can overlap this transfer. This is not the cross-graph pipeline.
++                    const char * carry_async = std::getenv("LLAMA_DSV4_LAYER_MAJOR_CARRY_ASYNC");
++                    ggml_backend_t carry_be = ggml_backend_sched_get_tensor_backend(sched.get(), it.t);
++                    const char * carry_name = carry_be ? ggml_backend_name(carry_be) : nullptr;
++                    if (carry_async && std::strcmp(carry_async, "1") == 0 && carry_name &&
++                            std::strncmp(carry_name, "CUDA", 4) == 0) {
++                        ggml_backend_tensor_set_async(carry_be, it.t, it.host, 0, nb);
++                    } else {
++                        ggml_backend_tensor_set(it.t, it.host, 0, nb);
++                    }
+                     if (lm_cost_seg && lm_cost_detail) {
+                         lm_carry_kind_us[lm_kind] += ggml_time_us() - kind_t0;
+                         lm_carry_kind_bytes[lm_kind] += nb;
+@@ -2305,6 +2354,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         g32_ms->g32_unbind();
+     }
+     if (status != GGML_STATUS_SUCCESS) {
++        // A failed launch may still have an enqueued carry H2D reading pinned memory.
++        const char * carry_async = std::getenv("LLAMA_DSV4_LAYER_MAJOR_CARRY_ASYNC");
++        if (carry_async && std::strcmp(carry_async, "1") == 0 && cparams.dsv4_lm_carry_in != nullptr) {
++            ggml_backend_sched_synchronize(sched.get());
++        }
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+         return nullptr;
+@@ -3279,12 +3333,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 size_t                  cap[lm_carry::N] = {};
+                 lm_carry                in;
+                 lm_carry                out;
++                size_t cut_off[lm_carry::N] = {};
++                size_t cut_len[lm_carry::N] = {};
+             };
+             size_t  lm_pinned      = 0; // pinned host bytes the slots hold
+             size_t  lm_pinned_peak = 0;
+             int64_t lm_n_pull = 0, lm_n_keep = 0, lm_n_cut = 0;
+             int64_t lm_pull_bytes = 0;
+ 
++            // Slots outlive the pending guard even on error or exception.
++            std::vector<lm_carry_slot> slots;
++            const char * async_env = std::getenv("LLAMA_DSV4_LAYER_MAJOR_CARRY_ASYNC");
++            const bool carry_async_enabled = async_env && std::strcmp(async_env, "1") == 0;
++            struct pending_carry {
++                ggml_backend_sched_t sched;
++                bool enabled;
++                lm_carry_slot * slot = nullptr;
++                void finish() {
++                    if (!slot) return;
++                    ggml_backend_sched_synchronize(sched);
++                    for (int k = 0; k < lm_carry::N; ++k) {
++                        if (slot->cut_len[k]) {
++                            memmove(slot->in.v[k].host, (char *) slot->in.v[k].host + slot->cut_off[k], slot->cut_len[k]);
++                            slot->cut_len[k] = 0;
++                        }
++                    }
++                    slot = nullptr;
++                }
++                ~pending_carry() { finish(); if (enabled) ggml_backend_sched_synchronize(sched); }
++            } pending{sched.get(), carry_async_enabled};
++            auto finish_pending = [](void * p) { static_cast<pending_carry *>(p)->finish(); };
++
+             // after a group's graph: what it exported becomes the slot's state - a computed tensor is read from its
+             // backend; the graph's own input is the slot's bytes already; a view of one (C7c's cut) is its rows moved
+             // to the front of those bytes
+@@ -3303,7 +3382,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         lm_n_keep++;
+                     } else if (in.t != nullptr && t->view_src == in.t) {
+                         GGML_ASSERT(t->view_offs + nb <= ggml_nbytes(in.t));
+-                        memmove(in.host, (char *) in.host + t->view_offs, nb);
++                        if (carry_async_enabled) {
++                            s.cut_off[k] = t->view_offs;
++                            s.cut_len[k] = nb;
++                        } else {
++                            memmove(in.host, (char *) in.host + t->view_offs, nb);
++                        }
+                         lm_n_cut++;
+                     } else {
+                         for (const auto & o : s.in.v) {
+@@ -3436,12 +3520,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
+             const bool vram_enabled = vram_env && std::strcmp(vram_env, "1") == 0;
+             std::vector<lm_vram_sample> vram_samples(vram_enabled ? n_layer : 0);
+             lm_vram_scope vram_scope(vram_enabled ? &vram_samples : nullptr);
+-            std::vector<lm_carry_slot> slots;
++            size_t l034_graphs = 0;
++            struct l034_scope {
++                size_t & graphs;
++                explicit l034_scope(size_t & n) : graphs(n) { l034_begin(); }
++                ~l034_scope() { l034_end(graphs); }
++            } l034_guard(l034_graphs);
+             for (const auto & sc : superchunks) {
++                pending.finish();
++                l034_superchunk(); // the input cache holds one superchunk's ubatches
++
+                 if (sc.second - sc.first < 2) {
++                    l034_batch(sc.first);
+                     if (run_ubatch_full(sc.first) != 0) {
+                         return -3;
+                     }
++                    ++l034_graphs;
+                     continue;
+                 }
+ 
+@@ -3471,6 +3565,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         const bool p4_end = p.enc_only && gr.first <= dec && dec < gr.second;
+ 
+                         dctx->lm_seek(u);
++                        l034_batch(u);
+                         const llama_ubatch & ubatch = dctx->get_ubatch();
+                         if (!ub_counted[i]) {
+                             ub_counted[i] = true;
+@@ -3507,12 +3602,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                         cparams.dsv4_lm_carry_out = carry_on     ? &slots[i].out : nullptr;
+ 
+                         if (guard_pending || (gr.first >= dec && p.yoco_lo >= 0)) {
++                            pending.finish();
+                             pool_shrink_before(guard_pending ? "guard" : "C7-boundary", sc.first, gr.first, u);
+                         }
+                         ggml_status         status = GGML_STATUS_SUCCESS;
+                         llm_graph_result * res     = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+-                                mctx.get(), status, true);
++                                mctx.get(), status, true, carry_async_enabled ? +finish_pending : nullptr, &pending);
+                         ++n_graphs;
++                        ++l034_graphs;
+                         pool_guard_check();
+                         if (lm_seg_sched) {
+                             lm_seg_sched_buf_max = std::max(lm_seg_sched_buf_max, lm_cuda0_sched_buffer());
+@@ -3545,12 +3642,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                                 ggml_backend_sched_synchronize(sched.get());
+                             }
+                             const int64_t t0 = ggml_time_us();
++                            if (carry_async_enabled) pending.slot = &slots[i];
+                             lm_slot_pull(slots[i]);
+-                            if (lm_cost_enable) {
+-                                ggml_backend_sched_synchronize(sched.get());
+-                            } else {
+-                                ggml_backend_sched_synchronize(sched.get());
+-                            }
++                            if (!carry_async_enabled) ggml_backend_sched_synchronize(sched.get());
+                             lm_copy_us += ggml_time_us() - t0;
+                         } else {
+                             for (auto & it : slots[i].in.v) {
+@@ -3564,6 +3658,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
+                 }
+             }
+ 
++            pending.finish();
+             if (lm_seg_sched) {
+                 lm_seg_sched_buf_max = std::max(lm_seg_sched_buf_max, lm_cuda0_sched_buffer());
+                 LLAMA_LOG_INFO("%s: layer-major seg sched cuda0 buffer max=%.2f MiB (call end)\n", __func__,
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 52cdd27..65027ac 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -141,7 +141,9 @@ struct llama_context {
+                     llm_graph_type   gtype,
+             llama_memory_context_i * mctx,
+                        ggml_status & ret,
+-                           bool       skip_apply = false);
++                           bool       skip_apply = false,
++                            void (* before_inputs)(void *) = nullptr,
++                            void * before_inputs_data = nullptr);
+ 
+     int encode(const llama_batch & batch_inp);
+     int decode(const llama_batch & batch_inp);
+@@ -489,6 +491,9 @@ private:
+     llm_graph_result_ptr gf_res_reserve;
+ 
+     // host buffer for the model output (logits and embeddings)
++    // L038 draft: separate H input; cross-graph pipeline is not implemented.
++    ggml_backend_buffer_ptr lm_pipe_h_buffer;
++    size_t lm_pipe_h_capacity = 0;
+     ggml_backend_buffer_ptr buf_output;
+ 
+     // keep copies of the per-sequence memory on the device
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 2a5dc94..d1bf1d9 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -29,6 +29,48 @@
+ #include <string>
+ #include <typeinfo>
+ #include <unordered_set>
++#include <map>
++#include <new>
++
++// L034 experimental mask cache: exact visibility is included in the key.
++struct dsv4_mask_cache {
++    int mode = 0;
++    bool cost = false;
++    size_t batch = 0, used = 0, limit = 0, peak = 0;
++    uint64_t hits = 0, misses = 0, over = 0, hit_bytes = 0;
++    std::map<std::string, std::vector<uint8_t>> entries;
++    struct sample { uint64_t bytes = 0, calls = 0; int64_t us = 0, set_us = 0; };
++    std::map<std::string, sample> samples;
++};
++static thread_local dsv4_mask_cache * l034_cache = nullptr;
++void l034_begin() {
++    const char * m = getenv("LLAMA_DSV4_LAYER_MAJOR_INPUT_CACHE");
++    int mode = m ? atoi(m) : 0;
++    const char * cost = getenv("LLAMA_DSV4_LAYER_MAJOR_COST");
++    if (mode != 1 && mode != 2 && !(cost && atoi(cost) == 2)) return;
++    auto * p = new (std::nothrow) dsv4_mask_cache;
++    if (!p) return;
++    p->mode = mode == 1 || mode == 2 ? mode : 0;
++    p->cost = cost && atoi(cost) == 2;
++    const char * env = getenv("LLAMA_DSV4_LAYER_MAJOR_INPUT_CACHE_MIB");
++    char * end = nullptr;
++    unsigned long long mib = env ? strtoull(env, &end, 10) : 1024;
++    if (env && (*env == '-' || end == env || *end || mib > SIZE_MAX / 1048576)) mib = 0;
++    p->limit = (size_t) mib * 1048576;
++    l034_cache = p;
++}
++void l034_batch(size_t batch) { if (l034_cache) l034_cache->batch = batch; }
++// the keys hold the ubatch: entries of a finished superchunk are never hit again
++void l034_superchunk() {
++    if (l034_cache) { l034_cache->entries.clear(); l034_cache->used = 0; }
++}
++void l034_end(size_t graphs) {
++    auto * p = l034_cache; l034_cache = nullptr;
++    if (p) LLAMA_LOG_INFO("L034 cache mode=%d graphs=%zu hits=%" PRIu64 " (%.1f MiB) misses=%" PRIu64 " over cap=%" PRIu64
++        " peak payload+key=%.1f MiB cap=%.1f MiB\n", p->mode, graphs, p->hits, p->hit_bytes / 1048576.0, p->misses, p->over,
++        p->peak / 1048576.0, p->limit / 1048576.0);
++    delete p;
++}
+ 
+ // dedup helpers
+ 
+@@ -1295,13 +1337,43 @@ bool llm_graph_input_attn_k_iswa::can_reuse(const llm_graph_params & params) {
+     return res;
+ }
+ 
++static void l034_set_sample(ggml_tensor * dst, int64_t us, size_t bytes, bool transfer = true) {
++    auto * p = l034_cache;
++    if (!p || !p->cost) return;
++    std::ostringstream os;
++    os << dst->name << " type=" << ggml_type_name(dst->type) << " ne=" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3];
++    auto & s = p->samples[os.str()]; if (transfer) s.set_us += us; else s.us += us; s.bytes = bytes; ++s.calls;
++}
++
++// Host-side timings; tensor_set is timed separately where called.
++struct l034_timer {
++    ggml_tensor * dst; int64_t start;
++    explicit l034_timer(ggml_tensor * t) : dst(t && t->buffer ? t : nullptr),
++        start(dst && l034_cache && l034_cache->cost ? ggml_time_us() : 0) {}
++    ~l034_timer() { if (start) l034_set_sample(dst, ggml_time_us() - start, ggml_nbytes(dst), false); }
++};
++struct l034_call {
++    l034_call() { if (l034_cache && l034_cache->cost) l034_cache->samples.clear(); }
++    ~l034_call() {
++        if (!l034_cache || !l034_cache->cost) return;
++        auto & m = l034_cache->samples;
++        std::vector<std::pair<std::string, dsv4_mask_cache::sample>> v(m.begin(), m.end());
++        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.us + a.second.set_us > b.second.us + b.second.set_us; });
++        for (const auto & x : v) if (x.second.us || x.second.set_us)
++            LLAMA_LOG_INFO("L034 graph %s fill_ms=%.6f tensor_set_ms=%.6f bytes=%" PRIu64 " calls=%" PRIu64 "\n",
++                x.first.c_str(), x.second.us / 1000.0, x.second.set_us / 1000.0, x.second.bytes, x.second.calls);
++    }
++};
++
+ static void dsv4_set_i64(ggml_tensor * dst, const std::vector<int64_t> & src) {
+     if (!dst || !dst->buffer) {
+         return;
+     }
+ 
+     GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
++    const int64_t t0 = l034_cache && l034_cache->cost ? ggml_time_us() : 0;
+     ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
++    if (t0) l034_set_sample(dst, ggml_time_us() - t0, src.size()*ggml_element_size(dst));
+ }
+ 
+ static void dsv4_set_i32(ggml_tensor * dst, const std::vector<int32_t> & src) {
+@@ -1310,14 +1382,16 @@ static void dsv4_set_i32(ggml_tensor * dst, const std::vector<int32_t> & src) {
+     }
+ 
+     GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
++    const int64_t t0 = l034_cache && l034_cache->cost ? ggml_time_us() : 0;
+     ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
++    if (t0) l034_set_sample(dst, ggml_time_us() - t0, src.size()*ggml_element_size(dst));
+ }
+ 
+ static void dsv4_set_kq_mask(
+         ggml_tensor * dst,
+         const llama_kv_cache_dsv4_context::comp_plan & plan,
+         uint32_t n_tokens,
+-        int64_t n_stream) {
++        int64_t n_stream, const std::string & label) {
+     if (!dst || !dst->buffer) {
+         return;
+     }
+@@ -1332,7 +1406,25 @@ static void dsv4_set_kq_mask(
+     GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
+     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+ 
+-    if (dst->type == GGML_TYPE_F32) {
++    auto * cache = l034_cache;
++    const int64_t t0 = cache && cache->cost ? ggml_time_us() : 0;
++    std::string desc, key;
++    std::map<std::string, std::vector<uint8_t>>::iterator hit;
++    bool found = false;
++    if (cache) try {
++        std::ostringstream os;
++        os << label << " name=" << dst->name << " type=" << ggml_type_name(dst->type) << " ne=" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3];
++        desc = os.str();
++        if (cache->mode) {
++            key = std::to_string(cache->batch) + ":" + desc + ":";
++            if (!plan.n_visible.empty()) key.append((const char *) plan.n_visible.data(), plan.n_visible.size()*sizeof(plan.n_visible[0]));
++            hit = cache->entries.find(key);
++            found = hit != cache->entries.end();
++            if (found && cache->mode == 1) memcpy(dst->data, hit->second.data(), hit->second.size());
++        }
++    }
++    catch (const std::bad_alloc &) { cache->mode = 0; found = false; }
++    if (!(found && cache->mode == 1) && dst->type == GGML_TYPE_F32) {
+         float * data = (float *) dst->data;
+ 
+         for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
+@@ -1342,7 +1434,7 @@ static void dsv4_set_kq_mask(
+                 data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
+             }
+         }
+-    } else if (dst->type == GGML_TYPE_F16) {
++    } else if (!(found && cache->mode == 1) && dst->type == GGML_TYPE_F16) {
+         ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
+         const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+         const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
+@@ -1355,6 +1447,31 @@ static void dsv4_set_kq_mask(
+             }
+         }
+     }
++    if (cache && cache->mode) {
++        size_t bytes = ggml_nbytes(dst);
++        if (found) {
++            cache->hits++;
++            cache->hit_bytes += bytes;
++        } else {
++            cache->misses++;
++        }
++        if (found && cache->mode == 2 && (hit->second.size() != bytes || memcmp(hit->second.data(), dst->data, bytes) != 0)) {
++            LLAMA_LOG_ERROR("L034 ERROR input cache mismatch: %s\n", desc.c_str());
++        } else if (!found && key.size() <= cache->limit - cache->used && bytes <= cache->limit - cache->used - key.size()) {
++            const uint8_t * src = (const uint8_t *) dst->data;
++            try {
++                cache->entries.emplace(key, std::vector<uint8_t>(src, src + bytes));
++                cache->used += key.size() + bytes;
++                cache->peak = std::max(cache->peak, cache->used);
++            } catch (const std::bad_alloc &) { cache->mode = 0; }
++        } else if (!found) {
++            cache->over++;
++        }
++    }
++    if (cache && cache->cost) {
++        auto & sample = cache->samples[desc];
++        sample.us += ggml_time_us() - t0; sample.bytes = ggml_nbytes(dst); ++sample.calls;
++    }
+ }
+ 
+ static ggml_tensor * dsv4_build_raw_kq_mask(
+@@ -1447,6 +1564,7 @@ static void dsv4_set_cand_pin(
+     GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
+     GGML_ASSERT(dst->ne[1] == (int64_t) n_tokens/n_stream);
+ 
++    l034_timer timer(dst);
+     const int64_t n_blocks = dst->ne[0];
+     const int64_t block    = plan.n_kv/n_blocks;
+     float * data = (float *) dst->data;
+@@ -1482,9 +1600,14 @@ static void dsv4_set_comp_inputs(
+     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
+     dsv4_set_i64(inp.state_write_idxs_lid, plan.state_write_idxs_lid);
+     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
+-    dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+-    if (inp.lid_mask != inp.kq_mask) {
+-        dsv4_set_kq_mask(inp.lid_mask, plan, n_tokens, n_stream);
++    if (inp.mask_visible) {
++        // L037: the masks are built on the device from this vector (LLAMA_DSV4_MASK_GPU=1)
++        dsv4_set_i32(inp.mask_visible, plan.n_visible);
++    } else {
++        dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream, std::string(name) + ".kq_mask");
++        if (inp.lid_mask != inp.kq_mask) {
++            dsv4_set_kq_mask(inp.lid_mask, plan, n_tokens, n_stream, std::string(name) + ".lid_mask");
++        }
+     }
+ 
+     if (debug || dsv4_compress_debug()) {
+@@ -1584,8 +1707,15 @@ static void dsv4_build_comp_inputs(
+         GGML_ASSERT(n_stream > 0);
+         GGML_ASSERT(n_tokens%n_stream == 0);
+ 
+-        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+-        ggml_set_input(inp.kq_mask);
++        const char * mask_gpu_env = getenv("LLAMA_DSV4_MASK_GPU");
++        const bool mask_gpu = mask_gpu_env && strcmp(mask_gpu_env, "1") == 0;
++        if (mask_gpu) {
++            inp.mask_visible = dsv4_build_input_1d(ctx, GGML_TYPE_I32, n_tokens, std::string("dsv4_") + name + "_mask_visible");
++        }
++        const ggml_type mask_type = (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32;
++        inp.kq_mask = mask_gpu ? ggml_prefix_mask(ctx, inp.mask_visible, plan.n_kv, n_stream, mask_type) :
++            ggml_new_tensor_4d(ctx, mask_type, plan.n_kv, n_tokens/n_stream, 1, n_stream);
++        if (!mask_gpu) ggml_set_input(inp.kq_mask);
+         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+ 
+         // the indexer scores against this group's positions but needs the fused_lid type,
+@@ -1594,8 +1724,9 @@ static void dsv4_build_comp_inputs(
+         if (lid_type == inp.kq_mask->type) {
+             inp.lid_mask = inp.kq_mask;
+         } else {
+-            inp.lid_mask = ggml_new_tensor_4d(ctx, lid_type, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+-            ggml_set_input(inp.lid_mask);
++            inp.lid_mask = mask_gpu ? ggml_prefix_mask(ctx, inp.mask_visible, plan.n_kv, n_stream, lid_type) :
++                ggml_new_tensor_4d(ctx, lid_type, plan.n_kv, n_tokens/n_stream, 1, n_stream);
++            if (!mask_gpu) ggml_set_input(inp.lid_mask);
+             ggml_set_name(inp.lid_mask, (std::string("dsv4_") + name + "_lid_mask").c_str());
+         }
+ 
+@@ -2032,6 +2163,8 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+     ggml_fp16_t * mask = has_mask ? (ggml_fp16_t *) inp.p13_mask->data : nullptr;
+     std::vector<ggml_fp16_t> mask_row(has_mask ? 0 : (size_t) raw_len); // P19: the plain row when the mask is not in the graph
+ 
++    int64_t l034_p13_mask_us = 0, l034_p13_c7_us = 0;
++    const bool l034_timing = l034_cache && l034_cache->cost;
+     // SiegeLadder C7: the decoder layers' chunk mask with the bound, filled in the same pass (see c7_lo)
+     ggml_fp16_t *   mask7 = nullptr;
+     const llama_pos lo7   = inp.c7_lo;
+@@ -2086,6 +2219,8 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+             }
+         }
+ 
++        {
++        l034_timer timer(has_rows ? inp.p13_rows : nullptr);
+         for (int64_t r = 0; r < raw_len; ++r) {
+             if (r < n_rows) {
+                 const uint32_t j = cell[r];
+@@ -2101,24 +2236,34 @@ static void dsv4_p13_set_input(const llm_graph_input_dsv4 & inp, const llama_uba
+             }
+         }
+ 
++        }
+         // a cell of the token's sequence, not after it, inside its window: p1 - p0 < n_swa (is_masked_swa, standard)
+         for (int64_t i = i0; i < i1; ++i) {
+             const llama_pos p1 = ubatch.pos[i];
+             ggml_fp16_t * m = mask ? mask + i*raw_len : mask_row.data();
++            {
++            const int64_t l034_t0 = l034_timing && has_mask ? ggml_time_us() : 0;
+             for (int64_t r = 0; r < raw_len; ++r) {
+                 const llama_pos p0 = cell_pos[r];
+                 m[r] = p0 >= 0 && p0 <= p1 && p1 - p0 < n_swa ? f16_zero : f16_ninf;
+             }
++            if (l034_t0) l034_p13_mask_us += ggml_time_us() - l034_t0;
++            }
+             // SiegeLadder C7: the decoder layers' copy - a row at or past the bound sees no cell below it
+             if (mask7) {
++                const int64_t l034_t0 = l034_timing ? ggml_time_us() : 0;
+                 ggml_fp16_t * m7 = mask7 + i*raw_len;
+                 for (int64_t r = 0; r < raw_len; ++r) {
+                     m7[r] = p1 >= lo7 && cell_pos[r] < lo7 ? f16_ninf : m[r];
+                 }
++                if (l034_t0) l034_p13_c7_us += ggml_time_us() - l034_t0;
+             }
+         }
+     }
+ 
++    if (l034_timing && has_mask) l034_set_sample(inp.p13_mask, l034_p13_mask_us, ggml_nbytes(inp.p13_mask), false);
++    if (l034_timing && has_m7) l034_set_sample(inp.c7_p13_mask, l034_p13_c7_us, ggml_nbytes(inp.c7_p13_mask), false);
++
+     static bool logged = false;
+     if (!logged) {
+         logged = true;
+@@ -2157,6 +2302,7 @@ static void dsv4_sparse_set_input(const llm_graph_input_dsv4 & inp, const llama_
+         const ggml_fp16_t f16_zero = llama_cast<ggml_fp16_t>(0.0f);
+         const ggml_fp16_t f16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+ 
++        l034_timer timer(inp.sp_mask);
+         ggml_fp16_t * m = (ggml_fp16_t *) inp.sp_mask->data;
+         for (int64_t r = 0; r < plan.sp_kv; ++r) {
+             m[r] = r < plan.sp_n_sel + n_swa ? f16_zero : f16_ninf;
+@@ -2174,6 +2320,7 @@ static void dsv4_sparse_set_input(const llm_graph_input_dsv4 & inp, const llama_
+         const ggml_fp16_t f16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
+         const llama_pos   lo       = inp.c7_lo;
+ 
++        l034_timer timer(inp.c7_sp_mask);
+         ggml_fp16_t * m = (ggml_fp16_t *) inp.c7_sp_mask->data;
+         for (int64_t i = 0; i < nt; ++i) {
+             const llama_pos p  = ubatch.pos[0] + (llama_pos) i;
+@@ -2214,6 +2361,7 @@ static void dsv4_sparse_set_input(const llm_graph_input_dsv4 & inp, const llama_
+         GGML_ASSERT(t->type == GGML_TYPE_I32 && t->ne[0] == n_win && t->ne[1] == nt);
+         GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+ 
++        l034_timer timer(t);
+         const int64_t base = (g == 0 ? plan.sp_n_csa : plan.sp_n_hca) + off;
+ 
+         int32_t * data = (int32_t *) t->data;
+@@ -2242,19 +2390,23 @@ static void dsv4_sparse_set_input(const llm_graph_input_dsv4 & inp, const llama_
+ 
+ void llm_graph_input_dsv4_raw::set_input(const llama_ubatch * ubatch) {
+     if (self_k_idxs && self_k_idxs->buffer) {
++        l034_timer timer(self_k_idxs);
+         mctx->set_input_k_idxs(self_k_idxs);
+     }
+ 
+     if (self_kq_mask && self_kq_mask->buffer) {
++        l034_timer timer(self_kq_mask);
+         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+     }
+ 
+     if (self_k_rot) {
++        l034_timer timer(self_k_rot);
+         mctx->set_input_k_rot(self_k_rot);
+     }
+ }
+ 
+ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
++    l034_call measurement;
+     const auto & plan_csa = mctx->get_csa_plan(*ubatch);
+     const auto & plan_hca = mctx->get_hca_plan(*ubatch);
+     const auto & plan_lid = mctx->get_lid_plan(*ubatch);
+@@ -2266,6 +2418,7 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+     // SiegeLadder C7: the dense path's ring mask for the decoder layers - the plain one, then -inf over the cells below the
+     // bound for every query at or past it (one stream: the columns are the cells of the ubatch's sequence's ring)
+     if (c7_raw_mask && c7_raw_mask->buffer && c7_lo >= 0) {
++        l034_timer timer(c7_raw_mask);
+         const ggml_tensor * src = inp_raw->self_kq_mask;
+         GGML_ASSERT(src && src->type == c7_raw_mask->type && ggml_nbytes(src) == ggml_nbytes(c7_raw_mask));
+         GGML_ASSERT(ggml_backend_buffer_is_host(c7_raw_mask->buffer));
+@@ -2307,14 +2460,17 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
+     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+ 
+     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
++        l034_timer timer(inp_csa.k_rot);
+         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
+     }
+ 
+     if (inp_hca.k_rot && inp_hca.k_rot->buffer) {
++        l034_timer timer(inp_hca.k_rot);
+         mctx->get_hca()->set_input_k_rot(inp_hca.k_rot);
+     }
+ 
+     if (inp_lid.k_rot && inp_lid.k_rot->buffer) {
++        l034_timer timer(inp_lid.k_rot);
+         mctx->get_lid()->set_input_k_rot(inp_lid.k_rot);
+     }
+ 
+@@ -3521,6 +3677,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+     }
+ 
++    if (msl && msl->mgr->p19_lm_pool_active && msl->mgr->plan_slots != msl->mgr->p19_lm_base_slots) {
++        LLAMA_LOG_INFO("%s: P24 layer=%d tokens=%u plan=%u pin=%u cap=%u waves=%u skip=%d\n",
++                __func__, il, (unsigned) n_tokens, msl->mgr->plan_slots, msl->mgr->pin_budget,
++                stream_wave_cap, n_stream_waves, (int) skip_planned);
++    }
++
+     ggml_tensor * ids_gemm  = selected_experts;
+     ggml_tensor * drop_mask = nullptr;
+     // G2 runahead (decode; moe_runahead set by the model graph): the first half's slots and weight multipliers
+@@ -5312,6 +5474,23 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
+             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
+     dsv4_build_comp_inputs(ctx0, inp->inp_lid, mctx_cur->get_lid_plan(ubatch), "lid", cparams, n_stream,
+             hparams.dsv4_candidate_block_size, hparams.dsv4_candidate_topk_blocks);
++    // L037: a GPU-built mask has only the CPU input n_visible as its source, so the scheduler may leave it on the CPU
++    // (queue125: set_in -15 ms per graph at 512K, compute +10 ms) - pin it to the first backend, the card
++    if (sched && ggml_backend_sched_get_n_backends(sched) > 1) {
++        ggml_backend_t gpu = ggml_backend_sched_get_backend(sched, 0);
++        if (gpu != nullptr && gpu != backend_cpu) {
++            for (auto * ci : { &inp->inp_csa, &inp->inp_hca, &inp->inp_lid }) {
++                if (ci->mask_visible == nullptr) {
++                    continue;
++                }
++                for (ggml_tensor * m : { ci->kq_mask, ci->lid_mask }) {
++                    if (m != nullptr && m->op == GGML_OP_PREFIX_MASK && ggml_backend_supports_op(gpu, m)) {
++                        ggml_backend_sched_set_tensor_backend(sched, m, gpu);
++                    }
++                }
++            }
++        }
++    }
+     inp->inp_csa.k_rot = mctx_cur->get_csa()->build_input_k_rot(ctx0);
+     inp->inp_hca.k_rot = mctx_cur->get_hca()->build_input_k_rot(ctx0);
+     inp->inp_lid.k_rot = mctx_cur->get_lid()->build_input_k_rot(ctx0);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 48fd129..5c00fcc 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -16,6 +16,11 @@
+ #include <mutex>
+ #include <condition_variable>
+ 
++void l034_begin();
++void l034_batch(size_t batch);
++void l034_superchunk();
++void l034_end(size_t graphs);
++
+ struct ggml_cgraph;
+ struct ggml_context;
+ struct ggml_tensor;
+@@ -584,6 +589,7 @@ public:
+         ggml_tensor * state_write_idxs_lid = nullptr; // I64 [n_state_write], index cache stride
+         ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
+ 
++        ggml_tensor * mask_visible = nullptr; // optional I32 input for GPU-generated masks
+         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+ 
+         // the same mask, typed for the lightning indexer instead of for attention: the fused
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 8336c22..4c283d5 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -2864,7 +2864,8 @@ bool llama_moe_stream::p19_lm_pool_begin(uint32_t target_slots, size_t seg_reser
+         }
+     }
+ 
+-    plan_slots         = p19_lm_base_slots;
++    const char * pool_plan = std::getenv("LLAMA_DSV4_LAYER_MAJOR_POOL_PLAN");
++    plan_slots         = pool_plan && std::strcmp(pool_plan, "pool") == 0 ? P : p19_lm_base_slots;
+     p19_lm_pool_n      = P;
+     p19_lm_pool_active = true;
+     p19_lm_pool_shrunk = false;
+@@ -2952,6 +2953,7 @@ void llama_moe_stream::p19_lm_pool_shrink(const char * reason, size_t sc, int la
+             }
+         }
+     p19_lm_pool_active = false;
++    plan_slots = p19_lm_base_slots; // the old pool and its graph views are gone
+     p19_lm_pool_shrunk = true;
+     p19_lm_last_il = -1;
+ }
+@@ -2973,7 +2975,8 @@ void llama_moe_stream::p19_lm_pool_end() {
+         LLAMA_LOG_INFO("%s: P19 LM pool (call end): slots=%u plan=%u hits=%" PRId64 " miss=%" PRId64 " demand_io_bytes=%" PRId64
+                 " kept_tables=%" PRId64 " (delta vs call start; compare POOL off on the same prompt)\n", __func__,
+                 p19_lm_pool_n, plan_slots, hits, miss, bytes, p19_lm_keep_tables);
+-        // Keep the original plan until p11_leave restores the decode cache.
++        // Keep the base plan until p11_leave restores the decode cache.
++        plan_slots = p19_lm_base_slots;
+         p19_lm_pool_active = false;
+         p19_lm_pool_n      = 0;
+         p19_lm_last_il     = -1;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 886542f..bebba34 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -4513,7 +4513,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
+     }
+ };
+ 
+-static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
++static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool balanced = false) {
+     std::random_device rd;
+     std::default_random_engine rng(rd());
+     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+@@ -4523,9 +4523,9 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
+             for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                 std::vector<int32_t> data(t->ne[0]);
+                 for (int i = 0; i < t->ne[0]; i++) {
+-                    data[i] = i % n_mats;
++                    data[i] = balanced ? (int32_t) ((r * 6 + i) % n_mats) : i % n_mats;
+                 }
+-                std::shuffle(data.begin(), data.end(), rng);
++                if (!balanced) { std::shuffle(data.begin(), data.end(), rng); }
+                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+             }
+         } else {
+@@ -4544,6 +4544,7 @@ struct test_mul_mat_id : public test_case {
+     const int64_t m;
+     const int64_t n;
+     const int64_t k;
++    bool balanced_ids = false;
+ 
+     std::string vars() override {
+         return VARS_TO_STR8(type_a, type_b, n_mats, n_used, b, m, n, k);
+@@ -4596,7 +4597,7 @@ struct test_mul_mat_id : public test_case {
+     }
+ 
+     void initialize_tensors(ggml_context * ctx) override {
+-        init_mul_mat_id_tensors(ctx, n_mats);
++        init_mul_mat_id_tensors(ctx, n_mats, balanced_ids);
+     }
+ };
+ 
+@@ -7385,6 +7386,39 @@ struct test_tri : public test_case {
+     }
+ };
+ 
++// GGML_OP_PREFIX_MASK
++struct test_prefix_mask : public test_case {
++    const ggml_type type;
++    const int64_t width, tokens, streams;
++    std::string vars() override { return VARS_TO_STR4(type, width, tokens, streams); }
++    test_prefix_mask(ggml_type type, int64_t width, int64_t tokens, int64_t streams = 1)
++        : type(type), width(width), tokens(tokens), streams(streams) {}
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * v = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
++        ggml_set_name(v, "visible");
++        return ggml_prefix_mask(ctx, v, width, streams, type);
++    }
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "visible") == 0) {
++                std::vector<int32_t> v(tokens);
++                for (int64_t i = 0; i < tokens; ++i) {
++                    v[i] = i % 4 == 0 ? 0 : i % 4 == 1 ? (int32_t) width :
++                           i % 4 == 2 ? 1 : (int32_t) (width - 1);
++                }
++                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++    // exact equality: the harness also calls this on its sentinel tensors (op NONE), so no assumption about the layout;
++    // the CPU op is the reference and the kernel must match it bit for bit (0 / -inf of the same type)
++    double err(const float * a, const float * b, size_t n) override {
++        return memcmp(a, b, n*sizeof(float)) == 0 ? 0.0 : 1.0;
++    }
++};
++
+ // GGML_OP_FILL
+ struct test_fill : public test_case {
+     const ggml_type              type;
+@@ -9685,6 +9719,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_tri(GGML_TRI_TYPE_UPPER));
+     test_cases.emplace_back(new test_tri(GGML_TRI_TYPE_UPPER_DIAG));
+ 
++    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
++        test_cases.emplace_back(new test_prefix_mask(type, 257, 8, 2));
++        test_cases.emplace_back(new test_prefix_mask(type, 32768, 2048)); // 128K / 4
++        test_cases.emplace_back(new test_prefix_mask(type, 131072, 2048)); // 512K / 4
++    }
+     test_cases.emplace_back(new test_fill(0.0f));
+     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
+     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
+@@ -9989,6 +10028,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 18, 6, false, 2304, n, 5120));
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K,    GGML_TYPE_F32, 18, 6, false, 5120, n, 2304));
+     }
++    // P25: full resident og layer. Cyclic IDs are exactly balanced for these n.
++    for (ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
++        for (int n : {2048, 4096, 8192}) {
++            auto * gate_up = new test_mul_mat_id(type, GGML_TYPE_F32, 384, 6, true, 2304, n, 5120);
++            gate_up->balanced_ids = true;
++            test_cases.emplace_back(gate_up);
++            auto * down = new test_mul_mat_id(type, GGML_TYPE_F32, 384, 6, false, 5120, n, 2304);
++            down->balanced_ids = true;
++            test_cases.emplace_back(down);
++        }
++    }
+     // dense Q8_0 projections of a V4.1 layer: attn_q_b 1280->32768, attn_output_b 8192->5120, shared expert 5120->2304
+     for (int n : {1, 2048}) {
+         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32768, n, 1280, {1, 1}, {1, 1}));

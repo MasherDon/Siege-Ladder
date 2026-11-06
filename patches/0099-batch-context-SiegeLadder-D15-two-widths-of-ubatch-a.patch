@@ -1,7 +1,7 @@
 From 36d1ac8c486c0b5177ddfd1719a5b3d756a3d397 Mon Sep 17 00:00:00 2001
 From: MasherDon <62326358+MasherDon@users.noreply.github.com>
 Date: Mon, 26 Oct 2026 04:27:04 +0000
-Subject: [PATCH 099/112] batch + context : SiegeLadder D15 - two widths of
+Subject: [PATCH 099/121] batch + context : SiegeLadder D15 - two widths of
  ubatch at long context (automatic by default: only when the whole model's
  prompt graph does not fit at -ub; LLAMA_DSV4_UB_FULL=N - a fixed N, =0 -
  off). Under P4 + C7 the whole model is needed only by a long prompt's last

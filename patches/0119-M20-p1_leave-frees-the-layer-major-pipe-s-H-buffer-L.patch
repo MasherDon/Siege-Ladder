@@ -1,0 +1,92 @@
+From cb380f8133b4ba928c084057d9624c2afb1e2e3d Mon Sep 17 00:00:00 2001
+From: MasherDon <62326358+MasherDon@users.noreply.github.com>
+Date: Thu, 05 Nov 2026 03:41:30 +0000
+Subject: [PATCH 119/121] M20: p1_leave frees the layer-major pipe's H buffer
+ (L038; 320 MiB at -ub 4096) before the expert cache and the head return -
+ with 16 cache slots at 1M it outlived the prompt and left the decode buffers
+ short (out of memory after a 21-min document); a DXGI usage line in p1_leave
+ and a load warning under 512 MiB of headroom (lab L051, Codex + lead)
+
+Verified in queue143: 48K byte for byte (normal and layer-major arms); 1M at 16 slots answers; 256K at 21 slots works.
+---
+ src/llama-context.cpp    | 21 +++++++++++++++++++++
+ src/llama-moe-stream.cpp |  4 ++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index b763260..70bcca4 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1380,6 +1380,7 @@ void llama_context::p1_enter() {
+ 
+ bool llama_context::p1_leave() {
+     const int64_t t0 = ggml_time_us();
++    const llama_wddm_budget m20_before = llama_wddm_query_budget();
+     if (sched) {
+         ggml_backend_sched_synchronize(sched.get()); // the hidden states have landed in p1_hidden
+     }
+@@ -1387,6 +1388,12 @@ bool llama_context::p1_leave() {
+     gf_res_prev.reset();
+     gf_res_reserve.reset();
+     sched.reset();
++    // SiegeLadder M20: the layer-major pipe's H input (L038; 320 MiB at -ub 4096) serves prompt graphs only - it goes
++    // too, before the expert cache and the head return, or a full cache leaves the decode buffers short (1M, 16 slots,
++    // runs 4.312). The next layer-major graph allocates it again: its tensor is made anew per graph.
++    const size_t m20_pipe_h = lm_pipe_h_capacity;
++    lm_pipe_h_buffer.reset();
++    lm_pipe_h_capacity = 0;
+     size_t trimmed = 0;
+     for (auto & backend : backends) {
+         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+@@ -1400,6 +1407,17 @@ bool llama_context::p1_leave() {
+     if (auto * ms = model.moe_stream(); ms != nullptr && ms->p11_active) {
+         ms->p11_leave();
+     }
++    const llama_wddm_budget m20_cache = llama_wddm_query_budget();
++    const auto m20_log = [&]() {
++        const llama_wddm_budget after = llama_wddm_query_budget();
++        if (m20_before.ok && m20_cache.ok && after.ok) {
++            LLAMA_LOG_INFO("%s: M20 VRAM DXGI local usage MiB: before release %.1f, after cache %.1f, after reserve %.1f; "
++                    "pipe H freed %.1f MiB\n", __func__, m20_before.local_usage/1048576.0, m20_cache.local_usage/1048576.0,
++                    after.local_usage/1048576.0, m20_pipe_h/1048576.0);
++        } else {
++            LLAMA_LOG_WARN("%s: M20 VRAM DXGI sample unavailable\n", __func__);
++        }
++    };
+     double t_read_ms = 0.0;
+     if (!model.head_restore(&t_read_ms)) {
+         // no head, no logits for this call. The context keeps a scheduler - the head-less one, head_out stays set
+@@ -1411,6 +1429,7 @@ bool llama_context::p1_leave() {
+         } catch (const std::exception & e) {
+             LLAMA_LOG_ERROR("%s: head yield: %s\n", __func__, e.what());
+         }
++        m20_log();
+         return false;
+     }
+     cparams.head_out = false;
+@@ -1427,8 +1446,10 @@ bool llama_context::p1_leave() {
+         sched_reserve();
+     } catch (const std::exception & e) {
+         LLAMA_LOG_ERROR("%s: head yield: the compute buffers for %u tokens: %s\n", __func__, p1_ub_small, e.what());
++        m20_log();
+         return false;
+     }
++    m20_log();
+     LLAMA_LOG_INFO("%s: head yield: head back in %.1f ms (read %.1f ms), logits of %lld rows, the CUDA pool gave back "
+             "%.1f MiB\n", __func__, (ggml_time_us() - t0)/1000.0, t_read_ms, (long long) n_rows, trimmed/1048576.0);
+     return ok;
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+index 77ba2d7..1693d88 100644
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -1404,6 +1404,10 @@ void llama_moe_stream::attach_backend(ggml_backend_t backend) {
+                     "left for the CUDA pool; shared %.0f of %.0f MiB\n", __func__, wb.name, wb.local_usage/1048576.0,
+                     wb.dedicated/1048576.0, wb.local_budget/1048576.0, headroom, wb.nonlocal_usage/1048576.0,
+                     wb.nonlocal_budget/1048576.0);
++            if (headroom < 512.0 && p11_slots > 0) {
++                LLAMA_LOG_WARN("%s: M20: only about %.0f MiB left; after a long prompt the expert cache may need to shrink\n",
++                        __func__, headroom);
++            }
+             if (headroom < 128.0) {
+                 LLAMA_LOG_WARN("%s: only about %.0f MiB of VRAM left after load - a prompt batch that grows the CUDA "
+                         "pool past it fails under \"Prefer No Sysmem Fallback\" (a smaller -ub needs less)\n",
