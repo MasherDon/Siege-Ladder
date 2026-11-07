@@ -74,6 +74,22 @@ The publicly assembled `cd` with the defaults of 25–26 October (before the cur
 
 The `og` and `cd` rows are separate runs with different settings, not an isolated measurement of the quantization.
 
+**Fast mode (lossy).** `LLAMA_MOE_STREAM_PRESET=fast` adds one approximation to `default`: per token, up to one
+light expert that would come from the drive is not waited for; its contribution is added after the next layer's
+attention. Five experts per token instead of six is a separate switch (`--override-kv deepseek41.expert_used_count=int:5`). Both were measured on
+the lighter `qd` build (362 GB, IQ2_XXS gate/up experts; assembled by `tools/assemble.py --build qd`, not published on
+Hugging Face). Decode is teacher-forced; the distance is to the DeepSeek API on general-100 / general-2 / router-112,
+and smaller is closer to the full model:
+
+| | decode, tok/s | distance, nat/token |
+|---|---|---|
+| `og` `default` | 21.30 (4 November) | ~0.091 / 0.054 / 0.072 (27–28 October) |
+| `qd` `fast` | 23.7 (3 November) | 0.143 / 0.102 / 0.126 (25 October) |
+| `qd` `fast` + 5 experts per token | 24.97 (28 October, before the lens correction) | another +0.010–0.013 (25 October) |
+
+That is ~11% faster decode for ~0.05 nat more distance. Most of that distance comes from the lighter build: on `qd`
+the preset itself costs 0.006–0.014. `fast` on `og` and `fast` through the server have not been measured yet.
+
 On this PC with the `cd` file (measured 2026-10-22): the original fork ~10 tok/s, Project Maya v1.1.21 3.9 tok/s. Maya has
 shipped many releases since; these two numbers are from that day.
 
