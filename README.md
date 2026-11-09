@@ -21,9 +21,19 @@ Long context, up to 1M tokens, at a usable speed on a single consumer PC — not
 | | |
 |---|---|
 | GPU | RTX 5070 Ti 16 GB in a PCIe 4.0 x16 slot (pinned host-to-device copies ~28.8 GB/s) |
+| Display | the monitor is on the Ryzen's integrated graphics: the RTX 5070 Ti drives no display |
 | CPU / RAM | Ryzen 5 7600, 64 GB DDR5 (4 × 16 GB) |
 | Drives | NVMe Gen5 2 TB (~13.5 GB/s) for the model; NVMe Gen4 1 TB (~5 GB/s) holding a second copy of the expert files |
 | OS | Windows 11, CUDA 13.0 |
+
+**The GPU drives no display, and this is required.** With the monitor on the motherboard the RTX 5070 Ti runs
+headless and the model gets all 16 GB. Do not plug the monitor into the card that holds the model: in our test a
+2560×1440 240 Hz monitor on the same card made Windows page the card's memory, kernels ran 5–180× slower and decode
+fell 3–4×, to 2–3 tok/s. The same hardware with the monitor on the GPU will not reproduce the numbers below.
+
+**The numbers do not depend on the CPU.** It computes no experts or layers: everything runs on the GPU, and the CPU
+only builds the graphs and issues the reads. The speed is set by the GPU, the PCIe link, RAM and the drives. Keep the
+CPU otherwise idle during runs all the same.
 
 ## The model builds
 
@@ -234,7 +244,8 @@ be a starting point.
 
 Not turnkey: a research setup, built and run on Windows 11 only. What it needs:
 
-- an NVIDIA GPU with 16 GB (the build line targets Blackwell, `sm_120`; set `CMAKE_CUDA_ARCHITECTURES` for others);
+- an NVIDIA GPU with 16 GB that drives no display: the monitor goes to the CPU's integrated graphics or a second card
+  (the build line targets Blackwell, `sm_120`; set `CMAKE_CUDA_ARCHITECTURES` for others);
 - 64 GB of RAM (the RAM tier takes 43–46 GiB, pinned);
 - ~375 GB on a fast NVMe (Gen4 or Gen5) for the weights, and ~175 GB on a second drive for the optional copy of the
   expert parts;
